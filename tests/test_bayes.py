@@ -155,3 +155,108 @@ def test_observe_is_cheap():
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     assert elapsed_ms < 50.0, f"observe took {elapsed_ms:.1f} ms"
+
+
+# --- Posterior freeze / early-exit --------------------------------------
+
+def test_posterior_freezes_on_high_concentration():
+    """Once distribution().max() >= freeze_threshold, observe() should
+    stop updating log_alpha — saves ~15 ms/turn for the tail of the
+    match. Manual log_alpha seeding exercises the transition without
+    running a full game."""
+    p = ArchetypePosterior(freeze_threshold=0.99)
+    # Plant an extreme log_alpha so softmax exceeds 0.99 on one index.
+    p.log_alpha = np.full(p.K, -20.0)
+    p.log_alpha[0] = 20.0
+    p._last_obs = {"fleets": []}  # skip the first-call bootstrap
+    # Before observe: not frozen yet (transition fires on update).
+    assert p.is_frozen() is False
+
+    obs = {"fleets": [], "planets": [], "step": 10}
+    p.observe(obs, opp_player=1)
+    assert p.is_frozen() is True
+    frozen_alpha = p.log_alpha.copy()
+
+    # Subsequent observe() must NOT modify log_alpha.
+    p.observe(obs, opp_player=1)
+    p.observe(obs, opp_player=1)
+    np.testing.assert_array_equal(p.log_alpha, frozen_alpha)
+
+
+def test_posterior_frozen_still_increments_turns_observed():
+    """Frozen observe() must still tick turns_observed so downstream
+    gates (like MCTSAgent's _POSTERIOR_MIN_TURNS) keep working against
+    the cached posterior."""
+    p = ArchetypePosterior(freeze_threshold=0.99)
+    p.log_alpha = np.full(p.K, -20.0)
+    p.log_alpha[0] = 20.0
+    p._last_obs = {"fleets": []}
+
+    obs = {"fleets": [], "planets": [], "step": 10}
+    p.observe(obs, opp_player=1)  # triggers freeze
+    assert p.is_frozen()
+    start = p.turns_observed()
+
+    p.observe(obs, opp_player=1)
+    p.observe(obs, opp_player=1)
+    assert p.turns_observed() == start + 2
+
+
+def test_posterior_frozen_skips_archetype_act_calls(monkeypatch):
+    """The expensive bit in observe() is the K-archetype act() loop in
+    _predicted_launches. When frozen, that loop must not run — otherwise
+    freezing buys us nothing."""
+    p = ArchetypePosterior(freeze_threshold=0.99)
+    p.log_alpha = np.full(p.K, -20.0)
+    p.log_alpha[0] = 20.0
+    p._last_obs = {"fleets": []}
+
+    obs = {"fleets": [], "planets": [], "step": 10}
+    p.observe(obs, opp_player=1)  # triggers freeze
+    assert p.is_frozen()
+
+    calls = []
+    orig = p._predicted_launches
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(p, "_predicted_launches", spy)
+    p.observe(obs, opp_player=1)
+    p.observe(obs, opp_player=1)
+    assert len(calls) == 0, (
+        "frozen observe() must NOT call _predicted_launches — that's "
+        "the hot path the freeze is designed to short-circuit"
+    )
+
+
+def test_posterior_reset_clears_freeze():
+    """reset() must thaw the posterior — a new match starts with an
+    unknown opponent, stale freeze would lock us to the wrong archetype."""
+    p = ArchetypePosterior(freeze_threshold=0.99)
+    p.log_alpha = np.full(p.K, -20.0)
+    p.log_alpha[0] = 20.0
+    p._last_obs = {"fleets": []}
+
+    obs = {"fleets": [], "planets": [], "step": 10}
+    p.observe(obs, opp_player=1)
+    assert p.is_frozen()
+
+    p.reset()
+    assert p.is_frozen() is False
+    np.testing.assert_allclose(p.distribution(), 1.0 / p.K)
+
+
+def test_posterior_freeze_disabled_when_threshold_is_one():
+    """freeze_threshold=1.0 is the opt-out knob: no matter how
+    concentrated, observe() keeps updating. Validates the guard in
+    observe() where ``freeze_threshold < 1.0`` gates the transition."""
+    p = ArchetypePosterior(freeze_threshold=1.0)
+    p.log_alpha = np.full(p.K, -20.0)
+    p.log_alpha[0] = 20.0
+    p._last_obs = {"fleets": []}
+
+    obs = {"fleets": [], "planets": [], "step": 10}
+    p.observe(obs, opp_player=1)
+    assert p.is_frozen() is False

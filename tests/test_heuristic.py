@@ -98,6 +98,109 @@ def test_agent_launches_in_game_two_with_reused_instance():
     assert steps[0] < 499 or steps[1] < 499, "both games hit step cap — bot never launched?"
 
 
+def test_heuristic_act_respects_hard_stop_at_deadline():
+    """When the caller passes a ``Deadline`` whose ``hard_stop_at`` has
+    already elapsed, ``HeuristicAgent.act`` must short-circuit to a
+    no-op instead of running the full O(fleets x planets) computation.
+
+    This is the load-bearing piece of the rollout-bounding fix: MCTS
+    rollouts pass the outer search deadline into each inner heuristic
+    call so an in-flight dense-state ``_plan_moves`` (observed: 400-700
+    ms on late-game states) can't blow the search budget.
+    """
+    import time as _t
+    from orbitwars.bots.base import Deadline
+
+    agent = HeuristicAgent()
+    # Minimal dense-enough obs with my_planets so act() doesn't early-
+    # return on "no owned planets".
+    obs = {
+        "player": 0,
+        "step": 5,
+        "angular_velocity": 0.03,
+        "planets": [
+            [0, 0, 10, 10, 1.5, 100, 3],
+            [1, 1, 90, 90, 2.0, 100, 3],
+        ],
+        "initial_planets": [
+            [0, 0, 10, 10, 1.5, 100, 3],
+            [1, 1, 90, 90, 2.0, 100, 3],
+        ],
+        "fleets": [],
+        "next_fleet_id": 0,
+        "comet_planet_ids": [],
+    }
+
+    # hard_stop_at in the past → act should return the staged no-op.
+    dl_expired = Deadline(hard_stop_at=_t.perf_counter() - 1.0)
+    out = agent.act(obs, dl_expired)
+    assert out == [], (
+        "expired hard_stop_at must short-circuit act() to no-op, got %r" % out
+    )
+
+    # hard_stop_at in the future → act should produce real moves
+    # (identical behavior to the no-arg Deadline).
+    dl_future = Deadline(hard_stop_at=_t.perf_counter() + 10.0)
+    out2 = agent.act(obs, dl_future)
+    # Not asserting non-empty — the heuristic may legally hold — just
+    # that we didn't hit the short-circuit path (which returns []).
+    # A cheap way to check: compare to a plain Deadline which shouldn't
+    # short-circuit either.
+    dl_plain = Deadline()
+    out3 = agent.act(obs, dl_plain)
+    assert out2 == out3, (
+        "future hard_stop_at must produce same output as plain Deadline; "
+        f"got {out2!r} vs {out3!r}"
+    )
+
+
+def test_build_arrival_table_honors_expired_deadline():
+    """build_arrival_table must abort mid-fleet-loop when the deadline
+    has fired. Regression: without this, a rollout's in-flight heuristic
+    call on a dense state spends 100-300 ms inside this function before
+    the outer act() gets a chance to check the deadline \u2014 so the outer
+    search wall budget can be blown by a single rollout even when the
+    per-ply deadline-propagation is in place.
+    """
+    import time as _t
+    from orbitwars.bots.base import Deadline
+    from orbitwars.bots.heuristic import build_arrival_table, parse_obs
+
+    # Minimal obs with a fleet \u2014 loop body runs at least one iteration.
+    obs = {
+        "player": 0,
+        "step": 5,
+        "angular_velocity": 0.03,
+        "planets": [
+            [0, 0, 10, 10, 1.5, 100, 3],
+            [1, 1, 90, 90, 2.0, 100, 3],
+        ],
+        "initial_planets": [
+            [0, 0, 10, 10, 1.5, 100, 3],
+            [1, 1, 90, 90, 2.0, 100, 3],
+        ],
+        "fleets": [[0, 0, 20, 20, 0.5, 0, 50]],
+        "next_fleet_id": 1,
+        "comet_planet_ids": [],
+    }
+    po = parse_obs(obs)
+    # Expired deadline \u2192 loop must break on the very first check; table
+    # should be empty (no fleet iterations completed).
+    dl_expired = Deadline(hard_stop_at=_t.perf_counter() - 1.0)
+    table = build_arrival_table(po, deadline=dl_expired)
+    # Events for the one fleet's target are NOT recorded because the
+    # outer loop broke before calling table.add(...).
+    for pid in [0, 1]:
+        assert list(table.events(pid)) == [], (
+            f"pid={pid} should have no events when deadline is expired"
+        )
+    # Sanity: without deadline, the same call produces events (so the
+    # expired-deadline result above isn't vacuously empty).
+    table2 = build_arrival_table(po)
+    any_events = any(list(table2.events(pid)) for pid in [0, 1])
+    assert any_events, "expected at least one arrival event without deadline"
+
+
 def test_parse_obs_separates_owners():
     """parse_obs correctly sorts planets by owner."""
     obs = {

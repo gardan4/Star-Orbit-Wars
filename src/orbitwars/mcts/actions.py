@@ -49,6 +49,7 @@ from orbitwars.bots.heuristic import (
 from orbitwars.engine.intercept import (
     is_orbiting_planet,
 )
+from orbitwars.mcts.bokr_widen import BOKRKernelSelector
 
 
 # Move kinds — used by the search layer to prune / bias at non-root nodes.
@@ -93,6 +94,23 @@ class ActionConfig:
     ship_fractions: discrete send-sizes as fractions of available ships.
     softmax_temperature: higher → flatter prior (more exploration at root).
     min_launch_size: drop moves below this many ships — matches heuristic.
+
+    Angle refinement (BOKR-style):
+      angle_refinement_n_grid: per (target, ship-fraction) pair, instead
+          of emitting ONE move at the heuristic's analytic intercept,
+          emit ``angle_refinement_n_grid`` moves spread ± ``angle_refinement_range``
+          radians around it. ``1`` = current behavior (single base angle
+          per target). ``3`` = base ± offset (typical BOKR-mini); ``5`` =
+          finer grid. Odd values keep the base angle always represented.
+          Upper-bounded by the Gumbel root budget: Gumbel will halve
+          across whatever top-k arrives, so more grid points just give
+          the search more side-pass structure to discover. Keep
+          ``max_per_planet`` in mind — grid × target × fraction explodes
+          quickly without the top-K trim.
+      angle_refinement_range: half-width of the angle grid in radians.
+          ~0.1 rad ≈ 5.7° matches Kore 2022's empirical "pass on either
+          side" sweet spot for orbital targets. Wider than ~0.2 rad
+          starts aiming at nothing in particular.
     """
     max_per_planet: int = 8
     include_hold: bool = True
@@ -100,6 +118,8 @@ class ActionConfig:
     softmax_temperature: float = 1.0
     min_launch_size: int = 20
     hold_bonus_score: float = 0.0   # added to HOLD raw score before softmax
+    angle_refinement_n_grid: int = 1
+    angle_refinement_range: float = 0.1
 
 
 def _softmax(xs: List[float], temperature: float) -> List[float]:
@@ -188,11 +208,28 @@ def generate_per_planet_moves(
                 )
                 if not math.isfinite(score):
                     continue
-                move = PlanetMove(
-                    from_pid=mpid, angle=float(angle), ships=int(ships),
-                    target_pid=tpid, kind=kind, prior=0.0, raw_score=score,
-                )
-                raw.append((score, move))
+
+                # Emit angle variants around the heuristic's analytic
+                # intercept. All variants share the base raw_score
+                # because the score is ~angle-invariant at this scale —
+                # side-pass discovery is MCTS's job during search.
+                # n_grid=1 preserves the legacy single-angle behavior.
+                if cfg.angle_refinement_n_grid > 1:
+                    sel = BOKRKernelSelector(
+                        base_angle=float(angle),
+                        angle_range=float(cfg.angle_refinement_range),
+                        n_grid=int(cfg.angle_refinement_n_grid),
+                    )
+                    variant_angles = sel.candidate_angles()
+                else:
+                    variant_angles = [float(angle)]
+                for var_angle in variant_angles:
+                    move = PlanetMove(
+                        from_pid=mpid, angle=float(var_angle),
+                        ships=int(ships), target_pid=tpid, kind=kind,
+                        prior=0.0, raw_score=score,
+                    )
+                    raw.append((score, move))
 
         # Rank descending by raw_score, keep top-K.
         raw.sort(key=lambda t: t[0], reverse=True)

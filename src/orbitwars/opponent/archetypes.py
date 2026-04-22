@@ -189,6 +189,33 @@ def make_archetype(name: str) -> ArchetypeAgent:
     return ArchetypeAgent(name)
 
 
+def make_fast_archetype(name: str):
+    """Fast-rollout-flavor factory for an archetype.
+
+    Returns a ``FastRolloutAgent`` tuned so its nearest-target launch
+    cadence and enemy/neutral preference match the archetype's weights.
+    ~30-50x cheaper per ``act()`` call than ``make_archetype`` — use
+    inside MCTS rollouts when the posterior has concentrated and we
+    want flavor-matched opponent plies without the 18ms/call heuristic
+    cost.
+
+    Uses ``FastRolloutAgent.from_weights`` to handle the actual
+    knob-mapping; this wrapper just does the name lookup.
+    """
+    if name not in ARCHETYPE_WEIGHTS:
+        raise KeyError(
+            f"unknown archetype {name!r}; known = {ARCHETYPE_NAMES}"
+        )
+    # Merge archetype overrides on top of HEURISTIC_WEIGHTS so knobs
+    # the archetype didn't explicitly override still see sensible
+    # base values (e.g., rusher doesn't specify keep_reserve_ships, so
+    # it picks up the HEURISTIC_WEIGHTS default).
+    from orbitwars.bots.fast_rollout import FastRolloutAgent
+    merged = dict(HEURISTIC_WEIGHTS)
+    merged.update(ARCHETYPE_WEIGHTS[name])
+    return FastRolloutAgent.from_weights(merged)
+
+
 def all_archetypes() -> List[ArchetypeAgent]:
     """Return one fresh agent instance per archetype, canonical order."""
     return [ArchetypeAgent(n) for n in ARCHETYPE_NAMES]

@@ -198,16 +198,29 @@ class ArrivalTable:
         return ships
 
 
-def build_arrival_table(po: ParsedObs) -> ArrivalTable:
+def build_arrival_table(
+    po: ParsedObs, deadline: Optional[Deadline] = None,
+) -> ArrivalTable:
     """Populate arrival events for every in-flight fleet against its target.
 
     We estimate the target by: the closest planet along the fleet's heading.
     That's imperfect (fleets can target any point in space or a planet that's
     rotated by arrival time), but it's good enough for a first-cut defense
     signal. The MCTS wrapper will replace this with a more precise estimate.
+
+    ``deadline`` (optional) is checked between fleet iterations. This loop
+    is O(fleets \u00d7 planets) with a Newton-intercept solve per pair \u2014 on
+    dense late-game states (40+ fleets, 40+ planets) it runs 100-300 ms.
+    Without a mid-loop check, an in-flight rollout can blow past the outer
+    search deadline by the full duration of this function. When the
+    deadline fires, we return the partial table accumulated so far; that
+    is still a valid input to downstream scoring (just undercounts arrivals
+    for the unvisited fleets).
     """
     table = ArrivalTable()
     for f in po.fleets:
+        if deadline is not None and deadline.should_stop():
+            break
         fid, owner, fx, fy, fangle, from_pid, fships = f
         # Best guess of target: planet whose perpendicular distance from fleet
         # ray is minimal and the planet is ahead of the fleet.
@@ -365,9 +378,25 @@ class HeuristicAgent(Agent):
         if not po.my_planets:
             return no_op()
 
-        table = build_arrival_table(po)
+        # Outer-deadline check between stages: build_arrival_table scales
+        # with fleet count × planet count (intercept math per pair) and
+        # on dense late-game states runs 50-200 ms. When the caller
+        # (e.g. MCTS rollouts) supplies a Deadline with an absolute
+        # hard_stop_at, short-circuit before paying that cost. Returns
+        # the no-op staged above so the call is still action-valid.
+        if deadline.should_stop():
+            return no_op()
 
-        moves: Action = self._plan_moves(po, table)
+        # Thread deadline into build_arrival_table \u2014 on dense states its
+        # O(fleets \u00d7 planets) intercept loop dominates (100-300 ms) and
+        # must be abortable mid-way or a single in-flight rollout blows
+        # past the outer search deadline.
+        table = build_arrival_table(po, deadline=deadline)
+
+        if deadline.should_stop():
+            return no_op()
+
+        moves: Action = self._plan_moves(po, table, deadline=deadline)
 
         # Cooldown bookkeeping
         for m in moves:
@@ -378,7 +407,10 @@ class HeuristicAgent(Agent):
 
     # ---- Planning ----
 
-    def _plan_moves(self, po: ParsedObs, table: ArrivalTable) -> Action:
+    def _plan_moves(
+        self, po: ParsedObs, table: ArrivalTable,
+        deadline: Optional[Deadline] = None,
+    ) -> Action:
         moves: List[Move] = []
         w = self.weights
         reserve = int(w["keep_reserve_ships"])
@@ -389,6 +421,15 @@ class HeuristicAgent(Agent):
         candidates = [p for p in po.planets]
 
         for mp in po.my_planets:
+            # Per-my-planet deadline check. The inner loop runs intercept
+            # math for every (my_planet, target) pair — 30-100 μs per pair
+            # × 40 planets = ~2 ms per outer-iteration. On dense late-game
+            # states with 20 my-planets we can still accumulate ~40 ms in
+            # the outer loop. Breaking mid-way returns the partial move
+            # list built so far (still a valid Action), which is strictly
+            # better than overrunning the outer MCTS search deadline.
+            if deadline is not None and deadline.should_stop():
+                break
             mpid = int(mp[0])
             available = int(mp[5]) - reserve
             if available < int(w["min_launch_size"]):
@@ -427,6 +468,15 @@ class HeuristicAgent(Agent):
             # We pick the best (score, size) combination.
             best = None  # (score, angle, ships_to_send, target_pid)
             for tp in candidates:
+                # Inner-loop deadline check. candidates = all planets, so
+                # this loop is O(len(planets)) per my-planet with one
+                # Newton-intercept solve per iteration via _travel_turns.
+                # On dense states it can accumulate 5-15 ms per planet;
+                # across 20 my-planets the full outer loop is 100-300 ms.
+                # Without this check, an in-flight HeuristicAgent.act call
+                # from a rollout can keep running past the search deadline.
+                if deadline is not None and deadline.should_stop():
+                    break
                 if tp[0] == mpid:
                     continue
                 ip = po.initial_planet_by_id.get(tp[0], tp)

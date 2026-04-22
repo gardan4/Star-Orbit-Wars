@@ -132,6 +132,14 @@ class ArchetypePosterior:
     alpha0: float = 1.0
     temperature: float = 2.0
     eps: float = 0.1
+    # Early-exit: once the top archetype's posterior probability reaches
+    # this threshold, stop running the K-archetype act() likelihood loop
+    # on subsequent turns. Saves ~15 ms/turn (the dominant per-turn cost)
+    # once the opponent has been identified. Set to 1.0 to disable.
+    # Fleet-id bookkeeping still runs (needed if someone resets us later
+    # with a fresh match), and ``turns_observed`` still increments so
+    # downstream gates keep working.
+    freeze_threshold: float = 0.99
 
     def __post_init__(self) -> None:
         self.K = len(self.archetypes)
@@ -142,6 +150,9 @@ class ArchetypePosterior:
         self._prev_fleet_ids: Set[int] = set()
         self._last_obs: Optional[Dict[str, Any]] = None
         self._turns_observed: int = 0
+        # Frozen once the posterior concentrates past freeze_threshold.
+        # While frozen, observe() skips the expensive K-archetype loop.
+        self._frozen: bool = False
 
     # ---- Public ----
 
@@ -150,6 +161,15 @@ class ArchetypePosterior:
         self._prev_fleet_ids.clear()
         self._last_obs = None
         self._turns_observed = 0
+        self._frozen = False
+
+    def is_frozen(self) -> bool:
+        """True once the posterior concentration crossed ``freeze_threshold``.
+
+        Exposed for smokes/telemetry — lets a test verify the early-exit
+        path fired after N turns of strong evidence.
+        """
+        return self._frozen
 
     def observe(self, obs: Any, opp_player: int) -> None:
         """Incorporate the opponent's action revealed by ``obs``.
@@ -165,6 +185,35 @@ class ArchetypePosterior:
             }
             return
 
+        # Early-exit: frozen posterior skips the K-archetype likelihood
+        # loop (the ~15 ms/turn hot spot). We keep the fleet-id snapshot
+        # current and tick turns_observed so downstream consumers don't
+        # see stale telemetry. log_alpha is left untouched — distribution()
+        # continues to return the frozen posterior.
+        if self._frozen:
+            self._prev_fleet_ids = {
+                int(f[0]) for f in obs_get(obs, "fleets", [])
+            }
+            self._last_obs = obs
+            self._turns_observed += 1
+            return
+
+        # Run the likelihood update path. Tick turns_observed and check
+        # for freeze transition regardless of whether the update
+        # short-circuits (opp eliminated etc.) — a pre-seeded log_alpha
+        # that's already over-threshold should freeze on its first real
+        # observe() call.
+        self._update_log_alpha(obs, opp_player)
+        self._turns_observed += 1
+        self._maybe_freeze()
+
+    def _update_log_alpha(self, obs: Any, opp_player: int) -> None:
+        """Incorporate one turn of opp evidence into ``log_alpha``.
+
+        Split out from ``observe`` so the freeze check fires at a single
+        well-defined point regardless of which control-flow path the
+        update took.
+        """
         # Identify fleets launched by opp this turn.
         opp_launches = self._opp_launches_this_turn(obs, opp_player)
 
@@ -198,7 +247,15 @@ class ArchetypePosterior:
             )
             self.log_alpha[k] += log_lik / self.temperature
 
-        self._turns_observed += 1
+    def _maybe_freeze(self) -> None:
+        """Flip ``_frozen`` on when concentration crosses the threshold.
+
+        Called at the end of observe() (non-bootstrap, non-frozen path).
+        ``freeze_threshold=1.0`` opts out — the check becomes unreachable.
+        """
+        if self.freeze_threshold < 1.0:
+            if float(_softmax(self.log_alpha).max()) >= self.freeze_threshold:
+                self._frozen = True
 
     def distribution(self) -> np.ndarray:
         """Posterior over archetypes as a probability vector."""

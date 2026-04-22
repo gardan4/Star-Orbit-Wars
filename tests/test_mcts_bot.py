@@ -186,6 +186,80 @@ def test_mcts_agent_matches_heuristic_when_guard_is_tight():
         )
 
 
+def test_mcts_agent_reserves_rollout_overshoot_budget(monkeypatch):
+    """Regression test for the W2 time-budget audit failure: when outer
+    remaining time is just above the wrap-up floor, `safe_budget` MUST
+    reserve enough headroom for a one-rollout overshoot (~260 ms on
+    dense mid-game states) so the total turn stays under HARD_DEADLINE_MS.
+
+    Concretely: with remaining ≈ 400 ms, safe_budget should be at most
+    ~60 ms (not 300). The pre-fix code set safe_budget = min(300, remaining
+    - 40) = 300, which blew past 900 ms when pre-search had already eaten
+    most of the budget and a rollout overshoot landed at 260 ms on top.
+    """
+    observed: list = []
+
+    def _capturing_search(self, obs, my_player, start_time=None, anchor_action=None, **kwargs):
+        # **kwargs absorbs outer_hard_stop_at (added in the audit tail
+        # fix) so this regression remains focused on the safe_budget
+        # arithmetic it's actually testing.
+        observed.append(self.gumbel_cfg.hard_deadline_ms)
+        return None
+
+    from orbitwars.mcts import gumbel_search as gs
+    monkeypatch.setattr(gs.GumbelRootSearch, "search", _capturing_search)
+
+    agent = MCTSAgent(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=2, total_sims=2, rollout_depth=1,
+            hard_deadline_ms=300.0,  # shipped default
+            anchor_improvement_margin=10.0,
+        ),
+        rng_seed=0,
+    )
+    # Construct a Deadline that has ~400 ms of remaining budget against
+    # HARD_DEADLINE_MS=900. elapsed=500 → remaining=400.
+    dl = Deadline()
+    dl._t0 -= 0.500  # pretend 500 ms have passed
+    agent.act(_mk_obs(step=10), dl)
+
+    assert observed, "search() was not invoked"
+    safe_budget = observed[0]
+    # With remaining ≈ 400 and overshoot reserve 260 + wrap-up 40, the
+    # effective safe_budget is remaining - 300 = ~100. Strict upper bound
+    # 110 leaves some wiggle room for the timing of _t0.
+    assert safe_budget <= 110.0, (
+        f"safe_budget {safe_budget} does not reserve rollout-overshoot "
+        f"headroom — with remaining≈400 ms and overshoot+wrap-up≈300 ms, "
+        f"safe_budget should be ≤110 ms, not the full 300."
+    )
+
+
+def test_mcts_agent_skips_search_when_budget_wont_cover_overshoot():
+    """When outer remaining < overshoot reserve, search is skipped and
+    we return the staged heuristic action. This prevents the case where
+    a 50 ms search + 260 ms overshoot bolts onto an already-burned turn
+    and breaches HARD_DEADLINE_MS."""
+    agent = MCTSAgent(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=4, total_sims=64, rollout_depth=2,
+            hard_deadline_ms=300.0,
+            anchor_improvement_margin=10.0,
+        ),
+        rng_seed=0,
+    )
+    dl = Deadline()
+    # 0.7s already elapsed → 200 ms remaining — below 260 ms overshoot reserve.
+    dl._t0 -= 0.700
+
+    t0 = time.perf_counter()
+    action = agent.act(_mk_obs(step=10), dl)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    assert isinstance(action, list)
+    # Skipped search → heuristic-only latency. Should be well under 100 ms.
+    assert elapsed_ms < 150.0, f"search not skipped; elapsed={elapsed_ms:.1f} ms"
+
+
 def test_mcts_agent_preserves_margin_in_tight_cfg(monkeypatch):
     """Regression test: when mcts_bot rebuilds GumbelConfig to tighten
     the deadline, it MUST carry over `anchor_improvement_margin` from
@@ -196,7 +270,8 @@ def test_mcts_agent_preserves_margin_in_tight_cfg(monkeypatch):
 
     original_search = None
 
-    def _capturing_search(self, obs, my_player, start_time=None, anchor_action=None):
+    def _capturing_search(self, obs, my_player, start_time=None, anchor_action=None, **kwargs):
+        # **kwargs absorbs outer_hard_stop_at (added in the audit tail fix).
         observed.append(self.gumbel_cfg.anchor_improvement_margin)
         # Return None → agent falls back to heuristic. We only care that
         # the cfg in effect during search carried the margin through.
@@ -440,3 +515,171 @@ def test_fast_engine_step_does_not_touch_global_random():
         "module — this desynchronizes the Kaggle judge's RNG during "
         "MCTS rollouts. Use self._rng in _maybe_spawn_comets."
     )
+
+
+# ---- Decoupled sim-move wiring (Path B / W3) ---------------------------
+
+def test_mcts_agent_populates_opp_candidate_builder_on_split_posterior():
+    """With a posterior split ~60/30 across two archetypes, MCTSAgent
+    populates ``opp_candidate_builder`` so the search's decoupled UCB
+    branch fires. When the builder is called, it must return >=2
+    distinct wire actions — otherwise the search falls back to SH."""
+    import numpy as np
+
+    agent = MCTSAgent(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=2, total_sims=2, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            anchor_improvement_margin=10.0,
+        ),
+        rng_seed=0,
+    )
+    agent.act(_mk_obs(step=0), Deadline())
+    post = agent.opp_posterior
+    assert post is not None
+    post._turns_observed = agent._POSTERIOR_MIN_TURNS
+
+    # Force a top-2 split: rusher ~0.6, turtler ~0.3, rest ~noise.
+    # Concrete log-alphas with softmax > _POSTERIOR_DECOUPLED_MIN_SECOND_PROB
+    # on both positions.
+    post.log_alpha = np.full(post.K, -5.0)
+    post.log_alpha[post.names.index("rusher")] = 2.0
+    post.log_alpha[post.names.index("turtler")] = 1.3
+
+    agent._maybe_route_posterior_to_search()
+    assert agent._search.opp_candidate_builder is not None, (
+        "split posterior should populate the decoupled builder"
+    )
+    assert agent.telemetry["builder_fires"] == 1
+
+    # Builder must produce >=2 distinct wires.
+    wires = agent._search.opp_candidate_builder(_mk_obs(step=10), opp_player=1)
+    assert isinstance(wires, list)
+    assert len(wires) >= 2
+
+
+def test_mcts_agent_no_opp_candidate_builder_on_winner_take_all():
+    """Winner-take-all posterior (top ~0.9): the 2nd archetype is below
+    the decoupled gate, so no builder is installed. Single-archetype
+    ``opp_policy_override`` is strictly stronger in that regime."""
+    import numpy as np
+
+    agent = MCTSAgent(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=2, total_sims=2, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            anchor_improvement_margin=10.0,
+        ),
+        rng_seed=0,
+    )
+    agent.act(_mk_obs(step=0), Deadline())
+    post = agent.opp_posterior
+    assert post is not None
+    post._turns_observed = agent._POSTERIOR_MIN_TURNS
+
+    # Single dominant archetype — 2nd-top well below threshold.
+    post.log_alpha = np.full(post.K, -10.0)
+    post.log_alpha[post.names.index("rusher")] = 5.0
+
+    agent._maybe_route_posterior_to_search()
+    # Override set (single-archetype path), but builder stays None.
+    assert agent._search.opp_policy_override is not None
+    assert agent._search.opp_candidate_builder is None
+
+
+def test_mcts_agent_clears_opp_candidate_builder_on_posterior_collapse():
+    """When the posterior de-concentrates (match ends, new opp), the
+    builder must clear along with the override so the next match starts
+    from a clean slate."""
+    import numpy as np
+
+    agent = MCTSAgent(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=2, total_sims=2, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            anchor_improvement_margin=10.0,
+        ),
+        rng_seed=0,
+    )
+    agent.act(_mk_obs(step=0), Deadline())
+    post = agent.opp_posterior
+    assert post is not None
+    post._turns_observed = agent._POSTERIOR_MIN_TURNS
+
+    # First: arm the builder with a split posterior.
+    post.log_alpha = np.full(post.K, -5.0)
+    post.log_alpha[post.names.index("rusher")] = 2.0
+    post.log_alpha[post.names.index("turtler")] = 1.3
+    agent._maybe_route_posterior_to_search()
+    assert agent._search.opp_candidate_builder is not None
+
+    # Now collapse to near-uniform — both override and builder clear.
+    post.log_alpha = np.zeros(post.K)
+    agent._maybe_route_posterior_to_search()
+    assert agent._search.opp_policy_override is None
+    assert agent._search.opp_candidate_builder is None
+
+
+def test_mcts_agent_decoupled_flag_armed_by_default():
+    """MCTSAgent enables ``use_decoupled_sim_move`` on its GumbelConfig so
+    the search's decoupled branch can fire once the builder is populated.
+    Without this, all posterior wiring would be a no-op."""
+    agent = MCTSAgent(rng_seed=0)
+    assert agent.gumbel_cfg.use_decoupled_sim_move is True
+    # The search sees the same flag.
+    assert agent._search.gumbel_cfg.use_decoupled_sim_move is True
+
+
+def test_mcts_agent_bokr_refinement_defaults_off():
+    """Shipped MCTSAgent defaults to BOKR angle refinement OFF
+    (single-angle per target, n_grid=1) because the 3-variant expansion
+    pushed the turn-time tail past Kaggle's 1s actTimeout in audit
+    (seed=42 @ 300ms deadline: max=1156ms, 2 turns >= 900ms).
+
+    The bokr_widen module is still wired into generate_per_planet_moves
+    — callers can opt in by passing an ActionConfig with
+    ``angle_refinement_n_grid > 1``. This test pins the default to OFF
+    so we can't silently regress submission safety."""
+    agent = MCTSAgent(rng_seed=0)
+    assert agent.action_cfg.angle_refinement_n_grid == 1
+    # Explicit opt-in still works:
+    from orbitwars.mcts.actions import ActionConfig
+    agent_opt = MCTSAgent(
+        action_cfg=ActionConfig(
+            angle_refinement_n_grid=3,
+            angle_refinement_range=0.1,
+            max_per_planet=10,
+        ),
+        rng_seed=0,
+    )
+    assert agent_opt.action_cfg.angle_refinement_n_grid == 3
+
+
+def test_mcts_agent_telemetry_resets_builder_counters_on_step_zero():
+    """Turn-0 reset zeroes builder_fires and builder_clears so smoke
+    harnesses running multiple games see clean counts per-match."""
+    import numpy as np
+
+    agent = MCTSAgent(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=2, total_sims=2, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            anchor_improvement_margin=10.0,
+        ),
+        rng_seed=0,
+    )
+    agent.act(_mk_obs(step=0), Deadline())
+    post = agent.opp_posterior
+    post._turns_observed = agent._POSTERIOR_MIN_TURNS
+    post.log_alpha = np.full(post.K, -5.0)
+    post.log_alpha[post.names.index("rusher")] = 2.0
+    post.log_alpha[post.names.index("turtler")] = 1.3
+    agent._maybe_route_posterior_to_search()
+    assert agent.telemetry["builder_fires"] == 1
+
+    # New match at step 0 → builder_fires resets.
+    agent.act(_mk_obs(step=0), Deadline())
+    assert agent.telemetry["builder_fires"] == 0
+    assert agent.telemetry["builder_clears"] == 0
+    # And the underlying builder is cleared on the search too.
+    assert agent._search.opp_candidate_builder is None

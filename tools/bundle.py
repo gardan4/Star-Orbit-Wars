@@ -65,6 +65,7 @@ BOT_RECIPES: Dict[str, Tuple[List[str], str]] = {
             "bots.heuristic",
             "bots.fast_rollout",  # referenced by gumbel_search when rollout_policy="fast"
             "engine.fast_engine",
+            "mcts.bokr_widen",    # provides BOKRKernelSelector used by mcts.actions
             "mcts.actions",
             "mcts.gumbel_search",
             "opponent.archetypes",

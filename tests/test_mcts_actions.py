@@ -154,6 +154,172 @@ def test_joint_action_to_wire_drops_hold():
     assert wire[0] == [0, 0.5, 20]
 
 
+# ---- Angle refinement (BOKR wiring) ------------------------------------
+
+def test_angle_refinement_disabled_by_default():
+    """With n_grid=1 (ActionConfig default), each (target, fraction) pair
+    yields exactly one move. Backward-compat check — the default config
+    behaves identically to the pre-BOKR generator."""
+    po = parse_obs(_mk_obs())
+    table = ArrivalTable()
+    cfg = ActionConfig()
+    assert cfg.angle_refinement_n_grid == 1
+    # No need to count post-softmax (top-K trims); instead compare against
+    # a cfg with n_grid=3 and assert the grid-3 version produces strictly
+    # more raw candidates per target.
+    per_planet_1 = generate_per_planet_moves(po, table, cfg=cfg)
+
+    cfg3 = ActionConfig(angle_refinement_n_grid=3, angle_refinement_range=0.05,
+                        max_per_planet=50)
+    per_planet_3 = generate_per_planet_moves(po, table, cfg=cfg3)
+
+    # More candidates land under the same target after refinement.
+    def _attacks_per_target(moves):
+        from collections import Counter
+        return Counter(m.target_pid for m in moves if not m.is_hold)
+    c1 = _attacks_per_target(per_planet_1[0])
+    c3 = _attacks_per_target(per_planet_3[0])
+    # For every target reached by n=1, n=3 should reach it at least 3x.
+    for tpid, cnt in c1.items():
+        assert c3[tpid] >= cnt * 3, (
+            f"n_grid=3 should emit ≥3x moves per target; target {tpid}: "
+            f"{c1[tpid]=}, {c3[tpid]=}"
+        )
+
+
+def test_angle_refinement_grid_is_symmetric_around_base():
+    """n_grid=3 emits angles at {base-Δ, base, base+Δ} for each target."""
+    po = parse_obs(_mk_obs())
+    table = ArrivalTable()
+    # max_per_planet=50 so the top-K trim doesn't prune variants.
+    cfg = ActionConfig(
+        angle_refinement_n_grid=3,
+        angle_refinement_range=0.1,
+        max_per_planet=50,
+    )
+    per_planet = generate_per_planet_moves(po, table, cfg=cfg)
+    moves = per_planet[0]
+
+    # Group attacks by (target, ships) — the 3 variants of one (target,
+    # fraction) pair should share these two keys.
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for m in moves:
+        if m.is_hold:
+            continue
+        groups[(m.target_pid, m.ships)].append(m.angle)
+
+    # At least one group should have >=3 distinct angles (the 3 variants).
+    multi_angle_groups = [angles for angles in groups.values() if len(angles) >= 3]
+    assert multi_angle_groups, (
+        f"expected ≥1 (target, ships) group with 3 angle variants, got {dict(groups)}"
+    )
+
+    # For the first such group, check symmetry: angles should span
+    # [base - Δ, base, base + Δ] with Δ ≈ 0.1 rad (modulo sort order).
+    angles = sorted(multi_angle_groups[0])
+    assert len(angles) >= 3
+    spread = angles[-1] - angles[0]
+    assert spread == pytest.approx(0.2, abs=1e-6), (
+        f"expected span 0.2 rad (base ± 0.1), got {spread:.4f}"
+    )
+    # Middle angle ≈ midpoint of the extremes.
+    mid = 0.5 * (angles[0] + angles[-1])
+    assert angles[1] == pytest.approx(mid, abs=1e-6)
+
+
+def test_angle_refinement_wider_range_spreads_variants_further():
+    """A wider angle_refinement_range produces a wider angle span."""
+    po = parse_obs(_mk_obs())
+    table = ArrivalTable()
+    cfg_narrow = ActionConfig(
+        angle_refinement_n_grid=3,
+        angle_refinement_range=0.05,
+        max_per_planet=50,
+    )
+    cfg_wide = ActionConfig(
+        angle_refinement_n_grid=3,
+        angle_refinement_range=0.2,
+        max_per_planet=50,
+    )
+
+    def _max_span(per_planet):
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for m in per_planet[0]:
+            if m.is_hold:
+                continue
+            groups[(m.target_pid, m.ships)].append(m.angle)
+        return max(
+            (max(a) - min(a) for a in groups.values() if len(a) >= 2),
+            default=0.0,
+        )
+
+    span_narrow = _max_span(generate_per_planet_moves(po, table, cfg=cfg_narrow))
+    span_wide = _max_span(generate_per_planet_moves(po, table, cfg=cfg_wide))
+
+    assert span_wide > span_narrow, (
+        f"wider range should yield wider span: narrow={span_narrow:.4f}, "
+        f"wide={span_wide:.4f}"
+    )
+    # Span should be ~2×range (base ± range).
+    assert span_narrow == pytest.approx(0.1, abs=1e-6)
+    assert span_wide == pytest.approx(0.4, abs=1e-6)
+
+
+def test_angle_refinement_variants_share_kind_and_ships():
+    """All angle variants for one (target, fraction) share the same kind
+    and ship count — only the angle differs."""
+    po = parse_obs(_mk_obs())
+    table = ArrivalTable()
+    cfg = ActionConfig(
+        angle_refinement_n_grid=5,
+        angle_refinement_range=0.1,
+        max_per_planet=50,
+    )
+    per_planet = generate_per_planet_moves(po, table, cfg=cfg)
+
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for m in per_planet[0]:
+        if m.is_hold:
+            continue
+        groups[(m.target_pid, m.ships)].append(m)
+
+    for (tpid, ships), variants in groups.items():
+        if len(variants) < 2:
+            continue
+        kinds = {v.kind for v in variants}
+        assert len(kinds) == 1, (
+            f"variants of (target={tpid}, ships={ships}) disagree on kind: {kinds}"
+        )
+        # Angles should all be distinct.
+        angles = [v.angle for v in variants]
+        assert len(set(angles)) == len(angles), (
+            f"variants of (target={tpid}, ships={ships}) have duplicate angles: {angles}"
+        )
+
+
+def test_angle_refinement_priors_still_sum_to_one():
+    """Top-K trim + softmax with refinement on still produces a valid
+    probability distribution."""
+    po = parse_obs(_mk_obs())
+    table = ArrivalTable()
+    cfg = ActionConfig(
+        angle_refinement_n_grid=3,
+        angle_refinement_range=0.1,
+        max_per_planet=10,
+    )
+    per_planet = generate_per_planet_moves(po, table, cfg=cfg)
+    for pid, moves in per_planet.items():
+        if not moves:
+            continue
+        total = sum(m.prior for m in moves)
+        assert math.isclose(total, 1.0, abs_tol=1e-6), (
+            f"planet {pid}: priors sum to {total} not 1 under BOKR refinement"
+        )
+
+
 def test_softmax_temperature_changes_sharpness():
     """Low temperature → sharper prior (max prior closer to 1)."""
     po = parse_obs(_mk_obs(my_ships=60, enemy_ships=80, neutral_ships=5))

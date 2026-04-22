@@ -48,13 +48,23 @@ class Deadline:
             improved = search_one_step()
             dl.stage(improved)
         return dl.best()
+
+    ``hard_stop_at`` (optional, in ``time.perf_counter()`` seconds) is an
+    *external* absolute deadline. When set, ``should_stop()`` fires at
+    that instant regardless of per-call elapsed time. Used by MCTS
+    rollouts to propagate the search's outer deadline into the rollout's
+    inner ``HeuristicAgent.act`` calls — without this, a single in-flight
+    heuristic.act on a dense mid-game state (400-700 ms observed) can
+    blow past the outer deadline while its own per-call ``Deadline()``
+    still shows "plenty of time left".
     """
 
-    __slots__ = ("_t0", "_best")
+    __slots__ = ("_t0", "_best", "_hard_stop_at")
 
-    def __init__(self) -> None:
+    def __init__(self, hard_stop_at: float | None = None) -> None:
         self._t0 = time.perf_counter()
         self._best: Action = no_op()
+        self._hard_stop_at = hard_stop_at
 
     def stage(self, action: Action) -> None:
         """Mark this action as the current best; returned if deadline hits."""
@@ -67,6 +77,10 @@ class Deadline:
         return deadline_ms - self.elapsed_ms()
 
     def should_stop(self, deadline_ms: float = SEARCH_DEADLINE_MS) -> bool:
+        # An external hard stop (e.g. outer MCTS deadline) always wins.
+        if self._hard_stop_at is not None:
+            if time.perf_counter() >= self._hard_stop_at:
+                return True
         return self.elapsed_ms() >= deadline_ms
 
     def best(self) -> Action:

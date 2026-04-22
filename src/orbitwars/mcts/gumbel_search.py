@@ -123,6 +123,35 @@ class GumbelConfig:
     # "heuristic" to preserve the shipped mcts_v1 bot's behavior
     # byte-for-byte; switch via config for A/B and future defaults.
     rollout_policy: str = "heuristic"
+    # Simultaneous-move root decoupling (Path B / W3). When True, the
+    # root treats my + opp action selection as a 2D decoupled bandit
+    # (see orbitwars.mcts.sim_move.decoupled_ucb_root). The opp
+    # candidate pool is drawn from the posterior-biased heuristic — so
+    # when the Bayesian posterior has concentrated, MCTS marginalizes
+    # over the top archetypes' responses instead of assuming a single
+    # deterministic opp heuristic. Default False — the core improvement
+    # only shows up once the posterior has evidence to concentrate on,
+    # and the 2D bandit doubles arity at fixed total_sims so it's a
+    # no-op-to-loss on turn-0-heavy matches. Flag it on once paired
+    # with (b) posterior caching.
+    use_decoupled_sim_move: bool = False
+    # Number of opp candidate actions to sample when decoupling is on.
+    # Typical: 2-3. Larger K = better marginalization, worse per-cell
+    # noise under fixed total_sims. 2 is the minimum where decoupling
+    # is even meaningful (1 opp candidate degenerates to the baseline).
+    num_opp_candidates: int = 2
+    # Per-rollout wall-clock cap, in milliseconds. ``_rollout_value``
+    # enforces ``min(hard_stop_at, rollout_start + per_rollout_budget)``
+    # as its inner deadline, so no single rollout can blow past the
+    # whole search budget. Measured fat tail on step-35-ish states:
+    # natural rollout cost has p50 ~0.1 ms (many rollouts end at
+    # eng.done) but max ~685 ms in 200 samples (see
+    # tools/diag_rollout_deadline). Without the cap, a single unlucky
+    # rollout eats the entire ``hard_deadline_ms`` window and the
+    # overall act() can overshoot 1 s \u2014 a Kaggle-forfeit risk.
+    # 150 ms is ~2\u00d7 the natural median for the heavy-state regime and
+    # leaves room for n_sim \u2265 2 under the 300 ms default deadline.
+    per_rollout_budget_ms: float = 150.0
 
 
 # ---------------------------- Gumbel top-k --------------------------------
@@ -227,45 +256,128 @@ def _rollout_value(
     depth: int,
     num_agents: int = 2,
     rng: Optional[random.Random] = None,
+    deadline_fn: Optional[Callable[[], bool]] = None,
+    opp_turn0_action: Optional[List[List]] = None,
+    hard_stop_at: Optional[float] = None,
+    per_rollout_budget_ms: Optional[float] = None,
 ) -> float:
     """Simulate `depth` plies from a cloned state; return scalar value.
 
-    Turn 0 uses the candidate root action for `my_player` and the
-    opponent's heuristic for others. Subsequent turns use fresh
-    heuristic instances on both sides. Fresh instances because
-    HeuristicAgent carries per-match state (`_state.last_launch_turn`)
-    that shouldn't leak across rollouts.
+    Turn 0 uses the candidate root action for `my_player`. The opp
+    turn-0 action is either ``opp_turn0_action`` (if supplied — e.g. a
+    pre-computed archetype pick in decoupled sim-move search) or the
+    result of ``opp_agent_factory().act()`` (the default heuristic).
+    Subsequent turns use fresh heuristic instances on both sides.
+
+    Fresh instances because HeuristicAgent carries per-match state
+    (`_state.last_launch_turn`) that shouldn't leak across rollouts.
 
     The `rng` is forwarded into the rollout engine for comet-ship
     sizing so rollouts are reproducible given the search seed. If
     None, each FastEngine seeds its own RNG from os.urandom — which
     makes the search nondeterministic across runs.
+
+    ``deadline_fn`` (optional) is polled *between plies*. When it
+    returns True we abort the rollout and score the engine state as-
+    is. This bounds a single rollout's wall cost to roughly "one ply
+    above the deadline" — critical for the 1-s Kaggle turn ceiling
+    because a late-game HeuristicAgent ply can take 30-100 ms and
+    unchecked rollouts have been observed to blow past 900 ms.
+
+    ``hard_stop_at`` (optional, absolute ``time.perf_counter()``
+    seconds) propagates the outer search deadline into each inner
+    ``agent.act()`` call via ``Deadline(hard_stop_at=...)``. Without
+    this, an in-flight ``HeuristicAgent.act`` on a dense mid-game
+    state (profile: 400-700 ms) can overshoot the search deadline by
+    hundreds of ms. With it, heuristic agents short-circuit inside
+    ``_plan_moves`` as soon as the outer deadline fires, bounding a
+    single ply's overshoot to the time needed to detect + return.
+
+    ``per_rollout_budget_ms`` (optional) imposes an *additional*,
+    per-rollout deadline on top of ``hard_stop_at``. The inner
+    effective deadline is ``min(hard_stop_at, now + per_rollout_budget)``.
+    This guards against the fat-tail case observed in diag_rollout_deadline:
+    while the bulk of rollouts finish in <200 ms at depth=15, one in
+    every ~200 naturally runs 600-700 ms (state where the heuristic
+    walks every reachable target on every ply). Without this bound, a
+    single unlucky rollout early in a search can consume the whole
+    ``hard_stop_at`` window, leaving later rollouts with zero budget
+    AND blowing past the outer MCTS deadline. The per-rollout cap is
+    what keeps p99.something bounded, not just p95.
     """
+    # Compute the effective inner deadline. Every subsequent
+    # ``Deadline(hard_stop_at=...)`` and deadline check uses this
+    # tighter value — the outer search deadline (hard_stop_at) still
+    # wins when it's closer, but per_rollout_budget_ms caps the worst-
+    # case single rollout.
+    effective_stop: Optional[float] = hard_stop_at
+    if per_rollout_budget_ms is not None:
+        rollout_cap = time.perf_counter() + per_rollout_budget_ms / 1000.0
+        if effective_stop is None or rollout_cap < effective_stop:
+            effective_stop = rollout_cap
+
+    # Build an inner deadline_fn that respects the per-rollout cap
+    # even if the outer caller only passed a global deadline_fn.
+    inner_deadline_fn: Optional[Callable[[], bool]]
+    if effective_stop is not None:
+        _stop = effective_stop  # capture
+
+        def inner_deadline_fn() -> bool:  # noqa: E306
+            return time.perf_counter() >= _stop
+    else:
+        inner_deadline_fn = deadline_fn
+
     eng = FastEngine(
         copy.deepcopy(base_state),
         num_agents=num_agents,
         rng=rng,
     )
 
-    # Turn 0: my root action + heuristic for opponents.
+    # Late deadline check: sequential_halving's pre-rollout gate catches
+    # "deadline fired before this rollout starts", but we can still
+    # have fired by the time deepcopy + FastEngine init complete — AND
+    # the single `opp.act()` call below on dense mid-game states runs
+    # 100-300 ms, which is the observed source of the remaining tail
+    # (audit pass 3: max 1190 ms vs 900 ms ceiling). Short-circuit here
+    # so the in-flight rollout costs ~deepcopy (~1 ms) instead of a full
+    # turn-0. This caps the observed overshoot from ~300 ms to ~5 ms.
+    if inner_deadline_fn is not None and inner_deadline_fn():
+        return _score_from_engine(eng, my_player, num_agents)
+
+    # Turn 0: my root action + opp's turn-0 response.
+    # If the caller pre-computed opp's turn-0 (the decoupled sim-move
+    # path passes one opp candidate per rollout), skip the heuristic
+    # call entirely — saves 100-300 ms per rollout on dense states.
     actions: List[Optional[List]] = [None] * num_agents
     actions[my_player] = my_action
     for i in range(num_agents):
         if i == my_player:
             continue
-        opp = opp_agent_factory()
-        actions[i] = opp.act(eng.observation(i), Deadline())
+        if opp_turn0_action is not None:
+            actions[i] = opp_turn0_action
+        else:
+            opp = opp_agent_factory()
+            actions[i] = opp.act(
+                eng.observation(i), Deadline(hard_stop_at=effective_stop),
+            )
     eng.step(actions)
 
-    # Turns 1..depth-1: heuristic on both sides.
+    # Turns 1..depth-1: heuristic on both sides. Abort between plies
+    # if the deadline has fired — the cost of an extra ply is unbounded
+    # (HeuristicAgent's fleet-arrival table scales with fleet count)
+    # so we pay the check on every ply, not just every rollout.
     for _ in range(max(0, depth - 1)):
         if eng.done:
+            break
+        if inner_deadline_fn is not None and inner_deadline_fn():
             break
         actions = [None] * num_agents
         for i in range(num_agents):
             factory = my_future_factory if i == my_player else opp_agent_factory
             agent = factory()
-            actions[i] = agent.act(eng.observation(i), Deadline())
+            actions[i] = agent.act(
+                eng.observation(i), Deadline(hard_stop_at=effective_stop),
+            )
         eng.step(actions)
 
     return _score_from_engine(eng, my_player, num_agents)
@@ -462,6 +574,14 @@ class GumbelRootSearch:
     gumbel_cfg: GumbelConfig = field(default_factory=GumbelConfig)
     rng_seed: Optional[int] = None
     opp_policy_override: Optional[Callable[[], Any]] = None
+    # Decoupled sim-move root (Path B / W3). When set, called each turn
+    # with (obs, opp_player) to produce a list of candidate opp wire
+    # actions. If the list has >=2 distinct actions and
+    # ``gumbel_cfg.use_decoupled_sim_move`` is True, search runs the
+    # decoupled UCB bandit from sim_move.py instead of sequential_halving.
+    # Typically populated by MCTSAgent from the Bayesian posterior's
+    # top-K archetypes when the posterior has concentrated.
+    opp_candidate_builder: Optional[Callable[[Any, int], List[List[List]]]] = None
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.rng_seed)
@@ -501,6 +621,7 @@ class GumbelRootSearch:
         self, obs: Any, my_player: int, num_agents: int = 2,
         start_time: Optional[float] = None,
         anchor_action: Optional[List[List]] = None,
+        outer_hard_stop_at: Optional[float] = None,
     ) -> Optional[SearchResult]:
         """Run search for one turn. Returns None if no legal moves exist.
 
@@ -509,6 +630,19 @@ class GumbelRootSearch:
         never prunes it. This turns MCTSAgent into a guaranteed floor:
         if search can't beat the heuristic, we return the heuristic's
         action.
+
+        ``outer_hard_stop_at`` (optional, absolute ``time.perf_counter()``
+        seconds): an EXTERNAL ceiling from the caller (typically
+        MCTSAgent's outer Deadline). The rollout and SH deadlines are
+        internally capped at ``min(own_deadline, outer_hard_stop_at)``
+        so search cannot run past the caller's turn budget even if
+        safe_budget math upstream was loose. This is the
+        belt-and-suspenders guard that converts audit outliers (e.g.
+        985 ms on a 900 ms ceiling) into bounded 880 ms worst case.
+        Without it, the search's `hard_deadline_ms` is relative-to-
+        start and has no notion of "the outer turn-budget has already
+        been eaten by a slow pre-search". This parameter closes that
+        gap.
         """
         from orbitwars.bots.heuristic import ArrivalTable, parse_obs
 
@@ -573,6 +707,27 @@ class GumbelRootSearch:
         )
         base_state = eng.state
 
+        # Per-rollout deadline: SH's own deadline ∩ caller's outer hard
+        # stop. When the wall-clock overshoots, `_rollout_value` short-
+        # circuits between plies and returns the mid-rollout engine
+        # score. This caps a single rollout's over-deadline overshoot
+        # to ~one ply instead of "all remaining plies at worst-case
+        # heuristic cost".
+        #
+        # The ∩ with outer_hard_stop_at is the load-bearing audit fix:
+        # without it, a slow pre-search that eats the turn budget still
+        # hands the full hard_deadline_ms window to SH, and SH's
+        # in-flight rollout can push total turn time past the outer
+        # actTimeout. With it, SH naturally runs less when the budget
+        # was already consumed upstream, and the overall turn time is
+        # bounded by the outer ceiling regardless of pre-search cost.
+        t0_rollout = start_time if start_time is not None else time.perf_counter()
+        rollout_deadline_sec = t0_rollout + self.gumbel_cfg.hard_deadline_ms / 1000.0
+        if outer_hard_stop_at is not None and outer_hard_stop_at < rollout_deadline_sec:
+            rollout_deadline_sec = outer_hard_stop_at
+        def _rollout_deadline_fired() -> bool:
+            return time.perf_counter() > rollout_deadline_sec
+
         def rollout_fn(joint: JointAction) -> float:
             return _rollout_value(
                 base_state=base_state,
@@ -583,13 +738,121 @@ class GumbelRootSearch:
                 depth=self.gumbel_cfg.rollout_depth,
                 num_agents=num_agents,
                 rng=self._rng,  # deterministic rollouts given search seed
+                deadline_fn=_rollout_deadline_fired,
+                hard_stop_at=rollout_deadline_sec,
+                per_rollout_budget_ms=self.gumbel_cfg.per_rollout_budget_ms,
             )
 
         protected_idx = 0 if anchor_joint is not None else None
-        result = sequential_halving(
-            joints, rollout_fn, self.gumbel_cfg,
-            start_time=start_time, protected_idx=protected_idx,
-        )
+
+        # --- Decoupled sim-move branch -----------------------------------
+        # When the posterior has concentrated enough that MCTSAgent
+        # populates `opp_candidate_builder`, and the decoupled flag is on,
+        # run the 2D UCB bandit over (my_joint, opp_wire) instead of
+        # sequential_halving. The bandit marginalizes over the opp's
+        # posterior-weighted strategies — honest scoring under sim-move
+        # uncertainty. Only fires when there are >=2 distinct opp
+        # candidates (1 candidate degenerates to the baseline).
+        opp_wires: List[List[List]] = []
+        if (
+            self.gumbel_cfg.use_decoupled_sim_move
+            and self.opp_candidate_builder is not None
+            and num_agents == 2
+        ):
+            try:
+                # 2-player only for v1: opp is the other seat.
+                opp_player = 1 - my_player
+                opp_wires = list(self.opp_candidate_builder(obs, opp_player) or [])
+                # Deduplicate by wire signature so we don't waste rollouts
+                # on identical opp responses.
+                seen_opp: set = set()
+                deduped: List[List[List]] = []
+                for w in opp_wires:
+                    try:
+                        key = tuple(tuple(m) for m in w)
+                    except Exception:
+                        continue
+                    if key in seen_opp:
+                        continue
+                    seen_opp.add(key)
+                    deduped.append(w)
+                opp_wires = deduped
+            except Exception:
+                # Any builder failure → fall through to baseline SH.
+                opp_wires = []
+
+        if len(opp_wires) >= 2:
+            from orbitwars.mcts.sim_move import decoupled_ucb_root
+
+            def decoupled_rollout_fn(my_joint: JointAction, opp_wire: List[List]) -> float:
+                return _rollout_value(
+                    base_state=base_state,
+                    my_player=my_player,
+                    my_action=my_joint.to_wire(),
+                    opp_agent_factory=self._opp_factory,
+                    my_future_factory=self._my_future_factory,
+                    depth=self.gumbel_cfg.rollout_depth,
+                    num_agents=num_agents,
+                    rng=self._rng,
+                    deadline_fn=_rollout_deadline_fired,
+                    opp_turn0_action=opp_wire,
+                    hard_stop_at=rollout_deadline_sec,
+                    per_rollout_budget_ms=self.gumbel_cfg.per_rollout_budget_ms,
+                )
+
+            # Same tightening as the SH branch: cap the bandit's own
+            # deadline at the outer ceiling so the decoupled root stops
+            # dispatching rollouts in sync with the rollout-level
+            # short-circuit.
+            dec_hard_ms = self.gumbel_cfg.hard_deadline_ms
+            if outer_hard_stop_at is not None:
+                tight_ms = max(1.0, (rollout_deadline_sec - t0_rollout) * 1000.0)
+                dec_hard_ms = min(dec_hard_ms, tight_ms)
+            dres = decoupled_ucb_root(
+                my_candidates=joints,
+                opp_candidates=opp_wires,
+                rollout_fn=decoupled_rollout_fn,
+                total_sims=self.gumbel_cfg.total_sims,
+                hard_deadline_ms=dec_hard_ms,
+                start_time=start_time,
+                protected_my_idx=protected_idx,
+            )
+            # Map DecoupledSearchResult → SearchResult so the anchor-guard
+            # below operates without branching (it indexes q_values[0] as
+            # the anchor's marginal Q, which is exactly my_q_values[0]).
+            result = SearchResult(
+                best_joint=dres.best_my_joint,
+                n_rollouts=dres.n_rollouts,
+                duration_ms=dres.duration_ms,
+                q_values=list(dres.my_q_values),
+                visits=list(dres.my_visits),
+                aborted=dres.aborted,
+            )
+        else:
+            # Tighten SH's own deadline to match rollout_deadline_sec. When
+            # outer_hard_stop_at is closer than self.gumbel_cfg.hard_deadline_ms,
+            # SH must stop dispatching rollouts at that same wall time, not
+            # the config's looser value. Rebuild a temporary config so SH's
+            # internal `t0 + cfg.hard_deadline_ms/1000` == rollout_deadline_sec.
+            sh_hard_ms = self.gumbel_cfg.hard_deadline_ms
+            if outer_hard_stop_at is not None:
+                tight_ms = max(1.0, (rollout_deadline_sec - t0_rollout) * 1000.0)
+                sh_hard_ms = min(sh_hard_ms, tight_ms)
+            sh_cfg = GumbelConfig(
+                num_candidates=self.gumbel_cfg.num_candidates,
+                total_sims=self.gumbel_cfg.total_sims,
+                rollout_depth=self.gumbel_cfg.rollout_depth,
+                hard_deadline_ms=sh_hard_ms,
+                anchor_improvement_margin=self.gumbel_cfg.anchor_improvement_margin,
+                rollout_policy=self.gumbel_cfg.rollout_policy,
+                use_decoupled_sim_move=self.gumbel_cfg.use_decoupled_sim_move,
+                num_opp_candidates=self.gumbel_cfg.num_opp_candidates,
+                per_rollout_budget_ms=self.gumbel_cfg.per_rollout_budget_ms,
+            )
+            result = sequential_halving(
+                joints, rollout_fn, sh_cfg,
+                start_time=start_time, protected_idx=protected_idx,
+            )
 
         # Anchor guard: if we included an anchor, only override it when
         # the SH winner beats it by a confident margin. Rollout noise

@@ -296,6 +296,238 @@ def test_rollout_value_returns_scalar_in_range():
     assert math.isfinite(v)
 
 
+def test_rollout_value_aborts_on_deadline():
+    """When ``deadline_fn`` returns True BEFORE the first rollout ply,
+    the rollout must short-circuit entirely — zero HeuristicAgent.act()
+    calls, ~5 ms wall cost. This is load-bearing for the Kaggle 1-s
+    turn ceiling: the audit showed that a single turn-0 opp.act() on a
+    dense mid-game state runs 100-300 ms. If sequential_halving's
+    pre-rollout deadline check passes by a hair and then the rollout
+    starts, the turn-0 opp heuristic would push total turn time past
+    the 900 ms outer ceiling. The pre-turn-0 deadline check in
+    _rollout_value prevents that."""
+    obs = _mk_obs()
+    eng = FastEngine.from_official_obs(SimpleNamespace(**obs), num_agents=2)
+    base_state = eng.state
+
+    from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS, HeuristicAgent
+
+    plies_done = [0]
+
+    class _CountingHeuristic(HeuristicAgent):
+        def act(self, obs_, dl):  # type: ignore[override]
+            plies_done[0] += 1
+            return super().act(obs_, dl)
+
+    def factory():
+        return _CountingHeuristic(weights=HEURISTIC_WEIGHTS)
+
+    # Deadline already fired — rollout short-circuits before turn 0.
+    v = _rollout_value(
+        base_state=base_state,
+        my_player=0,
+        my_action=[],  # hold
+        opp_agent_factory=factory,
+        my_future_factory=factory,
+        depth=10,
+        num_agents=2,
+        deadline_fn=lambda: True,
+    )
+    assert -1.0 <= v <= 1.0
+    assert math.isfinite(v)
+    # Zero HeuristicAgent.act() calls — the short-circuit fires before
+    # turn-0 runs.
+    assert plies_done[0] == 0, (
+        f"expected 0 opp act (deadline pre-fired) but got {plies_done[0]}; "
+        f"deadline_fn was ignored"
+    )
+
+
+def test_rollout_value_propagates_hard_stop_at_to_inner_deadlines():
+    """When ``hard_stop_at`` is passed to ``_rollout_value``, each inner
+    ``agent.act(obs, Deadline(...))`` call must receive a Deadline whose
+    ``hard_stop_at`` equals the outer value. This is load-bearing: an
+    in-flight ``HeuristicAgent._plan_moves`` on a dense mid-game state
+    runs 400-700 ms of intercept math per pair; without hard_stop_at
+    propagation it can't short-circuit when the outer search deadline
+    fires and pushes total turn time past 900 ms (observed pre-fix max:
+    1172 ms against shipped 300 ms deadline + 260 ms overshoot reserve).
+    """
+    from orbitwars.bots.base import Deadline
+    from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS, HeuristicAgent
+
+    obs = _mk_obs()
+    eng = FastEngine.from_official_obs(SimpleNamespace(**obs), num_agents=2)
+    base_state = eng.state
+
+    captured: list = []
+
+    class _CapturingHeuristic(HeuristicAgent):
+        def act(self, obs_, dl):  # type: ignore[override]
+            captured.append(getattr(dl, "_hard_stop_at", "MISSING"))
+            return super().act(obs_, dl)
+
+    def factory():
+        return _CapturingHeuristic(weights=HEURISTIC_WEIGHTS)
+
+    # Use an "effectively infinite" future hard_stop so act() doesn't
+    # short-circuit and we can observe the propagated value.
+    fake_stop = time.perf_counter() + 1e6
+    _rollout_value(
+        base_state=base_state,
+        my_player=0,
+        my_action=[],
+        opp_agent_factory=factory,
+        my_future_factory=factory,
+        depth=3,
+        num_agents=2,
+        deadline_fn=lambda: False,
+        hard_stop_at=fake_stop,
+    )
+    assert captured, "rollout should have run at least one inner act()"
+    for v in captured:
+        assert v == fake_stop, (
+            f"inner Deadline.hard_stop_at={v!r}; expected {fake_stop!r} — "
+            "hard_stop_at was not propagated"
+        )
+
+
+def test_rollout_value_per_rollout_budget_tightens_inner_deadline():
+    """per_rollout_budget_ms must produce an *effective* deadline of
+    ``min(hard_stop_at, now + per_rollout_budget_ms)``. When the budget
+    cap is sooner than hard_stop_at, inner Deadlines see the tighter
+    value \u2014 not the outer hard_stop_at. This is the per-rollout fat-
+    tail guard: without it, one unlucky rollout on a step-35-ish state
+    can naturally run 685 ms and blow the outer 300 ms budget.
+    """
+    from orbitwars.bots.base import Deadline
+    from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS, HeuristicAgent
+
+    obs = _mk_obs()
+    eng = FastEngine.from_official_obs(SimpleNamespace(**obs), num_agents=2)
+    base_state = eng.state
+
+    captured: list = []
+
+    class _CapturingHeuristic(HeuristicAgent):
+        def act(self, obs_, dl):  # type: ignore[override]
+            captured.append(getattr(dl, "_hard_stop_at", "MISSING"))
+            return super().act(obs_, dl)
+
+    def factory():
+        return _CapturingHeuristic(weights=HEURISTIC_WEIGHTS)
+
+    # Outer hard_stop in the far future; per-rollout cap is 50 ms.
+    # Expectation: inner Deadlines see a hard_stop_at within ~(now, now+50ms),
+    # NOT the far-future hard_stop_at.
+    t_enter = time.perf_counter()
+    far_future = t_enter + 1e6
+    _rollout_value(
+        base_state=base_state,
+        my_player=0,
+        my_action=[],
+        opp_agent_factory=factory,
+        my_future_factory=factory,
+        depth=3,
+        num_agents=2,
+        deadline_fn=lambda: False,
+        hard_stop_at=far_future,
+        per_rollout_budget_ms=50.0,
+    )
+    assert captured, "rollout should have run at least one inner act()"
+    # Inner Deadlines must use the tighter (now + 50ms) cap, not far_future.
+    max_allowed = t_enter + 0.050 + 0.050  # slop for Python overhead
+    for v in captured:
+        assert isinstance(v, float), f"expected float hard_stop_at, got {v!r}"
+        assert v <= max_allowed, (
+            f"inner Deadline.hard_stop_at={v!r} exceeds tight cap {max_allowed!r}; "
+            "per_rollout_budget_ms not applied"
+        )
+        assert v != far_future, (
+            "inner Deadline.hard_stop_at should be the rollout cap, not "
+            "the outer hard_stop_at"
+        )
+
+
+def test_rollout_value_per_rollout_budget_bounds_wall_time():
+    """With a tight per_rollout_budget_ms (say 20 ms) and an unbounded
+    outer hard_stop_at, a full rollout must return within approximately
+    the budget + detection slack. This is the behavior the profile
+    relies on to bound single-rollout wall cost when the natural cost
+    has a fat tail (diag_rollout_deadline: max=685 ms natural).
+    """
+    obs = _mk_obs()
+    eng = FastEngine.from_official_obs(SimpleNamespace(**obs), num_agents=2)
+    base_state = eng.state
+
+    from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS, HeuristicAgent
+
+    def factory():
+        return HeuristicAgent(weights=HEURISTIC_WEIGHTS)
+
+    # Outer hard_stop far in the future so only per_rollout_budget_ms gates.
+    far_future = time.perf_counter() + 1e6
+    t0 = time.perf_counter()
+    _rollout_value(
+        base_state=base_state,
+        my_player=0,
+        my_action=[],
+        opp_agent_factory=factory,
+        my_future_factory=factory,
+        depth=15,
+        num_agents=2,
+        deadline_fn=lambda: False,
+        hard_stop_at=far_future,
+        per_rollout_budget_ms=20.0,
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    # Budget is 20 ms; allow up to 100 ms for detection slack on CI.
+    # (One heuristic ply on a tiny synthetic obs is well under 10 ms.)
+    assert elapsed_ms < 100.0, (
+        f"rollout wall time {elapsed_ms:.1f} ms exceeds tight 20 ms budget + slack"
+    )
+
+
+def test_rollout_value_runs_full_depth_when_deadline_false():
+    """Mirror of the abort test: with a False-returning deadline_fn,
+    plies proceed normally up to ``depth`` or terminal, so we can
+    trust that the deadline plumbing doesn't spuriously cut rollouts
+    short under normal operation."""
+    obs = _mk_obs()
+    eng = FastEngine.from_official_obs(SimpleNamespace(**obs), num_agents=2)
+    base_state = eng.state
+
+    from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS, HeuristicAgent
+
+    plies_done = [0]
+
+    class _CountingHeuristic(HeuristicAgent):
+        def act(self, obs_, dl):  # type: ignore[override]
+            plies_done[0] += 1
+            return super().act(obs_, dl)
+
+    def factory():
+        return _CountingHeuristic(weights=HEURISTIC_WEIGHTS)
+
+    depth = 3
+    _rollout_value(
+        base_state=base_state,
+        my_player=0,
+        my_action=[],
+        opp_agent_factory=factory,
+        my_future_factory=factory,
+        depth=depth,
+        num_agents=2,
+        deadline_fn=lambda: False,
+    )
+    # Turn 0: 1 opp.act. Turns 1..depth-1: 2 acts each (my + opp).
+    # So 1 + 2*(depth-1) = 1 + 4 = 5 when depth=3. Allow <= in case
+    # the tiny synthetic game terminates early.
+    expected_max = 1 + 2 * (depth - 1)
+    assert plies_done[0] <= expected_max
+    assert plies_done[0] >= 1, "turn-0 opp action must always run"
+
+
 # ---- GumbelRootSearch end-to-end ---------------------------------------
 
 def test_gumbel_root_search_returns_result():
@@ -406,3 +638,152 @@ def test_gumbel_root_search_margin_guard_retains_anchor():
     # Anchor preserved: its wire output matches what we passed in.
     wire = res.best_joint.to_wire()
     assert wire == [[0, 0.5, 25]]
+
+
+# ---- Decoupled sim-move branch (Path B / W3) ---------------------------
+
+def test_gumbel_root_search_uses_decoupled_when_flagged(monkeypatch):
+    """When ``use_decoupled_sim_move=True`` and ``opp_candidate_builder``
+    returns >=2 wire actions, search runs the decoupled UCB bandit from
+    sim_move.py instead of sequential_halving.
+
+    Verified by spying on ``decoupled_ucb_root``: the spy records the
+    call and delegates to the real implementation so the search still
+    returns a valid result."""
+    import orbitwars.mcts.sim_move as sim_move_mod
+    real_decoupled = sim_move_mod.decoupled_ucb_root
+    calls = []
+
+    def spy_decoupled(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_decoupled(*args, **kwargs)
+
+    monkeypatch.setattr(sim_move_mod, "decoupled_ucb_root", spy_decoupled)
+
+    def opp_builder(obs_, opp_player):
+        # Two distinct wire actions so the bandit has something to
+        # marginalize over. Hold + a small launch from planet 1 (the
+        # opp's home base in _mk_obs).
+        return [[], [[1, 0.0, 5]]]
+
+    obs = _mk_obs()
+    search = GumbelRootSearch(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=3, total_sims=6, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            use_decoupled_sim_move=True,
+            num_opp_candidates=2,
+        ),
+        rng_seed=0,
+        opp_candidate_builder=opp_builder,
+    )
+    res = search.search(obs, my_player=0)
+    assert res is not None
+    assert res.best_joint is not None
+    assert len(calls) == 1, (
+        f"decoupled_ucb_root should have fired exactly once; got {len(calls)}"
+    )
+
+
+def test_gumbel_root_search_falls_back_to_sh_when_only_one_opp_candidate(monkeypatch):
+    """Builder returns only 1 distinct opp wire → the decoupled branch
+    degenerates (marginalizing over a single strategy is a no-op), so we
+    fall back to ``sequential_halving``. Spy on both to confirm."""
+    import orbitwars.mcts.sim_move as sim_move_mod
+    import orbitwars.mcts.gumbel_search as gumbel_mod
+
+    dec_calls = []
+    sh_calls = []
+    real_sh = gumbel_mod.sequential_halving
+
+    def spy_decoupled(*args, **kwargs):
+        dec_calls.append(1)
+        raise AssertionError("should not have been called")
+
+    def spy_sh(*args, **kwargs):
+        sh_calls.append(1)
+        return real_sh(*args, **kwargs)
+
+    monkeypatch.setattr(sim_move_mod, "decoupled_ucb_root", spy_decoupled)
+    monkeypatch.setattr(gumbel_mod, "sequential_halving", spy_sh)
+
+    def opp_builder(obs_, opp_player):
+        return [[]]  # single hold candidate
+
+    obs = _mk_obs()
+    search = GumbelRootSearch(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=3, total_sims=6, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            use_decoupled_sim_move=True,
+        ),
+        rng_seed=0,
+        opp_candidate_builder=opp_builder,
+    )
+    res = search.search(obs, my_player=0)
+    assert res is not None
+    assert len(dec_calls) == 0
+    assert len(sh_calls) == 1
+
+
+def test_gumbel_root_search_falls_back_to_sh_when_flag_off(monkeypatch):
+    """Flag off → decoupled branch never fires even if a builder is set."""
+    import orbitwars.mcts.sim_move as sim_move_mod
+
+    dec_calls = []
+
+    def spy_decoupled(*args, **kwargs):
+        dec_calls.append(1)
+        raise AssertionError("should not have been called")
+
+    monkeypatch.setattr(sim_move_mod, "decoupled_ucb_root", spy_decoupled)
+
+    def opp_builder(obs_, opp_player):
+        return [[], [[1, 0.0, 5]]]
+
+    obs = _mk_obs()
+    search = GumbelRootSearch(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=3, total_sims=6, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            use_decoupled_sim_move=False,  # flag off
+        ),
+        rng_seed=0,
+        opp_candidate_builder=opp_builder,
+    )
+    res = search.search(obs, my_player=0)
+    assert res is not None
+    assert len(dec_calls) == 0
+
+
+def test_gumbel_root_search_decoupled_deduplicates_opp_wires(monkeypatch):
+    """Duplicate opp wires (same moves, same order) are collapsed before
+    dispatch — otherwise we'd waste rollouts scoring the same response
+    twice. With only one *distinct* wire, we fall back to SH."""
+    import orbitwars.mcts.sim_move as sim_move_mod
+
+    dec_calls = []
+
+    def spy_decoupled(*args, **kwargs):
+        dec_calls.append(1)
+        raise AssertionError("should not have been called after dedup")
+
+    monkeypatch.setattr(sim_move_mod, "decoupled_ucb_root", spy_decoupled)
+
+    def opp_builder(obs_, opp_player):
+        # Three entries, but all collapse to the same wire-key after dedup.
+        return [[], [], []]
+
+    obs = _mk_obs()
+    search = GumbelRootSearch(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=3, total_sims=6, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            use_decoupled_sim_move=True,
+        ),
+        rng_seed=0,
+        opp_candidate_builder=opp_builder,
+    )
+    res = search.search(obs, my_player=0)
+    assert res is not None
+    assert len(dec_calls) == 0

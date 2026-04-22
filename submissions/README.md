@@ -52,7 +52,7 @@ Should list `orbit-wars` with `userHasEntered: True`.
    ```
 3. Submit by kernel slug:
    ```powershell
-   .venv\Scripts\kaggle.exe competitions submit -c orbit-wars -k marcmeijers01/orbit-wars-noop -m "W1 dry-run"
+   .venv\Scripts\kaggle.exe competitions submit -c orbit-wars -k gardan4/orbit-wars-mcts-v2 -m "W3 first real sub"
    ```
 4. Poll status:
    ```powershell

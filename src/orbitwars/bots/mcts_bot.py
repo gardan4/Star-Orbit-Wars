@@ -61,8 +61,23 @@ class MCTSAgent(Agent):
         use_opponent_model: bool = True,
     ):
         self.weights = dict(HEURISTIC_WEIGHTS) if weights is None else dict(weights)
+        # BOKR-style angle refinement is available (set
+        # ``angle_refinement_n_grid > 1`` in your ActionConfig) but
+        # DEFAULTED OFF. Smoke testing showed refinement pushes the turn-time
+        # tail past Kaggle's 1-second actTimeout (seed=42, default
+        # deadline 300ms: max=1156ms, 2 turns over 900ms — forfeit
+        # risk). The BOKR module is wired into generate_per_planet_moves
+        # so callers can opt in for specific experiments, but the
+        # shipped MCTSAgent uses the single-angle behavior to preserve
+        # the v3 tail profile (max 882 ms, 0 over 900 ms).
         self.action_cfg = action_cfg or ActionConfig()
         self.gumbel_cfg = gumbel_cfg or GumbelConfig()
+        # Arm the decoupled sim-move branch by default. The branch is a
+        # no-op unless MCTSAgent also populates ``opp_candidate_builder``
+        # with >=2 wires (see _maybe_route_posterior_to_search), so this
+        # is backward-compat: behavior only changes once the posterior
+        # has concentrated enough to propose a multi-archetype mixture.
+        self.gumbel_cfg.use_decoupled_sim_move = True
         self._fallback = HeuristicAgent(weights=self.weights)
         self._search = GumbelRootSearch(
             weights=self.weights,
@@ -88,6 +103,8 @@ class MCTSAgent(Agent):
             "turns_observed": 0,
             "override_fires": 0,
             "override_clears": 0,
+            "builder_fires": 0,
+            "builder_clears": 0,
             "last_top_name": None,
             "last_top_prob": 0.0,
         }
@@ -97,6 +114,12 @@ class MCTSAgent(Agent):
     # the uniform 1/K baseline. Below that, the posterior is noise.
     _POSTERIOR_MIN_TURNS: int = 15
     _POSTERIOR_MIN_TOP_PROB: float = 0.35
+    # Decoupled sim-move branch gate. When the *2nd* archetype also
+    # has meaningful mass (>= 0.2 ~= ~1.5x uniform), marginalize over
+    # both via decoupled UCB. With second-top below this threshold, a
+    # single-archetype SH is strictly stronger (no rollouts wasted on
+    # a phantom branch), so we keep the builder = None.
+    _POSTERIOR_DECOUPLED_MIN_SECOND_PROB: float = 0.20
 
     def _maybe_route_posterior_to_search(self) -> None:
         """If the posterior has concentrated, set the search's opponent
@@ -120,13 +143,107 @@ class MCTSAgent(Agent):
             if self._search.opp_policy_override is not None:
                 self._search.opp_policy_override = None
                 self.telemetry["override_clears"] += 1
+            # Also make sure the decoupled builder is cleared so the
+            # search branch doesn't fire under noise.
+            if self._search.opp_candidate_builder is not None:
+                self._search.opp_candidate_builder = None
             return
         top_name = post.most_likely()
         # Late-bind the name so every call produces a fresh archetype
         # (HeuristicAgent has per-match state that rollouts must not share).
-        from orbitwars.opponent.archetypes import make_archetype
-        self._search.opp_policy_override = lambda n=top_name: make_archetype(n)
+        # When rollout_policy=="fast", swap in the flavor-matched fast
+        # rollout agent — ~30x cheaper per ply, same stylistic bias.
+        if self.gumbel_cfg.rollout_policy == "fast":
+            from orbitwars.opponent.archetypes import make_fast_archetype
+            self._search.opp_policy_override = (
+                lambda n=top_name: make_fast_archetype(n)
+            )
+        else:
+            from orbitwars.opponent.archetypes import make_archetype
+            self._search.opp_policy_override = (
+                lambda n=top_name: make_archetype(n)
+            )
         self.telemetry["override_fires"] += 1
+
+        # Decoupled UCB branch: fires only when the *second* archetype
+        # also has real mass. Marginalizing over a phantom 2nd branch
+        # wastes rollouts, so below the threshold we leave the builder
+        # = None and the search falls back to plain Sequential Halving.
+        sorted_probs = sorted(dist, reverse=True)
+        if (
+            len(sorted_probs) >= 2
+            and sorted_probs[1] >= self._POSTERIOR_DECOUPLED_MIN_SECOND_PROB
+        ):
+            self._search.opp_candidate_builder = self._build_opp_candidates
+            self.telemetry["builder_fires"] = (
+                self.telemetry.get("builder_fires", 0) + 1
+            )
+        else:
+            if self._search.opp_candidate_builder is not None:
+                self._search.opp_candidate_builder = None
+                self.telemetry["builder_clears"] = (
+                    self.telemetry.get("builder_clears", 0) + 1
+                )
+
+    def _build_opp_candidates(self, obs: Any, opp_player: int):
+        """Compute opp's wire action under each of the top-K archetypes.
+
+        Called by ``GumbelRootSearch`` when the decoupled sim-move branch
+        is armed. Returns a list of wire actions — one per archetype —
+        that the bandit marginalizes over.
+
+        Fails closed: any exception returns ``[]``, which makes the
+        search fall back to plain Sequential Halving (the pre-decoupled
+        shipped behavior). This is the contract the search relies on.
+        """
+        try:
+            post = self.opp_posterior
+            if post is None:
+                return []
+            k = max(1, int(self.gumbel_cfg.num_opp_candidates))
+            dist = post.distribution()
+            # Rank archetypes by posterior mass, descending. Keep only
+            # those with non-negligible mass (>= second-prob threshold
+            # / 2) so a near-uniform posterior doesn't pad the list
+            # with noise candidates.
+            floor = 0.5 * self._POSTERIOR_DECOUPLED_MIN_SECOND_PROB
+            ranked = sorted(
+                [(i, float(p)) for i, p in enumerate(dist)],
+                key=lambda ip: -ip[1],
+            )
+            names = [post.names[i] for i, p in ranked[:k] if p >= floor]
+            if len(names) < 2:
+                return []
+
+            # Build opp's observation once via a temporary FastEngine
+            # (perspective-swap). Cheap — a dict shim + a FastEngine
+            # construction, comparable to what search already does
+            # per-rollout.
+            from orbitwars.engine.fast_engine import FastEngine
+            from orbitwars.mcts.gumbel_search import _obs_to_namespace
+            from orbitwars.opponent.archetypes import make_archetype
+
+            eng = FastEngine.from_official_obs(
+                _obs_to_namespace(obs), num_agents=2,
+            )
+            opp_obs = eng.observation(opp_player)
+
+            wires = []
+            # Fresh Deadline per archetype — generous, since this is
+            # called from inside the outer turn budget and the archetype
+            # .act()s are cheap heuristic passes (<5 ms each).
+            for name in names:
+                dl = Deadline()
+                try:
+                    agent = make_archetype(name)
+                    wire = agent.act(opp_obs, dl)
+                except Exception:
+                    continue
+                if isinstance(wire, list):
+                    wires.append(wire)
+            return wires
+        except Exception:
+            return []
 
     def act(self, obs: Any, deadline: Deadline) -> Action:
         # Always stage no_op first so any premature return is legal.
@@ -159,12 +276,15 @@ class MCTSAgent(Agent):
             # Also clear any stale override from the previous match — the
             # new opponent is an unknown, back to default heuristic rollouts.
             self._search.opp_policy_override = None
+            self._search.opp_candidate_builder = None
             # Reset per-match telemetry so smokes running back-to-back
             # matches don't see stale counts leaking across games.
             self.telemetry = {
                 "turns_observed": 0,
                 "override_fires": 0,
                 "override_clears": 0,
+                "builder_fires": 0,
+                "builder_clears": 0,
                 "last_top_name": None,
                 "last_top_prob": 0.0,
             }
@@ -202,8 +322,25 @@ class MCTSAgent(Agent):
             return heuristic_move
 
         # Tighten the search-internal deadline to whatever the outer
-        # Deadline gives us, minus a small safety margin for wrap-up.
-        safe_budget = min(self.gumbel_cfg.hard_deadline_ms, remaining - 40.0)
+        # Deadline gives us, minus:
+        #   * _ROLLOUT_OVERSHOOT_BUDGET_MS (260): after sequential_halving's
+        #     hard deadline fires, the in-flight rollout can still run its
+        #     turn-0 opp-heuristic call + step before the per-ply check in
+        #     _rollout_value short-circuits the rest. On dense mid-game
+        #     states that overshoot hits ~200-270 ms. Observed (audit pass
+        #     2): max turn 1172 ms vs 900 ms outer ceiling → 272 ms
+        #     overshoot. Reserve 260 ms so worst case lands under 900 ms.
+        #   * 40 ms: post-search wrap-up (action encoding, staging).
+        # Without this reservation, a slow pre-search (heuristic.act on a
+        # fleet-heavy state + posterior.observe) burns most of the outer
+        # budget and the search's internal 300 ms deadline can push total
+        # elapsed past 900 ms. The audit measures EXACTLY this number.
+        _ROLLOUT_OVERSHOOT_BUDGET_MS = 260.0
+        _WRAPUP_BUDGET_MS = 40.0
+        safe_budget = min(
+            self.gumbel_cfg.hard_deadline_ms,
+            remaining - _ROLLOUT_OVERSHOOT_BUDGET_MS - _WRAPUP_BUDGET_MS,
+        )
         if safe_budget <= 10.0:
             return heuristic_move
 
@@ -216,6 +353,32 @@ class MCTSAgent(Agent):
             rollout_depth=self.gumbel_cfg.rollout_depth,
             hard_deadline_ms=safe_budget,
             anchor_improvement_margin=self.gumbel_cfg.anchor_improvement_margin,
+        )
+
+        # Compute the caller-side outer hard stop: the latest wall-clock
+        # instant at which search must return. We reserve
+        # _OUTER_CEILING_MARGIN_MS between this stop and HARD_DEADLINE_MS
+        # so that an in-flight rollout short-circuiting "one inner
+        # iteration after the deadline fires" still lands under the
+        # outer actTimeout.
+        #
+        # _OUTER_CEILING_MARGIN_MS budget:
+        #   ~100 ms  — worst-case single-inner-iteration cost in
+        #              HeuristicAgent._plan_moves on a dense late-game
+        #              state (comments on that loop cite ~100-300 ms for
+        #              the full outer iteration; one inner-iteration
+        #              slice is the overshoot from a fired deadline).
+        #   ~20  ms  — action encoding + deadline.stage + any
+        #              in-wrapper gc.collect the harness includes in
+        #              the turn-time measurement.
+        #   -------
+        #    120 ms  — conservative ceiling; tighten once we have
+        #              audit data confirming the real pathological
+        #              ply cost is lower than 100 ms.
+        _OUTER_CEILING_MARGIN_MS = 120.0
+        outer_hard_stop_at = (
+            time.perf_counter()
+            + max(0.0, remaining - _OUTER_CEILING_MARGIN_MS) / 1000.0
         )
 
         # Wrap the entire swap+search+restore so ANY failure (including
@@ -233,6 +396,7 @@ class MCTSAgent(Agent):
             result = self._search.search(
                 obs, my_player, start_time=t0,
                 anchor_action=heuristic_move,
+                outer_hard_stop_at=outer_hard_stop_at,
             )
         except Exception:
             return heuristic_move

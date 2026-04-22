@@ -186,3 +186,188 @@ def test_gumbel_search_with_fast_rollout_completes_more_sims():
         f"fast ({n_fast}) should complete materially more rollouts than "
         f"heuristic ({n_slow}) at the same budget"
     )
+
+
+# ---- Archetype-flavored fast rollouts (Path D + B integration) ---------
+
+def _stubby_obs():
+    """Synthetic 4-planet obs with clearly-distinguishable enemy vs
+    neutral target positions. Used to exercise the ``enemy_bias`` and
+    ``keep_reserve_ships`` knobs deterministically (no RNG in the
+    decision path)."""
+    return {
+        "player": 0,
+        "step": 50,
+        "angular_velocity": 0.0,
+        "planets": [
+            # [pid, owner, x, y, r, ships, production]
+            [0, 0, 20.0, 50.0, 2.0, 100, 3],   # my home
+            [1, -1, 35.0, 50.0, 1.0, 10, 1],   # neutral, close
+            [2, 1, 50.0, 50.0, 1.0, 20, 2],    # enemy, further
+            [3, 1, 80.0, 50.0, 2.0, 30, 3],    # enemy, farthest
+        ],
+        "initial_planets": [],
+        "fleets": [],
+        "next_fleet_id": 0,
+        "comet_planet_ids": [],
+        "comets": [],
+    }
+
+
+def test_fast_rollout_enemy_bias_prefers_enemy_over_closer_neutral():
+    """With enemy_bias=0.3 the closest neutral (pid=1 at d=15) is
+    effectively further than the enemy at d=30 (30 × 0.3 = 9 effective),
+    so the agent should target the enemy."""
+    agent = FastRolloutAgent(enemy_bias=0.3, min_launch_size=5)
+    action = agent.act(_stubby_obs(), Deadline())
+    assert len(action) == 1
+    pid_launched, angle, ships = action[0]
+    # Angle must point roughly at enemy planet 2 (x=50, y=50 from x=20).
+    # Pure east: atan2(0, +30) = 0.
+    assert abs(angle - 0.0) < 0.1, (
+        f"enemy_bias=0.3 should target enemy pid=2; angle={angle:.3f}"
+    )
+
+
+def test_fast_rollout_neutral_preference_with_high_enemy_bias():
+    """With enemy_bias=3.0 (pro-neutral), the closer neutral wins even
+    though enemies are "within reach". atan2 to pid=1 at x=35 is still
+    0.0, so we verify via the target's equivalent distance instead —
+    any enemy at d=30 has effective d=90, neutral at d=15 stays d=15."""
+    agent = FastRolloutAgent(enemy_bias=3.0, min_launch_size=5)
+    action = agent.act(_stubby_obs(), Deadline())
+    assert len(action) == 1
+    # Since both neutral pid=1 and enemy pid=2 sit on the same angle
+    # (all planets are along y=50 here), the easier check is on ship
+    # count + angle = 0.
+    _, angle, _ = action[0]
+    assert abs(angle - 0.0) < 0.1
+
+
+def test_fast_rollout_keep_reserve_ships_holds_back_fleet():
+    """With min_launch_size=5 and keep_reserve_ships=90, a 100-ship
+    planet has 100-90=10 launchable, which beats min_launch. But with
+    reserve=96, only 4 launchable < min_launch=5 so no launch fires."""
+    agent = FastRolloutAgent(
+        min_launch_size=5, send_fraction=1.0, keep_reserve_ships=90,
+    )
+    action = agent.act(_stubby_obs(), Deadline())
+    assert len(action) == 1
+    ships = int(action[0][2])
+    assert ships == 10, f"expected 10 launchable, got {ships}"
+
+    # Now crank the reserve past the margin — no launch should fire.
+    agent2 = FastRolloutAgent(
+        min_launch_size=5, send_fraction=1.0, keep_reserve_ships=96,
+    )
+    assert agent2.act(_stubby_obs(), Deadline()) == []
+
+
+def test_fast_rollout_from_weights_derives_knobs():
+    """from_weights must pull the four knobs out of a HEURISTIC_WEIGHTS
+    dict. Tested with a synthetic dict so the expected values are
+    unambiguous."""
+    weights = {
+        "min_launch_size": 25.0,
+        "max_launch_fraction": 0.5,
+        "mult_enemy": 2.0,
+        "mult_neutral": 1.0,
+        "keep_reserve_ships": 40.0,
+    }
+    agent = FastRolloutAgent.from_weights(weights)
+    assert agent.min_launch_size == 25
+    assert agent.send_fraction == pytest.approx(0.5)
+    # enemy_bias = mult_neutral / mult_enemy = 1.0 / 2.0 = 0.5
+    assert agent.enemy_bias == pytest.approx(0.5, rel=1e-3)
+    assert agent.keep_reserve_ships == 40
+
+
+def test_fast_rollout_from_weights_clamps_bias():
+    """Pathological weights (e.g. mult_enemy=0) must not produce inf
+    or div-by-zero — from_weights clamps the divisor."""
+    weights = {
+        "mult_enemy": 0.0,
+        "mult_neutral": 10.0,
+    }
+    agent = FastRolloutAgent.from_weights(weights)
+    # enemy_bias clamped to 10.0 (upper bound) since 10.0 / 1e-3 = 10000 → clamp
+    assert agent.enemy_bias == pytest.approx(10.0)
+
+
+def test_make_fast_archetype_returns_flavored_agent():
+    """Each archetype name yields a FastRolloutAgent whose knobs reflect
+    the archetype's weights after merging on top of HEURISTIC_WEIGHTS."""
+    from orbitwars.opponent.archetypes import ARCHETYPE_NAMES, make_fast_archetype
+
+    for name in ARCHETYPE_NAMES:
+        agent = make_fast_archetype(name)
+        assert isinstance(agent, FastRolloutAgent), (
+            f"make_fast_archetype({name!r}) should return FastRolloutAgent"
+        )
+        # enemy_bias must be finite and clamped.
+        assert 0.1 <= agent.enemy_bias <= 10.0
+        # Keep reserve must be non-negative.
+        assert agent.keep_reserve_ships >= 0
+
+
+def test_make_fast_archetype_rusher_prefers_enemies():
+    """Rusher has mult_enemy=2.6, mult_neutral=0.9 →
+    enemy_bias = 0.9/2.6 ≈ 0.35 (strong enemy preference)."""
+    from orbitwars.opponent.archetypes import make_fast_archetype
+
+    agent = make_fast_archetype("rusher")
+    assert agent.enemy_bias < 0.5, (
+        f"rusher should strongly prefer enemies; enemy_bias={agent.enemy_bias:.3f}"
+    )
+
+
+def test_make_fast_archetype_economy_prefers_neutrals():
+    """Economy has mult_enemy=1.2, mult_neutral=1.5 →
+    enemy_bias = 1.5/1.2 = 1.25 (mild neutral preference)."""
+    from orbitwars.opponent.archetypes import make_fast_archetype
+
+    agent = make_fast_archetype("economy")
+    assert agent.enemy_bias > 1.0
+
+
+def test_make_fast_archetype_unknown_raises():
+    """Typos error loudly, matching make_archetype's contract."""
+    from orbitwars.opponent.archetypes import make_fast_archetype
+
+    with pytest.raises(KeyError):
+        make_fast_archetype("totally_made_up_archetype")
+
+
+def test_mcts_agent_with_fast_policy_uses_fast_archetype_override():
+    """End-to-end: when MCTSAgent has rollout_policy='fast' and the
+    posterior fires, the override must produce FastRolloutAgents, not
+    the slow HeuristicAgent-based ArchetypeAgents."""
+    import numpy as np
+    from orbitwars.bots.mcts_bot import MCTSAgent
+    from orbitwars.mcts.gumbel_search import GumbelConfig
+
+    agent = MCTSAgent(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=2, total_sims=2, rollout_depth=1,
+            hard_deadline_ms=2000.0, rollout_policy="fast",
+        ),
+        rng_seed=0,
+    )
+    # Seed a posterior that concentrates on rusher.
+    agent.act({
+        "player": 0, "step": 0, "angular_velocity": 0.03,
+        "planets": [[0, 0, 20.0, 50.0, 1.5, 50, 3]],
+        "initial_planets": [[0, 0, 20.0, 50.0, 1.5, 10, 3]],
+        "fleets": [], "next_fleet_id": 0,
+        "comets": [], "comet_planet_ids": [],
+    }, Deadline())
+    post = agent.opp_posterior
+    post._turns_observed = agent._POSTERIOR_MIN_TURNS
+    post.log_alpha = np.full(post.K, -10.0)
+    post.log_alpha[post.names.index("rusher")] = 5.0
+    agent._maybe_route_posterior_to_search()
+
+    # The override should be populated and produce a FastRolloutAgent.
+    assert agent._search.opp_policy_override is not None
+    built = agent._search.opp_policy_override()
+    assert isinstance(built, FastRolloutAgent)

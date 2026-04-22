@@ -1,5 +1,5 @@
 # Auto-generated Orbit Wars submission. Do not edit by hand.
-# Built by tools/bundle.py on 2026-04-22 18:34:01.
+# Built by tools/bundle.py on 2026-04-22 21:05:09.
 # Bot: mcts_bot
 #
 # Single-file submission: Kaggle will import this and call agent(obs, cfg).
@@ -377,13 +377,23 @@ class Deadline:
             improved = search_one_step()
             dl.stage(improved)
         return dl.best()
+
+    ``hard_stop_at`` (optional, in ``time.perf_counter()`` seconds) is an
+    *external* absolute deadline. When set, ``should_stop()`` fires at
+    that instant regardless of per-call elapsed time. Used by MCTS
+    rollouts to propagate the search's outer deadline into the rollout's
+    inner ``HeuristicAgent.act`` calls — without this, a single in-flight
+    heuristic.act on a dense mid-game state (400-700 ms observed) can
+    blow past the outer deadline while its own per-call ``Deadline()``
+    still shows "plenty of time left".
     """
 
-    __slots__ = ("_t0", "_best")
+    __slots__ = ("_t0", "_best", "_hard_stop_at")
 
-    def __init__(self) -> None:
+    def __init__(self, hard_stop_at: float | None = None) -> None:
         self._t0 = time.perf_counter()
         self._best: Action = no_op()
+        self._hard_stop_at = hard_stop_at
 
     def stage(self, action: Action) -> None:
         """Mark this action as the current best; returned if deadline hits."""
@@ -396,6 +406,10 @@ class Deadline:
         return deadline_ms - self.elapsed_ms()
 
     def should_stop(self, deadline_ms: float = SEARCH_DEADLINE_MS) -> bool:
+        # An external hard stop (e.g. outer MCTS deadline) always wins.
+        if self._hard_stop_at is not None:
+            if time.perf_counter() >= self._hard_stop_at:
+                return True
         return self.elapsed_ms() >= deadline_ms
 
     def best(self) -> Action:
@@ -675,16 +689,29 @@ class ArrivalTable:
         return ships
 
 
-def build_arrival_table(po: ParsedObs) -> ArrivalTable:
+def build_arrival_table(
+    po: ParsedObs, deadline: Optional[Deadline] = None,
+) -> ArrivalTable:
     """Populate arrival events for every in-flight fleet against its target.
 
     We estimate the target by: the closest planet along the fleet's heading.
     That's imperfect (fleets can target any point in space or a planet that's
     rotated by arrival time), but it's good enough for a first-cut defense
     signal. The MCTS wrapper will replace this with a more precise estimate.
+
+    ``deadline`` (optional) is checked between fleet iterations. This loop
+    is O(fleets \u00d7 planets) with a Newton-intercept solve per pair \u2014 on
+    dense late-game states (40+ fleets, 40+ planets) it runs 100-300 ms.
+    Without a mid-loop check, an in-flight rollout can blow past the outer
+    search deadline by the full duration of this function. When the
+    deadline fires, we return the partial table accumulated so far; that
+    is still a valid input to downstream scoring (just undercounts arrivals
+    for the unvisited fleets).
     """
     table = ArrivalTable()
     for f in po.fleets:
+        if deadline is not None and deadline.should_stop():
+            break
         fid, owner, fx, fy, fangle, from_pid, fships = f
         # Best guess of target: planet whose perpendicular distance from fleet
         # ray is minimal and the planet is ahead of the fleet.
@@ -842,9 +869,25 @@ class HeuristicAgent(Agent):
         if not po.my_planets:
             return no_op()
 
-        table = build_arrival_table(po)
+        # Outer-deadline check between stages: build_arrival_table scales
+        # with fleet count × planet count (intercept math per pair) and
+        # on dense late-game states runs 50-200 ms. When the caller
+        # (e.g. MCTS rollouts) supplies a Deadline with an absolute
+        # hard_stop_at, short-circuit before paying that cost. Returns
+        # the no-op staged above so the call is still action-valid.
+        if deadline.should_stop():
+            return no_op()
 
-        moves: Action = self._plan_moves(po, table)
+        # Thread deadline into build_arrival_table \u2014 on dense states its
+        # O(fleets \u00d7 planets) intercept loop dominates (100-300 ms) and
+        # must be abortable mid-way or a single in-flight rollout blows
+        # past the outer search deadline.
+        table = build_arrival_table(po, deadline=deadline)
+
+        if deadline.should_stop():
+            return no_op()
+
+        moves: Action = self._plan_moves(po, table, deadline=deadline)
 
         # Cooldown bookkeeping
         for m in moves:
@@ -855,7 +898,10 @@ class HeuristicAgent(Agent):
 
     # ---- Planning ----
 
-    def _plan_moves(self, po: ParsedObs, table: ArrivalTable) -> Action:
+    def _plan_moves(
+        self, po: ParsedObs, table: ArrivalTable,
+        deadline: Optional[Deadline] = None,
+    ) -> Action:
         moves: List[Move] = []
         w = self.weights
         reserve = int(w["keep_reserve_ships"])
@@ -866,6 +912,15 @@ class HeuristicAgent(Agent):
         candidates = [p for p in po.planets]
 
         for mp in po.my_planets:
+            # Per-my-planet deadline check. The inner loop runs intercept
+            # math for every (my_planet, target) pair — 30-100 μs per pair
+            # × 40 planets = ~2 ms per outer-iteration. On dense late-game
+            # states with 20 my-planets we can still accumulate ~40 ms in
+            # the outer loop. Breaking mid-way returns the partial move
+            # list built so far (still a valid Action), which is strictly
+            # better than overrunning the outer MCTS search deadline.
+            if deadline is not None and deadline.should_stop():
+                break
             mpid = int(mp[0])
             available = int(mp[5]) - reserve
             if available < int(w["min_launch_size"]):
@@ -904,6 +959,15 @@ class HeuristicAgent(Agent):
             # We pick the best (score, size) combination.
             best = None  # (score, angle, ships_to_send, target_pid)
             for tp in candidates:
+                # Inner-loop deadline check. candidates = all planets, so
+                # this loop is O(len(planets)) per my-planet with one
+                # Newton-intercept solve per iteration via _travel_turns.
+                # On dense states it can accumulate 5-15 ms per planet;
+                # across 20 my-planets the full outer loop is 100-300 ms.
+                # Without this check, an in-flight HeuristicAgent.act call
+                # from a rollout can keep running past the search deadline.
+                if deadline is not None and deadline.should_stop():
+                    break
                 if tp[0] == mpid:
                     continue
                 ip = po.initial_planet_by_id.get(tp[0], tp)
@@ -990,11 +1054,20 @@ fast policy intentionally skips every expensive subroutine:
   * No cooldowns, no defense guards, no launch-state tracking.
 
 The one rule: from each of my planets with enough ships, send
-`send_fraction × available` at `atan2(nearest_enemy_or_neutral)`.
+`send_fraction × available` at `atan2(weighted_nearest_target)`.
 
 Expected cost per `act()` call: <500 µs — a 30-50× speedup over the
 full heuristic. Net effect at default budget:
     sims/turn goes from <1 (diagnostic only) to ~10-15 (real search).
+
+Archetype flavoring:
+  The four knobs (``min_launch_size``, ``send_fraction``,
+  ``enemy_bias``, ``keep_reserve_ships``) expose enough surface that
+  ``from_weights(HEURISTIC_WEIGHTS-style dict)`` can build a fast
+  rollout agent whose aggregate launch cadence and target preference
+  track any of the archetype configs. This is used by MCTSAgent to
+  run opp rollouts under the posterior's most-likely archetype
+  *without* paying the ~18 ms/ply HeuristicAgent cost.
 
 Invariants preserved:
   * Only my planets launch.
@@ -1009,7 +1082,7 @@ agent.
 """
 
 import math
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 
@@ -1030,6 +1103,18 @@ class FastRolloutAgent(Agent):
             HeuristicAgent default, so fast and slow rollouts produce
             comparably-sized fleets — only the target-selection logic
             differs.
+        enemy_bias: distance multiplier for enemy targets. <1.0 biases
+            toward enemies (rusher/harasser flavor); >1.0 biases toward
+            neutrals (economy/comet_camper flavor). Applied as
+            ``effective_d2 = d2 * enemy_bias^2`` for enemy targets so
+            an enemy at distance D "competes" with a neutral at
+            ``D * enemy_bias``. 1.0 recovers the original behavior
+            (pure nearest-target).
+        keep_reserve_ships: extra ship reserve held back beyond
+            ``min_launch_size``. Defender-style archetypes set this
+            high; rusher-style set it to 0. A planet launches only
+            when ``available >= min_launch_size + keep_reserve_ships``,
+            and sends at most ``available - keep_reserve_ships``.
     """
 
     name = "fast_rollout"
@@ -1038,9 +1123,43 @@ class FastRolloutAgent(Agent):
         self,
         min_launch_size: int = 20,
         send_fraction: float = 0.8,
+        enemy_bias: float = 1.0,
+        keep_reserve_ships: int = 0,
     ) -> None:
         self.min_launch_size = int(min_launch_size)
         self.send_fraction = float(send_fraction)
+        # Clamp to avoid pathological 0/negative multipliers that would
+        # make every enemy instantly dominate or disappear.
+        self.enemy_bias = float(max(0.1, min(10.0, enemy_bias)))
+        self.keep_reserve_ships = int(max(0, keep_reserve_ships))
+
+    @classmethod
+    def from_weights(cls, weights: Dict[str, float]) -> "FastRolloutAgent":
+        """Build a fast-rollout flavor matching a HEURISTIC_WEIGHTS dict.
+
+        Pulls the four knob-equivalents out of the weights and clamps
+        to sane ranges:
+          * ``min_launch_size`` (direct copy; default 20)
+          * ``max_launch_fraction`` → send_fraction (direct; default 0.8)
+          * ``mult_enemy`` / ``mult_neutral`` → enemy_bias, inverted so
+            a HIGHER mult_enemy becomes a LOWER distance multiplier
+            (i.e. stronger enemy preference). Computed as
+            ``mult_neutral / max(mult_enemy, eps)``.
+          * ``keep_reserve_ships`` (direct copy; default 0)
+
+        Unspecified keys fall back to FastRolloutAgent's own defaults.
+        """
+        mult_enemy = float(weights.get("mult_enemy", 1.0))
+        mult_neutral = float(weights.get("mult_neutral", 1.0))
+        # Inverse: lower bias = stronger enemy preference. Clamp to
+        # avoid division-by-zero if mult_enemy is plausibly 0.
+        enemy_bias = mult_neutral / max(mult_enemy, 1e-3)
+        return cls(
+            min_launch_size=int(weights.get("min_launch_size", 20)),
+            send_fraction=float(weights.get("max_launch_fraction", 0.8)),
+            enemy_bias=enemy_bias,
+            keep_reserve_ships=int(weights.get("keep_reserve_ships", 0)),
+        )
 
     def act(self, obs: Any, deadline: Deadline) -> Action:
         # Always stage a safe fallback first; if we get interrupted
@@ -1053,14 +1172,20 @@ class FastRolloutAgent(Agent):
             return no_op()
 
         # Single-pass ownership partition. Both lists hold references
-        # into the same planet entries, so we avoid copying.
+        # into the same planet entries, so we avoid copying. Enemy
+        # flagging is precomputed once so the inner loop just reads a
+        # bool rather than re-comparing owners.
         my_planets: List[Any] = []
         targets: List[Any] = []
+        target_is_enemy: List[bool] = []
         for p in planets:
-            if p[1] == player:
+            owner = p[1]
+            if owner == player:
                 my_planets.append(p)
             else:
                 targets.append(p)
+                # Any non-ours-and-non-neutral owner is an enemy.
+                target_is_enemy.append(owner != -1 and owner != player)
 
         # Either no launchers or no opponents/neutrals to push toward:
         # there is nothing useful to do.
@@ -1070,22 +1195,34 @@ class FastRolloutAgent(Agent):
         moves: Action = []
         min_size = self.min_launch_size
         frac = self.send_fraction
+        reserve = self.keep_reserve_ships
+        # Apply the bias as a squared multiplier in the distance
+        # comparison — equivalent to scaling effective distance by
+        # ``enemy_bias`` while avoiding a sqrt.
+        enemy_d2_mult = self.enemy_bias * self.enemy_bias
 
         for mp in my_planets:
             available = int(mp[5])
-            if available < min_size:
+            # Don't launch unless we can afford min_size AND still hold
+            # the reserve. A reserve of 0 recovers the original gate.
+            if available < min_size + reserve:
                 continue
 
             # Find nearest target by squared-Euclidean — no sqrt needed
             # when we only need the argmin. This is the hot inner loop.
+            # enemy targets' effective distance is scaled by
+            # ``enemy_bias`` so enemy-leaning archetypes prefer enemies
+            # even when a neutral is marginally closer.
             mx = float(mp[2])
             my_ = float(mp[3])
             best_d2 = float("inf")
             best_tp: Optional[Any] = None
-            for tp in targets:
+            for tp, is_enemy in zip(targets, target_is_enemy):
                 dx = float(tp[2]) - mx
                 dy = float(tp[3]) - my_
                 d2 = dx * dx + dy * dy
+                if is_enemy:
+                    d2 *= enemy_d2_mult
                 if d2 < best_d2:
                     best_d2 = d2
                     best_tp = tp
@@ -1104,11 +1241,15 @@ class FastRolloutAgent(Agent):
                 float(best_tp[2]) - mx,
             )
 
-            ships = int(available * frac)
+            # Ship count respects both send_fraction and the reserve
+            # floor. send_fraction on (available - reserve) so the
+            # reserve is literally set aside.
+            launchable = available - reserve
+            ships = int(launchable * frac)
             if ships < min_size:
                 ships = min_size
-            if ships > available:
-                ships = available
+            if ships > launchable:
+                ships = launchable
 
             moves.append([int(mp[0]), float(angle), int(ships)])
 
@@ -2012,6 +2153,247 @@ class FastEngine:
 
 
 
+# --- inlined: orbitwars/mcts/bokr_widen.py ---
+
+"""BOKR-style kernel regression over UCB values for continuous-angle sub-actions.
+
+Inspired by Ji et al. 2025 (Bayesian Optimized Kernel Regression for
+continuous-action MCTS; validated on orbital planning tasks). The idea:
+
+  * Classical progressive widening treats each newly-added angle as a
+    fresh arm and tracks per-angle visit/value statistics independently.
+    With a 1-second budget we expand ~O(10-50) rollouts per planet —
+    not enough to separate signal from noise on 20 candidate angles.
+  * Kernel regression shares value across nearby angles via a Gaussian
+    kernel `K(θ, θ') = exp(-((θ-θ')/h)^2)`. The estimate at candidate θ
+    becomes a weighted average of ALL observations, not just those that
+    landed on θ exactly. Small angle perturbations then accumulate
+    evidence together — much higher sample efficiency.
+  * An exploration bonus on the "effective visit count"
+    `n_eff(θ) = sum_i K(θ, θ_i)` gives the UCB term. Angles far from
+    prior observations have low n_eff → high bonus → explored next.
+
+Why this fits Orbit Wars specifically:
+
+  * The heuristic emits one analytic intercept angle per target; nearby
+    angles (±5-10°) correspond to ships that pass the target on one side
+    or the other — materially different trajectories for orbiting
+    targets. Pure argmax from heuristic misses this continuous structure.
+  * Angles wrap modulo 2π. The kernel here operates on the circular
+    angular difference so θ=0 and θ=2π-ε are treated as neighbors.
+  * We deliberately keep this a root-level refiner: given a base angle
+    from the heuristic, it proposes a fine grid around it and picks
+    which grid point MCTS should rollout next. No tree surgery required.
+
+Scope of v1 (this module):
+
+  * Standalone `BOKRKernelSelector` class.
+  * Per-planet / per-target lifetime: construct with the analytic
+    intercept angle, accumulate (angle, value) observations via
+    ``update``, query ``select`` for the next angle to rollout, and
+    ``best_angle`` for the final pick.
+  * No neural value prior; no GP hyperparameter tuning; no shared
+    kernel bandwidth across planets. All can be added later.
+
+Non-goals for v1:
+
+  * Wiring into ``generate_per_planet_moves`` — that requires a dynamic
+    candidate set mid-search and is a heavier refactor we'll land after
+    this module ships and soaks.
+  * Full Bayesian posterior over the value surface. BOKR's original
+    formulation uses a GP; we use kernel regression + UCB because the
+    inverse-kernel-matrix solve is too expensive under a 1-second budget.
+"""
+
+import math
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+
+
+# ---- Kernel + helpers ---------------------------------------------------
+
+def _angular_diff(a: float, b: float) -> float:
+    """Minimum circular difference in radians: always in [0, pi].
+
+    Angles wrap modulo 2pi, so the raw distance `|a-b|` overstates the
+    true proximity (e.g. 0 and 2pi - 0.01 are actually 0.01 apart, not
+    nearly 2pi apart). Wraps to the smaller of the two arc-lengths.
+    """
+    d = abs(a - b) % (2.0 * math.pi)
+    return d if d <= math.pi else (2.0 * math.pi - d)
+
+
+def _gaussian_kernel(a: float, b: float, h: float) -> float:
+    """Gaussian kernel on circular angular distance, bandwidth `h`.
+
+    `h` controls how much value flows between nearby angles. Small `h`
+    (h << grid_spacing) → each angle is nearly independent; large `h`
+    → over-smoothing, all angles look identical. Tuning sweet spot is
+    `h ~ 0.5 * grid_spacing`.
+    """
+    d = _angular_diff(a, b) / max(h, 1e-9)
+    return math.exp(-d * d)
+
+
+# ---- Selector -----------------------------------------------------------
+
+@dataclass
+class BOKRKernelSelector:
+    """Kernel-UCB selector over a fine angle grid around a base angle.
+
+    Usage (per-target at a root decision):
+
+        sel = BOKRKernelSelector(base_angle=analytic_intercept)
+        for _ in range(sim_budget):
+            theta = sel.select()                          # pick next angle
+            value = rollout_at_angle(theta)               # MCTS rollout
+            sel.update(theta, value)                      # record result
+        final_angle = sel.best_angle()                    # argmax of kernel mean
+
+    Attributes:
+        base_angle: center of the grid — typically the heuristic's
+            analytic intercept angle for a given target.
+        angle_range: radians ± around ``base_angle`` covered by the grid.
+            Default 0.2 rad (~11 deg) — wide enough to find a pass-either-
+            side improvement, narrow enough that the kernel still shares
+            meaningful evidence.
+        n_grid: how many grid points inside the range (inclusive of
+            both endpoints; ``n_grid`` must be ≥ 1 and is clamped to odd
+            so the base angle is always a grid point).
+        kernel_h: Gaussian-kernel bandwidth. Default = 0.5 * grid spacing.
+        c_ucb: UCB exploration constant. 1.4 mirrors the non-root PUCT
+            setting in gumbel_search; pick lower under very noisy
+            rollouts (c=0.7) and higher when the value surface is smooth.
+        rng_seed: optional; only used to break ties in ``select``.
+    """
+
+    base_angle: float
+    angle_range: float = 0.2
+    n_grid: int = 9
+    kernel_h: Optional[float] = None
+    c_ucb: float = 1.4
+    rng_seed: Optional[int] = None
+
+    # --- Internals ------------------------------------------------------
+    # (angle, value) list of observed rollout outcomes.
+    _observations: List[Tuple[float, float]] = field(default_factory=list)
+    _grid: List[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.angle_range < 0.0:
+            raise ValueError("angle_range must be non-negative")
+        if self.n_grid < 1:
+            raise ValueError("n_grid must be >= 1")
+        # Force odd grid size so base_angle is always a grid point.
+        if self.n_grid % 2 == 0:
+            self.n_grid += 1
+        self._grid = self._build_grid()
+        if self.kernel_h is None:
+            # Sane default: half the grid spacing (matches the "nearest
+            # 1-2 grid points dominate" regime that generally works).
+            if self.n_grid >= 2:
+                spacing = (2.0 * self.angle_range) / (self.n_grid - 1)
+                self.kernel_h = 0.5 * spacing
+            else:
+                self.kernel_h = 0.1
+
+    def _build_grid(self) -> List[float]:
+        """Equally-spaced grid spanning [base - range, base + range]."""
+        if self.n_grid == 1:
+            return [float(self.base_angle)]
+        step = (2.0 * self.angle_range) / (self.n_grid - 1)
+        grid = []
+        for i in range(self.n_grid):
+            theta = self.base_angle - self.angle_range + i * step
+            # Wrap into [-pi, pi] for the external contract; kernel is
+            # already wrap-aware so this is cosmetic.
+            wrapped = ((theta + math.pi) % (2.0 * math.pi)) - math.pi
+            grid.append(wrapped)
+        return grid
+
+    # --- Public contract ------------------------------------------------
+
+    def candidate_angles(self) -> List[float]:
+        """The grid of angles this selector searches over."""
+        return list(self._grid)
+
+    def update(self, angle: float, value: float) -> None:
+        """Record a rollout outcome at ``angle``. Any angle is accepted
+        — callers usually pass grid points, but off-grid observations
+        still contribute via the kernel."""
+        self._observations.append((float(angle), float(value)))
+
+    def kernel_mean(self, angle: float) -> Tuple[float, float]:
+        """Kernel-weighted mean value at ``angle`` and its effective
+        visit count. Returns ``(mean, n_eff)``; ``mean=0, n_eff=0`` when
+        no observations exist (callers should treat that as "unvisited").
+        """
+        if not self._observations:
+            return (0.0, 0.0)
+        num = 0.0
+        den = 0.0
+        for theta_i, v_i in self._observations:
+            w = _gaussian_kernel(angle, theta_i, self.kernel_h)
+            num += w * v_i
+            den += w
+        if den <= 0.0:
+            return (0.0, 0.0)
+        return (num / den, den)
+
+    def ucb_score(self, angle: float, n_total: int) -> float:
+        """Kernel-UCB at ``angle``.
+
+        Formula::
+
+            ucb(theta) = kernel_mean(theta) + c * sqrt(log(n_total) / n_eff(theta))
+
+        Unvisited (n_eff ≈ 0) angles return +inf so ``select`` picks
+        them first — matches classical UCB1's "try each arm once" rule
+        in the zero-data regime.
+        """
+        mean, n_eff = self.kernel_mean(angle)
+        if n_eff <= 0.0 or n_total <= 0:
+            return float("inf")
+        # Defensive log: at n_total=1 log is 0 so bonus vanishes; use
+        # log(max(n_total, 2)) as is standard in UCB1 implementations.
+        bonus = self.c_ucb * math.sqrt(math.log(max(n_total, 2)) / n_eff)
+        return mean + bonus
+
+    def select(self) -> float:
+        """Return the grid angle with the highest UCB score. Ties
+        broken by grid order (deterministic given a seeded rng)."""
+        n_total = len(self._observations)
+        best_idx = 0
+        best_score = -float("inf")
+        for i, theta in enumerate(self._grid):
+            score = self.ucb_score(theta, n_total)
+            # `inf > inf` is False, so a later unvisited arm won't
+            # preempt an earlier one — preserves stable order.
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        return self._grid[best_idx]
+
+    def best_angle(self) -> float:
+        """Post-search pick: grid angle with the highest kernel-mean
+        value (no UCB bonus — exploitation only). Falls back to
+        ``base_angle`` when no observations have been recorded."""
+        if not self._observations:
+            return float(self.base_angle)
+        best_theta = self._grid[0]
+        best_mean = -float("inf")
+        for theta in self._grid:
+            mean, _ = self.kernel_mean(theta)
+            if mean > best_mean:
+                best_mean = mean
+                best_theta = theta
+        return float(best_theta)
+
+    def n_observations(self) -> int:
+        return len(self._observations)
+
+
+
 # --- inlined: orbitwars/mcts/actions.py ---
 
 """MCTS action generator for HeuristicAgent-priored search.
@@ -2098,6 +2480,23 @@ class ActionConfig:
     ship_fractions: discrete send-sizes as fractions of available ships.
     softmax_temperature: higher → flatter prior (more exploration at root).
     min_launch_size: drop moves below this many ships — matches heuristic.
+
+    Angle refinement (BOKR-style):
+      angle_refinement_n_grid: per (target, ship-fraction) pair, instead
+          of emitting ONE move at the heuristic's analytic intercept,
+          emit ``angle_refinement_n_grid`` moves spread ± ``angle_refinement_range``
+          radians around it. ``1`` = current behavior (single base angle
+          per target). ``3`` = base ± offset (typical BOKR-mini); ``5`` =
+          finer grid. Odd values keep the base angle always represented.
+          Upper-bounded by the Gumbel root budget: Gumbel will halve
+          across whatever top-k arrives, so more grid points just give
+          the search more side-pass structure to discover. Keep
+          ``max_per_planet`` in mind — grid × target × fraction explodes
+          quickly without the top-K trim.
+      angle_refinement_range: half-width of the angle grid in radians.
+          ~0.1 rad ≈ 5.7° matches Kore 2022's empirical "pass on either
+          side" sweet spot for orbital targets. Wider than ~0.2 rad
+          starts aiming at nothing in particular.
     """
     max_per_planet: int = 8
     include_hold: bool = True
@@ -2105,6 +2504,8 @@ class ActionConfig:
     softmax_temperature: float = 1.0
     min_launch_size: int = 20
     hold_bonus_score: float = 0.0   # added to HOLD raw score before softmax
+    angle_refinement_n_grid: int = 1
+    angle_refinement_range: float = 0.1
 
 
 def _softmax(xs: List[float], temperature: float) -> List[float]:
@@ -2193,11 +2594,28 @@ def generate_per_planet_moves(
                 )
                 if not math.isfinite(score):
                     continue
-                move = PlanetMove(
-                    from_pid=mpid, angle=float(angle), ships=int(ships),
-                    target_pid=tpid, kind=kind, prior=0.0, raw_score=score,
-                )
-                raw.append((score, move))
+
+                # Emit angle variants around the heuristic's analytic
+                # intercept. All variants share the base raw_score
+                # because the score is ~angle-invariant at this scale —
+                # side-pass discovery is MCTS's job during search.
+                # n_grid=1 preserves the legacy single-angle behavior.
+                if cfg.angle_refinement_n_grid > 1:
+                    sel = BOKRKernelSelector(
+                        base_angle=float(angle),
+                        angle_range=float(cfg.angle_refinement_range),
+                        n_grid=int(cfg.angle_refinement_n_grid),
+                    )
+                    variant_angles = sel.candidate_angles()
+                else:
+                    variant_angles = [float(angle)]
+                for var_angle in variant_angles:
+                    move = PlanetMove(
+                        from_pid=mpid, angle=float(var_angle),
+                        ships=int(ships), target_pid=tpid, kind=kind,
+                        prior=0.0, raw_score=score,
+                    )
+                    raw.append((score, move))
 
         # Rank descending by raw_score, keep top-K.
         raw.sort(key=lambda t: t[0], reverse=True)
@@ -2383,6 +2801,35 @@ class GumbelConfig:
     # "heuristic" to preserve the shipped mcts_v1 bot's behavior
     # byte-for-byte; switch via config for A/B and future defaults.
     rollout_policy: str = "heuristic"
+    # Simultaneous-move root decoupling (Path B / W3). When True, the
+    # root treats my + opp action selection as a 2D decoupled bandit
+    # (see orbitwars.mcts.sim_move.decoupled_ucb_root). The opp
+    # candidate pool is drawn from the posterior-biased heuristic — so
+    # when the Bayesian posterior has concentrated, MCTS marginalizes
+    # over the top archetypes' responses instead of assuming a single
+    # deterministic opp heuristic. Default False — the core improvement
+    # only shows up once the posterior has evidence to concentrate on,
+    # and the 2D bandit doubles arity at fixed total_sims so it's a
+    # no-op-to-loss on turn-0-heavy matches. Flag it on once paired
+    # with (b) posterior caching.
+    use_decoupled_sim_move: bool = False
+    # Number of opp candidate actions to sample when decoupling is on.
+    # Typical: 2-3. Larger K = better marginalization, worse per-cell
+    # noise under fixed total_sims. 2 is the minimum where decoupling
+    # is even meaningful (1 opp candidate degenerates to the baseline).
+    num_opp_candidates: int = 2
+    # Per-rollout wall-clock cap, in milliseconds. ``_rollout_value``
+    # enforces ``min(hard_stop_at, rollout_start + per_rollout_budget)``
+    # as its inner deadline, so no single rollout can blow past the
+    # whole search budget. Measured fat tail on step-35-ish states:
+    # natural rollout cost has p50 ~0.1 ms (many rollouts end at
+    # eng.done) but max ~685 ms in 200 samples (see
+    # tools/diag_rollout_deadline). Without the cap, a single unlucky
+    # rollout eats the entire ``hard_deadline_ms`` window and the
+    # overall act() can overshoot 1 s \u2014 a Kaggle-forfeit risk.
+    # 150 ms is ~2\u00d7 the natural median for the heavy-state regime and
+    # leaves room for n_sim \u2265 2 under the 300 ms default deadline.
+    per_rollout_budget_ms: float = 150.0
 
 
 # ---------------------------- Gumbel top-k --------------------------------
@@ -2488,14 +2935,20 @@ def _rollout_value(
     num_agents: int = 2,
     rng: Optional[random.Random] = None,
     deadline_fn: Optional[Callable[[], bool]] = None,
+    opp_turn0_action: Optional[List[List]] = None,
+    hard_stop_at: Optional[float] = None,
+    per_rollout_budget_ms: Optional[float] = None,
 ) -> float:
     """Simulate `depth` plies from a cloned state; return scalar value.
 
-    Turn 0 uses the candidate root action for `my_player` and the
-    opponent's heuristic for others. Subsequent turns use fresh
-    heuristic instances on both sides. Fresh instances because
-    HeuristicAgent carries per-match state (`_state.last_launch_turn`)
-    that shouldn't leak across rollouts.
+    Turn 0 uses the candidate root action for `my_player`. The opp
+    turn-0 action is either ``opp_turn0_action`` (if supplied — e.g. a
+    pre-computed archetype pick in decoupled sim-move search) or the
+    result of ``opp_agent_factory().act()`` (the default heuristic).
+    Subsequent turns use fresh heuristic instances on both sides.
+
+    Fresh instances because HeuristicAgent carries per-match state
+    (`_state.last_launch_turn`) that shouldn't leak across rollouts.
 
     The `rng` is forwarded into the rollout engine for comet-ship
     sizing so rollouts are reproducible given the search seed. If
@@ -2508,7 +2961,50 @@ def _rollout_value(
     above the deadline" — critical for the 1-s Kaggle turn ceiling
     because a late-game HeuristicAgent ply can take 30-100 ms and
     unchecked rollouts have been observed to blow past 900 ms.
+
+    ``hard_stop_at`` (optional, absolute ``time.perf_counter()``
+    seconds) propagates the outer search deadline into each inner
+    ``agent.act()`` call via ``Deadline(hard_stop_at=...)``. Without
+    this, an in-flight ``HeuristicAgent.act`` on a dense mid-game
+    state (profile: 400-700 ms) can overshoot the search deadline by
+    hundreds of ms. With it, heuristic agents short-circuit inside
+    ``_plan_moves`` as soon as the outer deadline fires, bounding a
+    single ply's overshoot to the time needed to detect + return.
+
+    ``per_rollout_budget_ms`` (optional) imposes an *additional*,
+    per-rollout deadline on top of ``hard_stop_at``. The inner
+    effective deadline is ``min(hard_stop_at, now + per_rollout_budget)``.
+    This guards against the fat-tail case observed in diag_rollout_deadline:
+    while the bulk of rollouts finish in <200 ms at depth=15, one in
+    every ~200 naturally runs 600-700 ms (state where the heuristic
+    walks every reachable target on every ply). Without this bound, a
+    single unlucky rollout early in a search can consume the whole
+    ``hard_stop_at`` window, leaving later rollouts with zero budget
+    AND blowing past the outer MCTS deadline. The per-rollout cap is
+    what keeps p99.something bounded, not just p95.
     """
+    # Compute the effective inner deadline. Every subsequent
+    # ``Deadline(hard_stop_at=...)`` and deadline check uses this
+    # tighter value — the outer search deadline (hard_stop_at) still
+    # wins when it's closer, but per_rollout_budget_ms caps the worst-
+    # case single rollout.
+    effective_stop: Optional[float] = hard_stop_at
+    if per_rollout_budget_ms is not None:
+        rollout_cap = time.perf_counter() + per_rollout_budget_ms / 1000.0
+        if effective_stop is None or rollout_cap < effective_stop:
+            effective_stop = rollout_cap
+
+    # Build an inner deadline_fn that respects the per-rollout cap
+    # even if the outer caller only passed a global deadline_fn.
+    inner_deadline_fn: Optional[Callable[[], bool]]
+    if effective_stop is not None:
+        _stop = effective_stop  # capture
+
+        def inner_deadline_fn() -> bool:  # noqa: E306
+            return time.perf_counter() >= _stop
+    else:
+        inner_deadline_fn = deadline_fn
+
     eng = FastEngine(
         copy.deepcopy(base_state),
         num_agents=num_agents,
@@ -2523,17 +3019,25 @@ def _rollout_value(
     # (audit pass 3: max 1190 ms vs 900 ms ceiling). Short-circuit here
     # so the in-flight rollout costs ~deepcopy (~1 ms) instead of a full
     # turn-0. This caps the observed overshoot from ~300 ms to ~5 ms.
-    if deadline_fn is not None and deadline_fn():
+    if inner_deadline_fn is not None and inner_deadline_fn():
         return _score_from_engine(eng, my_player, num_agents)
 
-    # Turn 0: my root action + heuristic for opponents.
+    # Turn 0: my root action + opp's turn-0 response.
+    # If the caller pre-computed opp's turn-0 (the decoupled sim-move
+    # path passes one opp candidate per rollout), skip the heuristic
+    # call entirely — saves 100-300 ms per rollout on dense states.
     actions: List[Optional[List]] = [None] * num_agents
     actions[my_player] = my_action
     for i in range(num_agents):
         if i == my_player:
             continue
-        opp = opp_agent_factory()
-        actions[i] = opp.act(eng.observation(i), Deadline())
+        if opp_turn0_action is not None:
+            actions[i] = opp_turn0_action
+        else:
+            opp = opp_agent_factory()
+            actions[i] = opp.act(
+                eng.observation(i), Deadline(hard_stop_at=effective_stop),
+            )
     eng.step(actions)
 
     # Turns 1..depth-1: heuristic on both sides. Abort between plies
@@ -2543,13 +3047,15 @@ def _rollout_value(
     for _ in range(max(0, depth - 1)):
         if eng.done:
             break
-        if deadline_fn is not None and deadline_fn():
+        if inner_deadline_fn is not None and inner_deadline_fn():
             break
         actions = [None] * num_agents
         for i in range(num_agents):
             factory = my_future_factory if i == my_player else opp_agent_factory
             agent = factory()
-            actions[i] = agent.act(eng.observation(i), Deadline())
+            actions[i] = agent.act(
+                eng.observation(i), Deadline(hard_stop_at=effective_stop),
+            )
         eng.step(actions)
 
     return _score_from_engine(eng, my_player, num_agents)
@@ -2746,6 +3252,14 @@ class GumbelRootSearch:
     gumbel_cfg: GumbelConfig = field(default_factory=GumbelConfig)
     rng_seed: Optional[int] = None
     opp_policy_override: Optional[Callable[[], Any]] = None
+    # Decoupled sim-move root (Path B / W3). When set, called each turn
+    # with (obs, opp_player) to produce a list of candidate opp wire
+    # actions. If the list has >=2 distinct actions and
+    # ``gumbel_cfg.use_decoupled_sim_move`` is True, search runs the
+    # decoupled UCB bandit from sim_move.py instead of sequential_halving.
+    # Typically populated by MCTSAgent from the Bayesian posterior's
+    # top-K archetypes when the posterior has concentrated.
+    opp_candidate_builder: Optional[Callable[[Any, int], List[List[List]]]] = None
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.rng_seed)
@@ -2783,6 +3297,7 @@ class GumbelRootSearch:
         self, obs: Any, my_player: int, num_agents: int = 2,
         start_time: Optional[float] = None,
         anchor_action: Optional[List[List]] = None,
+        outer_hard_stop_at: Optional[float] = None,
     ) -> Optional[SearchResult]:
         """Run search for one turn. Returns None if no legal moves exist.
 
@@ -2791,6 +3306,19 @@ class GumbelRootSearch:
         never prunes it. This turns MCTSAgent into a guaranteed floor:
         if search can't beat the heuristic, we return the heuristic's
         action.
+
+        ``outer_hard_stop_at`` (optional, absolute ``time.perf_counter()``
+        seconds): an EXTERNAL ceiling from the caller (typically
+        MCTSAgent's outer Deadline). The rollout and SH deadlines are
+        internally capped at ``min(own_deadline, outer_hard_stop_at)``
+        so search cannot run past the caller's turn budget even if
+        safe_budget math upstream was loose. This is the
+        belt-and-suspenders guard that converts audit outliers (e.g.
+        985 ms on a 900 ms ceiling) into bounded 880 ms worst case.
+        Without it, the search's `hard_deadline_ms` is relative-to-
+        start and has no notion of "the outer turn-budget has already
+        been eaten by a slow pre-search". This parameter closes that
+        gap.
         """
 
         po = parse_obs(obs)
@@ -2853,14 +3381,24 @@ class GumbelRootSearch:
         )
         base_state = eng.state
 
-        # Per-rollout deadline: identical to the SH outer deadline.
-        # When the wall-clock overshoots, `_rollout_value` short-
+        # Per-rollout deadline: SH's own deadline ∩ caller's outer hard
+        # stop. When the wall-clock overshoots, `_rollout_value` short-
         # circuits between plies and returns the mid-rollout engine
         # score. This caps a single rollout's over-deadline overshoot
         # to ~one ply instead of "all remaining plies at worst-case
         # heuristic cost".
+        #
+        # The ∩ with outer_hard_stop_at is the load-bearing audit fix:
+        # without it, a slow pre-search that eats the turn budget still
+        # hands the full hard_deadline_ms window to SH, and SH's
+        # in-flight rollout can push total turn time past the outer
+        # actTimeout. With it, SH naturally runs less when the budget
+        # was already consumed upstream, and the overall turn time is
+        # bounded by the outer ceiling regardless of pre-search cost.
         t0_rollout = start_time if start_time is not None else time.perf_counter()
         rollout_deadline_sec = t0_rollout + self.gumbel_cfg.hard_deadline_ms / 1000.0
+        if outer_hard_stop_at is not None and outer_hard_stop_at < rollout_deadline_sec:
+            rollout_deadline_sec = outer_hard_stop_at
         def _rollout_deadline_fired() -> bool:
             return time.perf_counter() > rollout_deadline_sec
 
@@ -2875,13 +3413,119 @@ class GumbelRootSearch:
                 num_agents=num_agents,
                 rng=self._rng,  # deterministic rollouts given search seed
                 deadline_fn=_rollout_deadline_fired,
+                hard_stop_at=rollout_deadline_sec,
+                per_rollout_budget_ms=self.gumbel_cfg.per_rollout_budget_ms,
             )
 
         protected_idx = 0 if anchor_joint is not None else None
-        result = sequential_halving(
-            joints, rollout_fn, self.gumbel_cfg,
-            start_time=start_time, protected_idx=protected_idx,
-        )
+
+        # --- Decoupled sim-move branch -----------------------------------
+        # When the posterior has concentrated enough that MCTSAgent
+        # populates `opp_candidate_builder`, and the decoupled flag is on,
+        # run the 2D UCB bandit over (my_joint, opp_wire) instead of
+        # sequential_halving. The bandit marginalizes over the opp's
+        # posterior-weighted strategies — honest scoring under sim-move
+        # uncertainty. Only fires when there are >=2 distinct opp
+        # candidates (1 candidate degenerates to the baseline).
+        opp_wires: List[List[List]] = []
+        if (
+            self.gumbel_cfg.use_decoupled_sim_move
+            and self.opp_candidate_builder is not None
+            and num_agents == 2
+        ):
+            try:
+                # 2-player only for v1: opp is the other seat.
+                opp_player = 1 - my_player
+                opp_wires = list(self.opp_candidate_builder(obs, opp_player) or [])
+                # Deduplicate by wire signature so we don't waste rollouts
+                # on identical opp responses.
+                seen_opp: set = set()
+                deduped: List[List[List]] = []
+                for w in opp_wires:
+                    try:
+                        key = tuple(tuple(m) for m in w)
+                    except Exception:
+                        continue
+                    if key in seen_opp:
+                        continue
+                    seen_opp.add(key)
+                    deduped.append(w)
+                opp_wires = deduped
+            except Exception:
+                # Any builder failure → fall through to baseline SH.
+                opp_wires = []
+
+        if len(opp_wires) >= 2:
+
+            def decoupled_rollout_fn(my_joint: JointAction, opp_wire: List[List]) -> float:
+                return _rollout_value(
+                    base_state=base_state,
+                    my_player=my_player,
+                    my_action=my_joint.to_wire(),
+                    opp_agent_factory=self._opp_factory,
+                    my_future_factory=self._my_future_factory,
+                    depth=self.gumbel_cfg.rollout_depth,
+                    num_agents=num_agents,
+                    rng=self._rng,
+                    deadline_fn=_rollout_deadline_fired,
+                    opp_turn0_action=opp_wire,
+                    hard_stop_at=rollout_deadline_sec,
+                    per_rollout_budget_ms=self.gumbel_cfg.per_rollout_budget_ms,
+                )
+
+            # Same tightening as the SH branch: cap the bandit's own
+            # deadline at the outer ceiling so the decoupled root stops
+            # dispatching rollouts in sync with the rollout-level
+            # short-circuit.
+            dec_hard_ms = self.gumbel_cfg.hard_deadline_ms
+            if outer_hard_stop_at is not None:
+                tight_ms = max(1.0, (rollout_deadline_sec - t0_rollout) * 1000.0)
+                dec_hard_ms = min(dec_hard_ms, tight_ms)
+            dres = decoupled_ucb_root(
+                my_candidates=joints,
+                opp_candidates=opp_wires,
+                rollout_fn=decoupled_rollout_fn,
+                total_sims=self.gumbel_cfg.total_sims,
+                hard_deadline_ms=dec_hard_ms,
+                start_time=start_time,
+                protected_my_idx=protected_idx,
+            )
+            # Map DecoupledSearchResult → SearchResult so the anchor-guard
+            # below operates without branching (it indexes q_values[0] as
+            # the anchor's marginal Q, which is exactly my_q_values[0]).
+            result = SearchResult(
+                best_joint=dres.best_my_joint,
+                n_rollouts=dres.n_rollouts,
+                duration_ms=dres.duration_ms,
+                q_values=list(dres.my_q_values),
+                visits=list(dres.my_visits),
+                aborted=dres.aborted,
+            )
+        else:
+            # Tighten SH's own deadline to match rollout_deadline_sec. When
+            # outer_hard_stop_at is closer than self.gumbel_cfg.hard_deadline_ms,
+            # SH must stop dispatching rollouts at that same wall time, not
+            # the config's looser value. Rebuild a temporary config so SH's
+            # internal `t0 + cfg.hard_deadline_ms/1000` == rollout_deadline_sec.
+            sh_hard_ms = self.gumbel_cfg.hard_deadline_ms
+            if outer_hard_stop_at is not None:
+                tight_ms = max(1.0, (rollout_deadline_sec - t0_rollout) * 1000.0)
+                sh_hard_ms = min(sh_hard_ms, tight_ms)
+            sh_cfg = GumbelConfig(
+                num_candidates=self.gumbel_cfg.num_candidates,
+                total_sims=self.gumbel_cfg.total_sims,
+                rollout_depth=self.gumbel_cfg.rollout_depth,
+                hard_deadline_ms=sh_hard_ms,
+                anchor_improvement_margin=self.gumbel_cfg.anchor_improvement_margin,
+                rollout_policy=self.gumbel_cfg.rollout_policy,
+                use_decoupled_sim_move=self.gumbel_cfg.use_decoupled_sim_move,
+                num_opp_candidates=self.gumbel_cfg.num_opp_candidates,
+                per_rollout_budget_ms=self.gumbel_cfg.per_rollout_budget_ms,
+            )
+            result = sequential_halving(
+                joints, rollout_fn, sh_cfg,
+                start_time=start_time, protected_idx=protected_idx,
+            )
 
         # Anchor guard: if we included an anchor, only override it when
         # the SH winner beats it by a confident margin. Rollout noise
@@ -3102,6 +3746,32 @@ def make_archetype(name: str) -> ArchetypeAgent:
     return ArchetypeAgent(name)
 
 
+def make_fast_archetype(name: str):
+    """Fast-rollout-flavor factory for an archetype.
+
+    Returns a ``FastRolloutAgent`` tuned so its nearest-target launch
+    cadence and enemy/neutral preference match the archetype's weights.
+    ~30-50x cheaper per ``act()`` call than ``make_archetype`` — use
+    inside MCTS rollouts when the posterior has concentrated and we
+    want flavor-matched opponent plies without the 18ms/call heuristic
+    cost.
+
+    Uses ``FastRolloutAgent.from_weights`` to handle the actual
+    knob-mapping; this wrapper just does the name lookup.
+    """
+    if name not in ARCHETYPE_WEIGHTS:
+        raise KeyError(
+            f"unknown archetype {name!r}; known = {ARCHETYPE_NAMES}"
+        )
+    # Merge archetype overrides on top of HEURISTIC_WEIGHTS so knobs
+    # the archetype didn't explicitly override still see sensible
+    # base values (e.g., rusher doesn't specify keep_reserve_ships, so
+    # it picks up the HEURISTIC_WEIGHTS default).
+    merged = dict(HEURISTIC_WEIGHTS)
+    merged.update(ARCHETYPE_WEIGHTS[name])
+    return FastRolloutAgent.from_weights(merged)
+
+
 def all_archetypes() -> List[ArchetypeAgent]:
     """Return one fresh agent instance per archetype, canonical order."""
     return [ArchetypeAgent(n) for n in ARCHETYPE_NAMES]
@@ -3256,6 +3926,14 @@ class ArchetypePosterior:
     alpha0: float = 1.0
     temperature: float = 2.0
     eps: float = 0.1
+    # Early-exit: once the top archetype's posterior probability reaches
+    # this threshold, stop running the K-archetype act() likelihood loop
+    # on subsequent turns. Saves ~15 ms/turn (the dominant per-turn cost)
+    # once the opponent has been identified. Set to 1.0 to disable.
+    # Fleet-id bookkeeping still runs (needed if someone resets us later
+    # with a fresh match), and ``turns_observed`` still increments so
+    # downstream gates keep working.
+    freeze_threshold: float = 0.99
 
     def __post_init__(self) -> None:
         self.K = len(self.archetypes)
@@ -3266,6 +3944,9 @@ class ArchetypePosterior:
         self._prev_fleet_ids: Set[int] = set()
         self._last_obs: Optional[Dict[str, Any]] = None
         self._turns_observed: int = 0
+        # Frozen once the posterior concentrates past freeze_threshold.
+        # While frozen, observe() skips the expensive K-archetype loop.
+        self._frozen: bool = False
 
     # ---- Public ----
 
@@ -3274,6 +3955,15 @@ class ArchetypePosterior:
         self._prev_fleet_ids.clear()
         self._last_obs = None
         self._turns_observed = 0
+        self._frozen = False
+
+    def is_frozen(self) -> bool:
+        """True once the posterior concentration crossed ``freeze_threshold``.
+
+        Exposed for smokes/telemetry — lets a test verify the early-exit
+        path fired after N turns of strong evidence.
+        """
+        return self._frozen
 
     def observe(self, obs: Any, opp_player: int) -> None:
         """Incorporate the opponent's action revealed by ``obs``.
@@ -3289,6 +3979,35 @@ class ArchetypePosterior:
             }
             return
 
+        # Early-exit: frozen posterior skips the K-archetype likelihood
+        # loop (the ~15 ms/turn hot spot). We keep the fleet-id snapshot
+        # current and tick turns_observed so downstream consumers don't
+        # see stale telemetry. log_alpha is left untouched — distribution()
+        # continues to return the frozen posterior.
+        if self._frozen:
+            self._prev_fleet_ids = {
+                int(f[0]) for f in obs_get(obs, "fleets", [])
+            }
+            self._last_obs = obs
+            self._turns_observed += 1
+            return
+
+        # Run the likelihood update path. Tick turns_observed and check
+        # for freeze transition regardless of whether the update
+        # short-circuits (opp eliminated etc.) — a pre-seeded log_alpha
+        # that's already over-threshold should freeze on its first real
+        # observe() call.
+        self._update_log_alpha(obs, opp_player)
+        self._turns_observed += 1
+        self._maybe_freeze()
+
+    def _update_log_alpha(self, obs: Any, opp_player: int) -> None:
+        """Incorporate one turn of opp evidence into ``log_alpha``.
+
+        Split out from ``observe`` so the freeze check fires at a single
+        well-defined point regardless of which control-flow path the
+        update took.
+        """
         # Identify fleets launched by opp this turn.
         opp_launches = self._opp_launches_this_turn(obs, opp_player)
 
@@ -3322,7 +4041,15 @@ class ArchetypePosterior:
             )
             self.log_alpha[k] += log_lik / self.temperature
 
-        self._turns_observed += 1
+    def _maybe_freeze(self) -> None:
+        """Flip ``_frozen`` on when concentration crosses the threshold.
+
+        Called at the end of observe() (non-bootstrap, non-frozen path).
+        ``freeze_threshold=1.0`` opts out — the check becomes unreachable.
+        """
+        if self.freeze_threshold < 1.0:
+            if float(_softmax(self.log_alpha).max()) >= self.freeze_threshold:
+                self._frozen = True
 
     def distribution(self) -> np.ndarray:
         """Posterior over archetypes as a probability vector."""
@@ -3450,8 +4177,23 @@ class MCTSAgent(Agent):
         use_opponent_model: bool = True,
     ):
         self.weights = dict(HEURISTIC_WEIGHTS) if weights is None else dict(weights)
+        # BOKR-style angle refinement is available (set
+        # ``angle_refinement_n_grid > 1`` in your ActionConfig) but
+        # DEFAULTED OFF. Smoke testing showed refinement pushes the turn-time
+        # tail past Kaggle's 1-second actTimeout (seed=42, default
+        # deadline 300ms: max=1156ms, 2 turns over 900ms — forfeit
+        # risk). The BOKR module is wired into generate_per_planet_moves
+        # so callers can opt in for specific experiments, but the
+        # shipped MCTSAgent uses the single-angle behavior to preserve
+        # the v3 tail profile (max 882 ms, 0 over 900 ms).
         self.action_cfg = action_cfg or ActionConfig()
         self.gumbel_cfg = gumbel_cfg or GumbelConfig()
+        # Arm the decoupled sim-move branch by default. The branch is a
+        # no-op unless MCTSAgent also populates ``opp_candidate_builder``
+        # with >=2 wires (see _maybe_route_posterior_to_search), so this
+        # is backward-compat: behavior only changes once the posterior
+        # has concentrated enough to propose a multi-archetype mixture.
+        self.gumbel_cfg.use_decoupled_sim_move = True
         self._fallback = HeuristicAgent(weights=self.weights)
         self._search = GumbelRootSearch(
             weights=self.weights,
@@ -3477,6 +4219,8 @@ class MCTSAgent(Agent):
             "turns_observed": 0,
             "override_fires": 0,
             "override_clears": 0,
+            "builder_fires": 0,
+            "builder_clears": 0,
             "last_top_name": None,
             "last_top_prob": 0.0,
         }
@@ -3486,6 +4230,12 @@ class MCTSAgent(Agent):
     # the uniform 1/K baseline. Below that, the posterior is noise.
     _POSTERIOR_MIN_TURNS: int = 15
     _POSTERIOR_MIN_TOP_PROB: float = 0.35
+    # Decoupled sim-move branch gate. When the *2nd* archetype also
+    # has meaningful mass (>= 0.2 ~= ~1.5x uniform), marginalize over
+    # both via decoupled UCB. With second-top below this threshold, a
+    # single-archetype SH is strictly stronger (no rollouts wasted on
+    # a phantom branch), so we keep the builder = None.
+    _POSTERIOR_DECOUPLED_MIN_SECOND_PROB: float = 0.20
 
     def _maybe_route_posterior_to_search(self) -> None:
         """If the posterior has concentrated, set the search's opponent
@@ -3509,12 +4259,102 @@ class MCTSAgent(Agent):
             if self._search.opp_policy_override is not None:
                 self._search.opp_policy_override = None
                 self.telemetry["override_clears"] += 1
+            # Also make sure the decoupled builder is cleared so the
+            # search branch doesn't fire under noise.
+            if self._search.opp_candidate_builder is not None:
+                self._search.opp_candidate_builder = None
             return
         top_name = post.most_likely()
         # Late-bind the name so every call produces a fresh archetype
         # (HeuristicAgent has per-match state that rollouts must not share).
-        self._search.opp_policy_override = lambda n=top_name: make_archetype(n)
+        # When rollout_policy=="fast", swap in the flavor-matched fast
+        # rollout agent — ~30x cheaper per ply, same stylistic bias.
+        if self.gumbel_cfg.rollout_policy == "fast":
+            self._search.opp_policy_override = (
+                lambda n=top_name: make_fast_archetype(n)
+            )
+        else:
+            self._search.opp_policy_override = (
+                lambda n=top_name: make_archetype(n)
+            )
         self.telemetry["override_fires"] += 1
+
+        # Decoupled UCB branch: fires only when the *second* archetype
+        # also has real mass. Marginalizing over a phantom 2nd branch
+        # wastes rollouts, so below the threshold we leave the builder
+        # = None and the search falls back to plain Sequential Halving.
+        sorted_probs = sorted(dist, reverse=True)
+        if (
+            len(sorted_probs) >= 2
+            and sorted_probs[1] >= self._POSTERIOR_DECOUPLED_MIN_SECOND_PROB
+        ):
+            self._search.opp_candidate_builder = self._build_opp_candidates
+            self.telemetry["builder_fires"] = (
+                self.telemetry.get("builder_fires", 0) + 1
+            )
+        else:
+            if self._search.opp_candidate_builder is not None:
+                self._search.opp_candidate_builder = None
+                self.telemetry["builder_clears"] = (
+                    self.telemetry.get("builder_clears", 0) + 1
+                )
+
+    def _build_opp_candidates(self, obs: Any, opp_player: int):
+        """Compute opp's wire action under each of the top-K archetypes.
+
+        Called by ``GumbelRootSearch`` when the decoupled sim-move branch
+        is armed. Returns a list of wire actions — one per archetype —
+        that the bandit marginalizes over.
+
+        Fails closed: any exception returns ``[]``, which makes the
+        search fall back to plain Sequential Halving (the pre-decoupled
+        shipped behavior). This is the contract the search relies on.
+        """
+        try:
+            post = self.opp_posterior
+            if post is None:
+                return []
+            k = max(1, int(self.gumbel_cfg.num_opp_candidates))
+            dist = post.distribution()
+            # Rank archetypes by posterior mass, descending. Keep only
+            # those with non-negligible mass (>= second-prob threshold
+            # / 2) so a near-uniform posterior doesn't pad the list
+            # with noise candidates.
+            floor = 0.5 * self._POSTERIOR_DECOUPLED_MIN_SECOND_PROB
+            ranked = sorted(
+                [(i, float(p)) for i, p in enumerate(dist)],
+                key=lambda ip: -ip[1],
+            )
+            names = [post.names[i] for i, p in ranked[:k] if p >= floor]
+            if len(names) < 2:
+                return []
+
+            # Build opp's observation once via a temporary FastEngine
+            # (perspective-swap). Cheap — a dict shim + a FastEngine
+            # construction, comparable to what search already does
+            # per-rollout.
+
+            eng = FastEngine.from_official_obs(
+                _obs_to_namespace(obs), num_agents=2,
+            )
+            opp_obs = eng.observation(opp_player)
+
+            wires = []
+            # Fresh Deadline per archetype — generous, since this is
+            # called from inside the outer turn budget and the archetype
+            # .act()s are cheap heuristic passes (<5 ms each).
+            for name in names:
+                dl = Deadline()
+                try:
+                    agent = make_archetype(name)
+                    wire = agent.act(opp_obs, dl)
+                except Exception:
+                    continue
+                if isinstance(wire, list):
+                    wires.append(wire)
+            return wires
+        except Exception:
+            return []
 
     def act(self, obs: Any, deadline: Deadline) -> Action:
         # Always stage no_op first so any premature return is legal.
@@ -3547,12 +4387,15 @@ class MCTSAgent(Agent):
             # Also clear any stale override from the previous match — the
             # new opponent is an unknown, back to default heuristic rollouts.
             self._search.opp_policy_override = None
+            self._search.opp_candidate_builder = None
             # Reset per-match telemetry so smokes running back-to-back
             # matches don't see stale counts leaking across games.
             self.telemetry = {
                 "turns_observed": 0,
                 "override_fires": 0,
                 "override_clears": 0,
+                "builder_fires": 0,
+                "builder_clears": 0,
                 "last_top_name": None,
                 "last_top_prob": 0.0,
             }
@@ -3623,6 +4466,32 @@ class MCTSAgent(Agent):
             anchor_improvement_margin=self.gumbel_cfg.anchor_improvement_margin,
         )
 
+        # Compute the caller-side outer hard stop: the latest wall-clock
+        # instant at which search must return. We reserve
+        # _OUTER_CEILING_MARGIN_MS between this stop and HARD_DEADLINE_MS
+        # so that an in-flight rollout short-circuiting "one inner
+        # iteration after the deadline fires" still lands under the
+        # outer actTimeout.
+        #
+        # _OUTER_CEILING_MARGIN_MS budget:
+        #   ~100 ms  — worst-case single-inner-iteration cost in
+        #              HeuristicAgent._plan_moves on a dense late-game
+        #              state (comments on that loop cite ~100-300 ms for
+        #              the full outer iteration; one inner-iteration
+        #              slice is the overshoot from a fired deadline).
+        #   ~20  ms  — action encoding + deadline.stage + any
+        #              in-wrapper gc.collect the harness includes in
+        #              the turn-time measurement.
+        #   -------
+        #    120 ms  — conservative ceiling; tighten once we have
+        #              audit data confirming the real pathological
+        #              ply cost is lower than 100 ms.
+        _OUTER_CEILING_MARGIN_MS = 120.0
+        outer_hard_stop_at = (
+            time.perf_counter()
+            + max(0.0, remaining - _OUTER_CEILING_MARGIN_MS) / 1000.0
+        )
+
         # Wrap the entire swap+search+restore so ANY failure (including
         # attribute access on a broken search object) degrades to the
         # heuristic. Agents in ladder play must never bubble.
@@ -3638,6 +4507,7 @@ class MCTSAgent(Agent):
             result = self._search.search(
                 obs, my_player, start_time=t0,
                 anchor_action=heuristic_move,
+                outer_hard_stop_at=outer_hard_stop_at,
             )
         except Exception:
             return heuristic_move
