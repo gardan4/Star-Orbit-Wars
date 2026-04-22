@@ -11,7 +11,8 @@ Auto-built single-file Kaggle submissions. Regenerate from source via:
 | `noop.py` | Pipeline dry-run (W1 gate) — confirms the judging machine accepts our bundle format | always-pass |
 | `noop_v0.py` | Earliest archived noop for the first Kaggle Notebook push | always-pass |
 | `heuristic_v1.py` | Path A bot v1 — parameterized heuristic w/ intercept math + arrival table | HeuristicAgent |
-| `mcts_v1.py` | Path B bot: Gumbel MCTS + anchor-locked heuristic floor (margin=2.0) + posterior-aware rollouts | MCTSAgent |
+| `mcts_v1.py` | Path B bot: Gumbel MCTS + anchor-locked heuristic floor (margin=2.0) + posterior-aware rollouts (no fast_rollout module) | MCTSAgent |
+| `mcts_v2.py` | Same default behavior as v1 but the `FastRolloutAgent` module is inlined, so switching `GumbelConfig.rollout_policy="fast"` works without a re-bundle. 141KB (+7KB vs v1). Smoke-tested vs `random` (step 111, W). | MCTSAgent |
 
 ## W1 GATE: Kaggle dry-run (noop)
 
@@ -67,4 +68,5 @@ pipeline works end-to-end.
 - `noop.py` — pipeline validation only. Never update.
 - `heuristic_v1.py` — track per weight change during W1/W2 tuning. Replace in-place.
 - `mcts_v1.py` — Path B bot with Path D opponent model. Replace in-place when source changes; re-run the smoke harness before each refresh.
-- Future: `heuristic_v2.py` (TuRBO-tuned), `nn_mcts_v1.py` (Path C).
+- `mcts_v2.py` — v1 + fast_rollout module inlined. No behavior change at shipped default; future-proofs toggling `rollout_policy="fast"` in a weight override without a re-bundle. Smoke-test before each refresh.
+- Future: `heuristic_v2.py` (TuRBO-tuned, pending second Ax run), `nn_mcts_v1.py` (Path C).

@@ -1,0 +1,3615 @@
+# Auto-generated Orbit Wars submission. Do not edit by hand.
+# Built by tools/bundle.py on 2026-04-22 17:10:42.
+# Bot: mcts_bot
+#
+# Single-file submission: Kaggle will import this and call agent(obs, cfg).
+from __future__ import annotations
+
+
+# --- inlined: orbitwars/engine/intercept.py ---
+
+"""Intercept solvers for straight-line fleets against static, orbiting, and
+comet-path targets in Orbit Wars.
+
+Game facts driving the math (cross-checked against
+kaggle_environments/envs/orbit_wars/orbit_wars.py v1.0.9):
+
+  * Fleets travel in straight lines at constant speed for their lifetime.
+    Speed depends only on fleet size at launch:
+        speed = 1 + (max_speed - 1) * (log(ships) / log(1000)) ** 1.5
+        speed = min(speed, max_speed)           # default max_speed = 6
+    Single ship -> 1.0/turn; 1000-ship fleet -> 6.0/turn (the cap).
+  * Planets with orbital_radius + planet_radius < ROTATION_RADIUS_LIMIT (50)
+    rotate around the board center at a fixed, game-global angular velocity ω
+    in (0.025, 0.05) rad/turn. Position at time t (turns from now):
+        θ(t) = θ0 + ω*t
+        pos(t) = (cx + r*cos θ(t), cy + r*sin θ(t))
+  * Comets move along a precomputed path (list of (x, y)) with `path_index`
+    advancing by 1 each turn.
+  * Sun at (50, 50) radius 10 destroys any fleet whose path segment comes
+    within 10 of the center. When the direct line crosses the sun we route
+    via a tangent angle ±ε.
+
+No gravity — fleets are straight-line. (The engine has no force model.)
+"""
+
+import math
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
+
+# Mirror the engine constants so we don't depend on importing the engine here.
+CENTER = 50.0
+SUN_RADIUS = 10.0
+ROTATION_RADIUS_LIMIT = 50.0
+BOARD_SIZE = 100.0
+DEFAULT_MAX_SPEED = 6.0
+
+TWO_PI = 2.0 * math.pi
+
+
+# ---- Fleet speed (exact match to engine) ----
+
+def fleet_speed(ships: int, max_speed: float = DEFAULT_MAX_SPEED) -> float:
+    """Engine's fleet speed formula. ships >= 1."""
+    if ships <= 0:
+        return 0.0
+    if ships == 1:
+        return 1.0
+    s = 1.0 + (max_speed - 1.0) * (math.log(ships) / math.log(1000.0)) ** 1.5
+    return min(s, max_speed)
+
+
+def ships_needed_for_speed(target_speed: float, max_speed: float = DEFAULT_MAX_SPEED) -> int:
+    """Inverse of fleet_speed. Ceiling ships count to reach `target_speed`."""
+    if target_speed <= 1.0:
+        return 1
+    if target_speed >= max_speed:
+        # max_speed is hit at 1000 ships exactly.
+        return 1000
+    frac = (target_speed - 1.0) / (max_speed - 1.0)
+    log_ships = math.log(1000.0) * frac ** (1.0 / 1.5)
+    return max(1, int(math.ceil(math.exp(log_ships))))
+
+
+# ---- Static intercept ----
+
+def static_intercept_angle(
+    source: Tuple[float, float],
+    target: Tuple[float, float],
+) -> float:
+    """Angle (radians) pointing from source directly at target."""
+    return math.atan2(target[1] - source[1], target[0] - source[0])
+
+
+def static_intercept_turns(
+    source: Tuple[float, float],
+    target: Tuple[float, float],
+    ships: int,
+) -> float:
+    """Turns for a fleet of `ships` ships from `source` to reach `target`."""
+    dx = target[0] - source[0]
+    dy = target[1] - source[1]
+    d = math.hypot(dx, dy)
+    v = fleet_speed(ships)
+    return d / v if v > 0 else float("inf")
+
+
+# ---- Orbiting-planet intercept (Newton iteration) ----
+
+@dataclass
+class OrbitingTarget:
+    """Target orbiting the board center at (cx, cy) with fixed angular velocity.
+
+    initial_angle and orbital_radius come from the observation's
+    `initial_planets` entry. The current observed position is
+        (cx + r cos(θ0 + ω t_now), cy + r sin(θ0 + ω t_now))
+    where t_now is the current step count.
+    """
+    orbital_radius: float
+    initial_angle: float       # θ0, radians
+    angular_velocity: float    # ω, rad/turn
+    current_step: int          # t_now (so we compute θ at t = t_now + Δt)
+
+    def position_at(self, delta_t: float) -> Tuple[float, float]:
+        θ = self.initial_angle + self.angular_velocity * (self.current_step + delta_t)
+        return (CENTER + self.orbital_radius * math.cos(θ),
+                CENTER + self.orbital_radius * math.sin(θ))
+
+
+def orbiting_intercept(
+    source: Tuple[float, float],
+    orbit: OrbitingTarget,
+    ships: int,
+    max_iters: int = 8,
+    tol: float = 1e-4,
+) -> Tuple[float, float, int]:
+    """Solve for time-of-flight Δt such that |orbit(Δt) - source| = v * Δt.
+
+    Returns (angle_to_intercept, delta_t_turns, iters_used).
+
+    Uses Newton on f(t) = (orbit.x(t) - sx)^2 + (orbit.y(t) - sy)^2 - (v t)^2.
+
+    Initial guess: time to intercept the *current* position (v * t0 = |cur - src|),
+    which is the right answer when ω = 0 and a good starting point otherwise.
+    """
+    v = fleet_speed(ships)
+    if v <= 0.0:
+        return (0.0, float("inf"), 0)
+
+    sx, sy = source
+    r = orbit.orbital_radius
+    ω = orbit.angular_velocity
+    # Current position of the target
+    cur = orbit.position_at(0.0)
+    t = math.hypot(cur[0] - sx, cur[1] - sy) / v
+
+    for i in range(max_iters):
+        θ = orbit.initial_angle + ω * (orbit.current_step + t)
+        tx = CENTER + r * math.cos(θ)
+        ty = CENTER + r * math.sin(θ)
+        dx = tx - sx
+        dy = ty - sy
+        # f(t) = dx^2 + dy^2 - (v t)^2
+        f = dx * dx + dy * dy - (v * t) ** 2
+        # df/dt = 2 dx * (-r ω sin θ) + 2 dy * (r ω cos θ) - 2 v^2 t
+        df = 2.0 * dx * (-r * ω * math.sin(θ)) \
+             + 2.0 * dy * (r * ω * math.cos(θ)) \
+             - 2.0 * (v * v) * t
+        if abs(df) < 1e-12:
+            break
+        dt = -f / df
+        t_new = max(0.0, t + dt)
+        if abs(t_new - t) < tol:
+            t = t_new
+            break
+        t = t_new
+
+    θ_final = orbit.initial_angle + ω * (orbit.current_step + t)
+    tx = CENTER + r * math.cos(θ_final)
+    ty = CENTER + r * math.sin(θ_final)
+    angle = math.atan2(ty - sy, tx - sx)
+    return (angle, t, i + 1)
+
+
+# ---- Comet intercept (path-indexed, linear scan) ----
+
+def comet_intercept(
+    source: Tuple[float, float],
+    comet_path: Sequence[Tuple[float, float]],
+    path_index_now: int,
+    ships: int,
+    max_time_mismatch: float = 1.0,
+) -> Optional[Tuple[float, float, int]]:
+    """Find the earliest future path index where fleet arrival time is close
+    to the comet's arrival time. Fleets travel in straight lines at constant
+    speed, so exact integer-step intercept is generally impossible; the engine
+    uses continuous sweep collision, so we just need the aim-point right.
+
+    Returns (angle, delta_t_to_fleet_arrival, path_index) or None.
+
+    Algorithm:
+      1. Ignore path indices where fleet arrival time `dist/v` is much less
+         than `idx - path_index_now` — the fleet would arrive before the
+         comet and continue past.
+      2. Accept the first index where `dist/v <= (idx - path_index_now) +
+         max_time_mismatch`, meaning the fleet arrives near the comet's time.
+      3. Return the angle aimed at that path position. The engine's continuous
+         sweep will trigger a collision when trajectories cross.
+    """
+    v = fleet_speed(ships)
+    if v <= 0.0:
+        return None
+
+    sx, sy = source
+    start_idx = max(0, path_index_now + 1)
+    best_idx = None
+    best_mismatch = float("inf")
+    for idx in range(start_idx, len(comet_path)):
+        tx, ty = comet_path[idx]
+        dist = math.hypot(tx - sx, ty - sy)
+        t_arrive = dist / v
+        t_comet = float(idx - path_index_now)
+        mismatch = t_arrive - t_comet  # positive = fleet late, negative = fleet early
+        # If fleet is very early and still getting earlier, keep scanning
+        if mismatch < -max_time_mismatch:
+            continue
+        # If fleet is late by more than max_time_mismatch, the comet is
+        # already past — skip.
+        if mismatch > max_time_mismatch:
+            continue
+        # Close enough: record and return the earliest such idx.
+        if abs(mismatch) < best_mismatch:
+            best_mismatch = abs(mismatch)
+            best_idx = idx
+        # First index in the acceptable band is generally the best; break.
+        break
+
+    if best_idx is None:
+        return None
+    tx, ty = comet_path[best_idx]
+    angle = math.atan2(ty - sy, tx - sx)
+    t_arrive = math.hypot(tx - sx, ty - sy) / v
+    return (angle, t_arrive, best_idx)
+
+
+# ---- Sun-tangent routing ----
+
+def path_crosses_sun(
+    source: Tuple[float, float],
+    target: Tuple[float, float],
+    sun_radius: float = SUN_RADIUS,
+    clearance: float = 0.5,
+) -> bool:
+    """True if the straight segment source->target comes within sun_radius
+    (+clearance) of the board center.
+    """
+    sx, sy = source
+    tx, ty = target
+    dx, dy = tx - sx, ty - sy
+    length_sq = dx * dx + dy * dy
+    if length_sq < 1e-12:
+        return False
+    # Projection of center onto line, clamped to segment
+    t = ((CENTER - sx) * dx + (CENTER - sy) * dy) / length_sq
+    t = max(0.0, min(1.0, t))
+    px = sx + t * dx
+    py = sy + t * dy
+    d = math.hypot(px - CENTER, py - CENTER)
+    return d < (sun_radius + clearance)
+
+
+def sun_tangent_angles(
+    source: Tuple[float, float],
+    sun_radius: float = SUN_RADIUS,
+    epsilon: float = 0.02,
+) -> Tuple[float, float]:
+    """Return (left_tangent_angle, right_tangent_angle) — the two angles from
+    source tangent to the sun (plus a small safety epsilon).
+
+    If source is inside the sun, this is undefined; we return two angles straight
+    outward and let the caller decide.
+    """
+    sx, sy = source
+    dx = CENTER - sx
+    dy = CENTER - sy
+    d = math.hypot(dx, dy)
+    if d <= sun_radius + 1e-6:
+        # Inside the sun — return opposite-directions radially outward.
+        a = math.atan2(-dy, -dx)
+        return (a - 0.1, a + 0.1)
+    theta = math.atan2(dy, dx)      # angle toward sun center
+    phi = math.asin(min(1.0, sun_radius / d))  # half-angle of sun disk
+    return (theta + phi + epsilon, theta - phi - epsilon)
+
+
+def route_angle_avoiding_sun(
+    source: Tuple[float, float],
+    direct_angle: float,
+    target: Tuple[float, float],
+) -> float:
+    """If the direct path crosses the sun, return the better tangent angle;
+    otherwise return direct_angle unchanged.
+
+    "Better" = the tangent closer in angular distance to `direct_angle`.
+    """
+    if not path_crosses_sun(source, target):
+        return direct_angle
+    left, right = sun_tangent_angles(source)
+
+    def _ang_dist(a, b):
+        d = (a - b) % TWO_PI
+        return d if d <= math.pi else TWO_PI - d
+
+    return left if _ang_dist(left, direct_angle) <= _ang_dist(right, direct_angle) else right
+
+
+# ---- Helper: detect if a planet is orbiting from the current observation ----
+
+def is_orbiting_planet(planet: Sequence, initial_planet: Sequence) -> bool:
+    """Engine rule: rotates if orbital_radius + radius < ROTATION_RADIUS_LIMIT.
+
+    Uses initial_planet[x, y] for the static orbital radius reference
+    (planet[x, y] may already have rotated).
+    """
+    r = planet[4]
+    dx = initial_planet[2] - CENTER
+    dy = initial_planet[3] - CENTER
+    orb_r = math.hypot(dx, dy)
+    return (orb_r + r) < ROTATION_RADIUS_LIMIT
+
+
+def initial_orbit_params(initial_planet: Sequence) -> Tuple[float, float]:
+    """Return (orbital_radius, initial_angle) from an `initial_planets` entry."""
+    dx = initial_planet[2] - CENTER
+    dy = initial_planet[3] - CENTER
+    return (math.hypot(dx, dy), math.atan2(dy, dx))
+
+
+
+# --- inlined: orbitwars/bots/base.py ---
+
+"""Base agent interface with hard timing guard and fallback action.
+
+All bots in this project inherit `Agent` and implement `act(obs) -> list`. The
+wrapper enforces:
+  * A valid no-op fallback is always available.
+  * Per-turn wall-clock is audited; if `act` overruns, the wrapper returns the
+    best-so-far action (if the bot staged one) or the fallback.
+  * gc is disabled at module load; one manual `gc.collect()` between turns keeps
+    latency spikes out of the 1-second budget.
+
+Kaggle's official agent contract is a plain callable `agent(obs, cfg=None) -> list`.
+`Agent.as_kaggle_agent()` produces such a callable so bots can be submitted
+as-is.
+"""
+
+import gc
+import math
+import time
+from typing import Callable, List
+
+# Action type: list of [from_planet_id, angle_rad, num_ships]
+Move = List[float]
+Action = List[Move]
+
+# Disable gc once at module import. Individual agents explicitly collect between
+# turns to avoid latency spikes during search.
+gc.disable()
+
+# Safety margins. actTimeout is 1s; we stop search at 850ms, return by 900ms.
+HARD_DEADLINE_MS = 900.0
+SEARCH_DEADLINE_MS = 850.0
+EARLY_FALLBACK_MS = 200.0  # Must have a valid action staged by this time.
+
+
+def no_op() -> Action:
+    """Always-valid null action."""
+    return []
+
+
+class Deadline:
+    """Per-turn wall-clock timer with best-so-far action buffer.
+
+    Usage inside an agent:
+        dl = Deadline()
+        dl.stage(fallback_action_here)           # by EARLY_FALLBACK_MS
+        while dl.remaining_ms() > slack:
+            improved = search_one_step()
+            dl.stage(improved)
+        return dl.best()
+    """
+
+    __slots__ = ("_t0", "_best")
+
+    def __init__(self) -> None:
+        self._t0 = time.perf_counter()
+        self._best: Action = no_op()
+
+    def stage(self, action: Action) -> None:
+        """Mark this action as the current best; returned if deadline hits."""
+        self._best = action
+
+    def elapsed_ms(self) -> float:
+        return (time.perf_counter() - self._t0) * 1000.0
+
+    def remaining_ms(self, deadline_ms: float = SEARCH_DEADLINE_MS) -> float:
+        return deadline_ms - self.elapsed_ms()
+
+    def should_stop(self, deadline_ms: float = SEARCH_DEADLINE_MS) -> bool:
+        return self.elapsed_ms() >= deadline_ms
+
+    def best(self) -> Action:
+        return self._best
+
+
+class Agent:
+    """Base class for all bots in this project.
+
+    Subclass and implement `act(obs, deadline) -> Action`. The `deadline`
+    argument is supplied by the wrapper; call `deadline.stage(...)` as soon as
+    you have a valid action, then improve it until `deadline.should_stop()`.
+    """
+
+    name: str = "base"
+
+    def act(self, obs, deadline: Deadline) -> Action:  # pragma: no cover — abstract
+        raise NotImplementedError
+
+    # ---- Kaggle submission wrapper ----
+    def as_kaggle_agent(self) -> Callable:
+        """Return a plain callable usable as a Kaggle submission.
+
+        The callable honors the hard deadline: if `act` runs long we return
+        the staged best-so-far; if it raises, we return no_op.
+        """
+
+        def kaggle_agent(obs, cfg=None):
+            dl = Deadline()
+            try:
+                result = self.act(obs, dl)
+                if dl.elapsed_ms() > HARD_DEADLINE_MS:
+                    return dl.best()
+                return result if isinstance(result, list) else dl.best()
+            except Exception:
+                return dl.best()
+            finally:
+                # One explicit collection between turns, cheap and keeps us
+                # off the critical path next turn.
+                gc.collect()
+
+        kaggle_agent.__name__ = self.name
+        return kaggle_agent
+
+
+# ---- Built-in trivial agents for baselines and pipeline testing ----
+
+class NoOpAgent(Agent):
+    """Does nothing. Used for pipeline validation (dry-run submission)."""
+
+    name = "no_op"
+
+    def act(self, obs, deadline: Deadline) -> Action:
+        deadline.stage(no_op())
+        return no_op()
+
+
+class RandomAgent(Agent):
+    """Random valid launches. Used as a weak baseline."""
+
+    name = "random"
+
+    def __init__(self, seed: int | None = None):
+        import random as _r
+        self._r = _r.Random(seed)
+
+    def act(self, obs, deadline: Deadline) -> Action:
+        deadline.stage(no_op())
+        player = obs.get("player", 0) if isinstance(obs, dict) else getattr(obs, "player", 0)
+        planets = obs.get("planets", []) if isinstance(obs, dict) else getattr(obs, "planets", [])
+        moves: Action = []
+        for p in planets:
+            if p[1] == player and p[5] > 0:
+                angle = self._r.uniform(0, 2 * math.pi)
+                ships = p[5] // 2
+                if ships >= 20:
+                    moves.append([p[0], angle, ships])
+        deadline.stage(moves)
+        return moves
+
+
+def obs_get(obs, key, default=None):
+    """Observation accessor that works for both dict and object-style obs.
+
+    Kaggle hands agents a dict-like obs; kaggle_environments's internal
+    state uses a SimpleNamespace. This indirection lets us write one code path.
+    """
+    if isinstance(obs, dict):
+        return obs.get(key, default)
+    return getattr(obs, key, default)
+
+
+
+# --- inlined: orbitwars/bots/heuristic.py ---
+
+"""Heuristic bot (Path A).
+
+The "floor" bot: a fast, parameterized heuristic that ranks candidate targets
+per owned planet using a linear mix of features and launches exact-plus-one
+attacks when a net-positive capture is predicted.
+
+Key ideas (drawn from the Kore 2022 winner's playbook):
+
+  * Fleet-arrival table: for each target planet, we tabulate net incoming
+    allied vs enemy ships by arrival time. Scoring factors in both the
+    earliest capture window and the steady-state production stream.
+
+  * Exact-plus-one sizing: ship count sent equals projected defender ships at
+    arrival time + 1. Under-send is wasted; over-send is merely inefficient.
+
+  * Intercept math: orbital targets are predicted via the Newton-iteration
+    solver in engine/intercept.py; comets via the path-indexed solver.
+
+  * Sun-avoidance: direct lines that cross the sun are rerouted to the closest
+    tangent angle.
+
+  * Parameterization: HEURISTIC_WEIGHTS is a flat dict of 20-ish floats. It
+    feeds TuRBO tuning (Path A) and LLM-evolved mutations (EvoTune). Adding a
+    new feature means adding one key here and one term in `_score_target`.
+
+This file is intentionally simple and close to the metal. Do not add clever
+caching or search here — that's Path B's job.
+"""
+
+import math
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+
+
+# ---- Parameter config (tuned by TuRBO / EvoTune) ----
+
+HEURISTIC_WEIGHTS: Dict[str, float] = {
+    # Target scoring (higher = stronger preference)
+    "w_production": 5.0,          # value per unit production
+    "w_ships_cost": 0.02,         # per-ship cost in denominator
+    "w_distance_cost": 0.05,      # per-unit Euclidean distance cost
+    "w_travel_cost": 0.3,         # per-turn travel cost
+
+    # Target preference multipliers
+    "mult_neutral": 1.0,
+    "mult_enemy": 1.8,            # bias toward offense over neutrals once in contact
+    "mult_comet": 1.5,
+    "mult_reinforce_ally": 0.0,   # disabled at v1 (we don't reinforce)
+
+    # Sizing
+    "ships_safety_margin": 1.0,   # extra ships beyond exact-plus-one
+    "min_launch_size": 20.0,      # don't send fewer than this (matches starter)
+    "max_launch_fraction": 0.8,   # leave 20% behind (tuned in W2 via TuRBO)
+
+    # Expansion pacing
+    "expand_cooldown_turns": 0.0, # allow every turn
+    "keep_reserve_ships": 0.0,    # no forced reserve (exact-plus-one handles this)
+    "agg_early_game": 1.0,
+    "early_game_cutoff_turn": 100.0,
+
+    # Sun handling
+    "sun_avoidance_epsilon": 0.02,
+
+    # Comet engagement
+    "comet_max_time_mismatch": 1.5,
+
+    # Search bias (used when MCTS wraps this — harmless here)
+    "expand_bias": 0.5,
+}
+
+
+# ---- Observation shape helper ----
+
+@dataclass
+class ParsedObs:
+    """Typed unpacking of the Kaggle obs for a single agent."""
+    player: int
+    step: int
+    angular_velocity: float
+    planets: List[List[Any]]
+    initial_planets: List[List[Any]]
+    fleets: List[List[Any]]
+    next_fleet_id: int
+    comet_planet_ids: set
+    # Derived
+    my_planets: List[List[Any]] = field(default_factory=list)
+    enemy_planets: List[List[Any]] = field(default_factory=list)
+    neutral_planets: List[List[Any]] = field(default_factory=list)
+    planet_by_id: Dict[int, List[Any]] = field(default_factory=dict)
+    initial_planet_by_id: Dict[int, List[Any]] = field(default_factory=dict)
+
+
+def parse_obs(obs) -> ParsedObs:
+    p = ParsedObs(
+        player=obs_get(obs, "player", 0),
+        step=obs_get(obs, "step", 0),
+        angular_velocity=obs_get(obs, "angular_velocity", 0.0),
+        planets=list(obs_get(obs, "planets", [])),
+        initial_planets=list(obs_get(obs, "initial_planets", [])),
+        fleets=list(obs_get(obs, "fleets", [])),
+        next_fleet_id=obs_get(obs, "next_fleet_id", 0),
+        comet_planet_ids=set(obs_get(obs, "comet_planet_ids", [])),
+    )
+    for pl in p.planets:
+        p.planet_by_id[pl[0]] = pl
+        if pl[1] == p.player:
+            p.my_planets.append(pl)
+        elif pl[1] == -1:
+            p.neutral_planets.append(pl)
+        else:
+            p.enemy_planets.append(pl)
+    for ip in p.initial_planets:
+        p.initial_planet_by_id[ip[0]] = ip
+    return p
+
+
+# ---- Fleet-arrival table ----
+
+@dataclass
+class ArrivalEvent:
+    turn: int
+    owner: int
+    ships: int
+
+
+@dataclass
+class ArrivalTable:
+    """Per-target net ship projections, indexed by arrival turn.
+
+    Used for:
+      - Deciding if a reinforce is needed (net-incoming flips negative).
+      - Exact-plus-one sizing under concurrent incoming fleets.
+      - Blocking attacks on planets already being attacked by a teammate
+        (we pass through for now — 2p games only have us).
+    """
+    events_by_pid: Dict[int, List[ArrivalEvent]] = field(default_factory=dict)
+
+    def add(self, pid: int, turn: int, owner: int, ships: int) -> None:
+        self.events_by_pid.setdefault(pid, []).append(ArrivalEvent(turn, owner, ships))
+
+    def events(self, pid: int) -> List[ArrivalEvent]:
+        return self.events_by_pid.get(pid, [])
+
+    def projected_defender_at(
+        self,
+        pid: int,
+        defender_owner: int,
+        current_ships: int,
+        production: int,
+        arrival_turn: int,
+    ) -> int:
+        """Project defender ship count at `arrival_turn`, assuming:
+          - Production continues at the given rate (only while owned).
+          - Incoming ships flip ownership / decrement per combat rules.
+
+        This is a simplified single-owner projection. For multi-front fights
+        the full simulator in fast_engine.py is the ground truth — we use
+        this estimate for fast scoring only.
+        """
+        owner = defender_owner
+        ships = current_ships
+        events = sorted(self.events(pid), key=lambda e: e.turn)
+        last_t = 0
+        for e in events:
+            if e.turn > arrival_turn:
+                break
+            # Production between last_t and e.turn (only while owned)
+            if owner != -1:
+                ships += production * max(0, e.turn - last_t)
+            if e.owner == owner:
+                ships += e.ships
+            else:
+                ships -= e.ships
+                if ships < 0:
+                    owner = e.owner
+                    ships = -ships
+            last_t = e.turn
+        # Production until arrival_turn
+        if owner != -1:
+            ships += production * max(0, arrival_turn - last_t)
+        return ships
+
+
+def build_arrival_table(po: ParsedObs) -> ArrivalTable:
+    """Populate arrival events for every in-flight fleet against its target.
+
+    We estimate the target by: the closest planet along the fleet's heading.
+    That's imperfect (fleets can target any point in space or a planet that's
+    rotated by arrival time), but it's good enough for a first-cut defense
+    signal. The MCTS wrapper will replace this with a more precise estimate.
+    """
+    table = ArrivalTable()
+    for f in po.fleets:
+        fid, owner, fx, fy, fangle, from_pid, fships = f
+        # Best guess of target: planet whose perpendicular distance from fleet
+        # ray is minimal and the planet is ahead of the fleet.
+        best_pid = -1
+        best_score = float("inf")
+        best_turns = 0
+        for pl in po.planets:
+            pid = pl[0]
+            if pid == from_pid:
+                continue
+            is_orb = is_orbiting_planet(pl, po.initial_planet_by_id.get(pid, pl))
+            if is_orb:
+                ir, ia = initial_orbit_params(po.initial_planet_by_id[pid])
+                ot = OrbitingTarget(
+                    orbital_radius=ir, initial_angle=ia,
+                    angular_velocity=po.angular_velocity,
+                    current_step=po.step,
+                )
+                # Quick check: if we aim at this orbital target, what's the
+                # angular difference from the fleet's current heading?
+                angle_to, t, _ = orbiting_intercept((fx, fy), ot, fships)
+            else:
+                angle_to = static_intercept_angle((fx, fy), (pl[2], pl[3]))
+                t = static_intercept_turns((fx, fy), (pl[2], pl[3]), fships)
+            # Circular distance between angles, in (0, pi]
+            da = abs(((angle_to - fangle + math.pi) % (2 * math.pi)) - math.pi)
+            # Score: prefer small angle difference, prefer closer.
+            score = da * 10.0 + t * 0.1
+            if score < best_score:
+                best_score = score
+                best_pid = pid
+                best_turns = t
+        if best_pid >= 0:
+            table.add(best_pid, int(math.ceil(best_turns)) + po.step, owner, fships)
+    return table
+
+
+# ---- Target scoring ----
+
+def _travel_turns(source: Tuple[float, float], target_pl: List[Any],
+                  initial_pl: List[Any], angular_velocity: float,
+                  step: int, ships: int) -> Tuple[float, float]:
+    """Return (angle_to_aim, travel_turns_prediction)."""
+    if is_orbiting_planet(target_pl, initial_pl):
+        ir, ia = initial_orbit_params(initial_pl)
+        ot = OrbitingTarget(
+            orbital_radius=ir, initial_angle=ia,
+            angular_velocity=angular_velocity, current_step=step,
+        )
+        angle, t, _ = orbiting_intercept(source, ot, ships)
+        return angle, t
+    else:
+        tx, ty = target_pl[2], target_pl[3]
+        angle = static_intercept_angle(source, (tx, ty))
+        t = static_intercept_turns(source, (tx, ty), ships)
+        return angle, t
+
+
+def _score_target(
+    mp: List[Any],
+    tp: List[Any],
+    ip: List[Any],
+    po: ParsedObs,
+    table: ArrivalTable,
+    weights: Dict[str, float],
+    ships_to_send: int,
+) -> Tuple[float, float, int]:
+    """Return (score, aim_angle, defender_projection).
+
+    Higher score = more attractive to launch this attack.
+    """
+    angle, turns = _travel_turns(
+        (mp[2], mp[3]), tp, ip,
+        po.angular_velocity, po.step, ships_to_send,
+    )
+    if turns <= 0 or math.isinf(turns):
+        return (-math.inf, 0.0, 0)
+
+    # Avoid sun if needed
+    target_pos = (tp[2], tp[3])
+    angle = route_angle_avoiding_sun((mp[2], mp[3]), angle, target_pos)
+
+    defender_ships = tp[5]
+    defender_owner = tp[1]
+    production = tp[6]
+    arrival_turn = po.step + int(math.ceil(turns))
+    projected = table.projected_defender_at(
+        tp[0], defender_owner, defender_ships, production, arrival_turn,
+    )
+
+    # Preference multiplier
+    if tp[0] in po.comet_planet_ids:
+        mult = weights["mult_comet"]
+    elif tp[1] == po.player:
+        mult = weights["mult_reinforce_ally"]
+    elif tp[1] == -1:
+        mult = weights["mult_neutral"]
+    else:
+        mult = weights["mult_enemy"]
+
+    # Core score: production value / (ships cost + travel cost)
+    ships_cost = weights["w_ships_cost"] * max(1, ships_to_send)
+    travel_cost = weights["w_travel_cost"] * turns
+    distance = math.hypot(tp[2] - mp[2], tp[3] - mp[3])
+    distance_cost = weights["w_distance_cost"] * distance
+    production_value = weights["w_production"] * production
+
+    # Early game aggression multiplier
+    if po.step < weights["early_game_cutoff_turn"]:
+        mult *= weights["agg_early_game"]
+
+    denom = ships_cost + travel_cost + distance_cost + 1e-6
+    score = mult * production_value / denom
+
+    # If we can't actually capture (insufficient ships), penalize heavily.
+    needed = projected + int(weights["ships_safety_margin"])
+    if ships_to_send < needed and defender_owner != po.player:
+        score -= 10.0  # can't capture
+
+    return (score, angle, projected)
+
+
+# ---- Main agent ----
+
+@dataclass
+class _LaunchState:
+    last_launch_turn: Dict[int, int] = field(default_factory=dict)
+
+
+class HeuristicAgent(Agent):
+    """Path A bot. Parameterized, fast, tournament baseline."""
+
+    name = "heuristic"
+
+    def __init__(self, weights: Optional[Dict[str, float]] = None):
+        self.weights = dict(HEURISTIC_WEIGHTS)
+        if weights:
+            self.weights.update(weights)
+        self._state = _LaunchState()
+
+    # ---- Public: Kaggle + Agent contract ----
+
+    def act(self, obs, deadline: Deadline) -> Action:
+        # Always stage the no-op first so we're safe against timeouts.
+        deadline.stage(no_op())
+
+        po = parse_obs(obs)
+
+        # Reset per-game state on turn 0 (the Agent instance may be reused
+        # across matches in round-robin; stale last_launch_turn values from
+        # previous games would block launches in this one).
+        if po.step == 0:
+            self._state = _LaunchState()
+
+        if not po.my_planets:
+            return no_op()
+
+        table = build_arrival_table(po)
+
+        moves: Action = self._plan_moves(po, table)
+
+        # Cooldown bookkeeping
+        for m in moves:
+            self._state.last_launch_turn[int(m[0])] = po.step
+
+        deadline.stage(moves)
+        return moves
+
+    # ---- Planning ----
+
+    def _plan_moves(self, po: ParsedObs, table: ArrivalTable) -> Action:
+        moves: List[Move] = []
+        w = self.weights
+        reserve = int(w["keep_reserve_ships"])
+        cd = int(w["expand_cooldown_turns"])
+
+        # Build the list of candidate targets once (excludes our own planets
+        # for attack; includes them for reinforce consideration).
+        candidates = [p for p in po.planets]
+
+        for mp in po.my_planets:
+            mpid = int(mp[0])
+            available = int(mp[5]) - reserve
+            if available < int(w["min_launch_size"]):
+                continue
+
+            # Defense guard: if enemy ships are inbound and our defenders can't
+            # hold, don't drain this planet for offense. Compute the net
+            # shortfall and reduce `available` by exactly that much.
+            incoming_enemy = 0
+            incoming_ally = 0
+            for ev in table.events(mpid):
+                if ev.owner == po.player:
+                    incoming_ally += ev.ships
+                else:
+                    incoming_enemy += ev.ships
+            # Assume production keeps coming while we hold; shortfall estimate
+            # is a cheap approximation (production time-integral depends on
+            # arrival ordering — handled precisely by fast_engine when MCTS
+            # wraps this).
+            projected_def = int(mp[5]) + incoming_ally
+            shortfall = max(0, incoming_enemy + 1 - projected_def)
+            if shortfall > 0:
+                # Keep exactly enough to defend; no extra hoarding.
+                available = max(0, int(mp[5]) - shortfall)
+            if available < int(w["min_launch_size"]):
+                continue
+
+            # Cooldown (skip check entirely when cd == 0 — avoids any chance
+            # of stale last_launch_turn values blocking launches)
+            if cd > 0:
+                last = self._state.last_launch_turn.get(mpid, -10_000)
+                if po.step - last < cd:
+                    continue
+
+            # Score all candidate targets at several possible send sizes.
+            # We pick the best (score, size) combination.
+            best = None  # (score, angle, ships_to_send, target_pid)
+            for tp in candidates:
+                if tp[0] == mpid:
+                    continue
+                ip = po.initial_planet_by_id.get(tp[0], tp)
+
+                # Trial size = exact-plus-one (projected + safety margin).
+                # First a cheap estimate of travel turns with a guess ship size:
+                _, t_guess = _travel_turns(
+                    (mp[2], mp[3]), tp, ip,
+                    po.angular_velocity, po.step, max(50, available // 2),
+                )
+                if math.isinf(t_guess) or t_guess <= 0:
+                    continue
+                arrival = po.step + int(math.ceil(t_guess))
+                proj = table.projected_defender_at(
+                    tp[0], tp[1], tp[5], tp[6], arrival,
+                )
+                needed = max(int(w["min_launch_size"]),
+                             proj + int(w["ships_safety_margin"]))
+                # Allies: send much smaller reinforcement
+                if tp[1] == po.player:
+                    needed = max(int(w["min_launch_size"]), proj // 5 + 1)
+
+                cap = int(available * w["max_launch_fraction"])
+                ships_to_send = min(needed, cap, available)
+                if ships_to_send < int(w["min_launch_size"]):
+                    continue
+
+                score, angle, _ = _score_target(
+                    mp, tp, ip, po, table, self.weights, ships_to_send,
+                )
+                if best is None or score > best[0]:
+                    best = (score, angle, ships_to_send, int(tp[0]))
+
+            if best is None or best[0] <= 0:
+                continue
+
+            score, angle, ships_to_send, target_pid = best
+            moves.append([mpid, float(angle), int(ships_to_send)])
+            # Register this launch in the arrival table so subsequent target
+            # scoring (in this same turn's planning) sees it.
+            _, t_actual = _travel_turns(
+                (mp[2], mp[3]),
+                po.planet_by_id[target_pid],
+                po.initial_planet_by_id.get(target_pid, po.planet_by_id[target_pid]),
+                po.angular_velocity, po.step, ships_to_send,
+            )
+            table.add(
+                target_pid,
+                po.step + int(math.ceil(t_actual)),
+                po.player, ships_to_send,
+            )
+
+        return moves
+
+
+def build(**overrides) -> HeuristicAgent:
+    """Factory for the heuristic agent. Accepts weight overrides."""
+    return HeuristicAgent(weights=overrides if overrides else None)
+
+
+
+# --- inlined: orbitwars/bots/fast_rollout.py ---
+
+"""Ultra-cheap rollout policy for MCTS.
+
+The `HeuristicAgent` takes ~18 ms per `act()` call — acceptable for the
+one root decision it makes per real turn, but catastrophic inside an
+MCTS rollout. At `rollout_depth=15` with 2 players, one rollout is
+~560 ms — we can't finish a single rollout inside the 300 ms search
+budget.
+
+This file provides `FastRolloutAgent`, which mirrors AlphaGo's
+"fast rollout policy" split: the slow/accurate policy drives the tree
+and the root decision, and a cheap policy fills in rollout plies. The
+fast policy intentionally skips every expensive subroutine:
+
+  * No arrival-table build.
+  * No scoring sweep over targets.
+  * No Newton intercept for orbiting targets (uses static-intercept,
+    which is just an `atan2`).
+  * No sun-tangent routing — we accept the rollout-noise cost of the
+    occasional fleet flying into the sun. Every candidate gets the
+    same bias, so ranking at the root is preserved.
+  * No cooldowns, no defense guards, no launch-state tracking.
+
+The one rule: from each of my planets with enough ships, send
+`send_fraction × available` at `atan2(nearest_enemy_or_neutral)`.
+
+Expected cost per `act()` call: <500 µs — a 30-50× speedup over the
+full heuristic. Net effect at default budget:
+    sims/turn goes from <1 (diagnostic only) to ~10-15 (real search).
+
+Invariants preserved:
+  * Only my planets launch.
+  * `ships <= planet.ships` always.
+  * Angle is finite (atan2 well-defined when source != target; the
+    guard below rejects self-targets).
+
+This class is used inside MCTS rollouts when
+`GumbelConfig.rollout_policy == "fast"`. The root anchor is still
+provided by `HeuristicAgent`; only rollout plies swap in the fast
+agent.
+"""
+
+import math
+from typing import Any, List, Optional
+
+
+
+class FastRolloutAgent(Agent):
+    """Cheapest-possible rollout policy: nearest-target static push.
+
+    Knobs intentionally minimal — tuning this is not the point. If
+    rollouts need to be smarter, promote to a real heuristic; if they
+    need to be faster, inline the loop.
+
+    Attributes:
+        min_launch_size: do not launch a fleet smaller than this many
+            ships (matches HeuristicAgent's default). Prevents single-
+            ship dribbles that clutter the fleet count without changing
+            the value.
+        send_fraction: fraction of available ships to send from a
+            launching planet. 0.8 leaves a 20% reserve and matches the
+            HeuristicAgent default, so fast and slow rollouts produce
+            comparably-sized fleets — only the target-selection logic
+            differs.
+    """
+
+    name = "fast_rollout"
+
+    def __init__(
+        self,
+        min_launch_size: int = 20,
+        send_fraction: float = 0.8,
+    ) -> None:
+        self.min_launch_size = int(min_launch_size)
+        self.send_fraction = float(send_fraction)
+
+    def act(self, obs: Any, deadline: Deadline) -> Action:
+        # Always stage a safe fallback first; if we get interrupted
+        # mid-loop the caller still has a valid action.
+        deadline.stage(no_op())
+
+        player = obs_get(obs, "player", 0)
+        planets = obs_get(obs, "planets", [])
+        if not planets:
+            return no_op()
+
+        # Single-pass ownership partition. Both lists hold references
+        # into the same planet entries, so we avoid copying.
+        my_planets: List[Any] = []
+        targets: List[Any] = []
+        for p in planets:
+            if p[1] == player:
+                my_planets.append(p)
+            else:
+                targets.append(p)
+
+        # Either no launchers or no opponents/neutrals to push toward:
+        # there is nothing useful to do.
+        if not my_planets or not targets:
+            return no_op()
+
+        moves: Action = []
+        min_size = self.min_launch_size
+        frac = self.send_fraction
+
+        for mp in my_planets:
+            available = int(mp[5])
+            if available < min_size:
+                continue
+
+            # Find nearest target by squared-Euclidean — no sqrt needed
+            # when we only need the argmin. This is the hot inner loop.
+            mx = float(mp[2])
+            my_ = float(mp[3])
+            best_d2 = float("inf")
+            best_tp: Optional[Any] = None
+            for tp in targets:
+                dx = float(tp[2]) - mx
+                dy = float(tp[3]) - my_
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_tp = tp
+
+            if best_tp is None or best_d2 == 0.0:
+                # Degenerate: co-located target (shouldn't happen in
+                # valid states) or no targets at all.
+                continue
+
+            # Static intercept angle — just atan2. We deliberately
+            # ignore orbital motion: in 15-ply rollouts the bias is
+            # small, and every candidate experiences the same bias,
+            # so simple-regret ranking at the root is preserved.
+            angle = math.atan2(
+                float(best_tp[3]) - my_,
+                float(best_tp[2]) - mx,
+            )
+
+            ships = int(available * frac)
+            if ships < min_size:
+                ships = min_size
+            if ships > available:
+                ships = available
+
+            moves.append([int(mp[0]), float(angle), int(ships)])
+
+        deadline.stage(moves)
+        return moves
+
+
+
+# --- inlined: orbitwars/engine/fast_engine.py ---
+
+"""Numpy SoA re-implementation of the orbit_wars engine.
+
+Goal: state-equal parity with kaggle_environments v1.0.9 over 1000 random seeds,
+while running materially faster (target 10-100x) than the stock engine.
+
+Key design choices:
+
+  * Planets and fleets are stored as parallel numpy arrays (Structure-of-Arrays).
+    The three hot loops — fleet movement + OOB/sun/planet collision, planet
+    rotation + sweep, comet movement + sweep — are vectorized via broadcasting
+    (O(F*P) with F,P <= ~300 is 100k flops per turn, negligible).
+  * Comet groups (which carry precomputed paths) stay as list-of-dicts: few of
+    them, branchy logic, path lookups are dict reads — not hot.
+  * Combat events are stored as lists of (owner, ships) tuples per planet,
+    captured at collision time so the order of fleet removal vs combat
+    resolution doesn't matter.
+  * Ship counts are stored as int64 to mirror Python's unbounded ints;
+    positions as float64 to avoid drift accumulating over 500 turns (important
+    for parity with the reference engine).
+
+Parity target: integer-equal ship counts and owner IDs for every planet/fleet
+at every turn; positions within 1e-9 of reference (pure float-math match is
+achievable since we compute each quantity the same way).
+"""
+
+import math
+import random
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+# --- Engine constants (must mirror kaggle_environments/envs/orbit_wars) ---
+
+BOARD_SIZE = 100.0
+CENTER = BOARD_SIZE / 2.0
+SUN_RADIUS = 10.0
+ROTATION_RADIUS_LIMIT = 50.0
+COMET_RADIUS = 1.0
+COMET_PRODUCTION = 1
+COMET_SPAWN_STEPS = [50, 150, 250, 350, 450]
+DEFAULT_MAX_SPEED = 6.0
+DEFAULT_COMET_SPEED = 4.0
+DEFAULT_EPISODE_STEPS = 500
+
+
+# --- Vectorized geometry helpers ---
+
+def _pt_seg_dist_pairs(
+    pts_x: np.ndarray, pts_y: np.ndarray,       # shape (P,)
+    seg_v_x: np.ndarray, seg_v_y: np.ndarray,   # shape (F,)
+    seg_w_x: np.ndarray, seg_w_y: np.ndarray,   # shape (F,)
+) -> np.ndarray:
+    """All-pairs distance: point[i] to segment[j]. Returns shape (P, F)."""
+    px = pts_x[:, None]
+    py = pts_y[:, None]
+    vx = seg_v_x[None, :]
+    vy = seg_v_y[None, :]
+    wx = seg_w_x[None, :]
+    wy = seg_w_y[None, :]
+    dx = wx - vx
+    dy = wy - vy
+    l2 = dx * dx + dy * dy
+    safe_l2 = np.where(l2 == 0.0, 1.0, l2)
+    t = ((px - vx) * dx + (py - vy) * dy) / safe_l2
+    t = np.clip(t, 0.0, 1.0)
+    proj_x = vx + t * dx
+    proj_y = vy + t * dy
+    d = np.hypot(px - proj_x, py - proj_y)
+    if np.any(l2 == 0.0):
+        d_zero = np.hypot(px - vx, py - vy)
+        d = np.where(l2 == 0.0, d_zero, d)
+    return d
+
+
+def _seg_dist_single_point_many_segs(
+    px: float, py: float,
+    seg_v_x: np.ndarray, seg_v_y: np.ndarray,
+    seg_w_x: np.ndarray, seg_w_y: np.ndarray,
+) -> np.ndarray:
+    """One point, many segments. Returns shape (F,)."""
+    dx = seg_w_x - seg_v_x
+    dy = seg_w_y - seg_v_y
+    l2 = dx * dx + dy * dy
+    safe_l2 = np.where(l2 == 0.0, 1.0, l2)
+    t = ((px - seg_v_x) * dx + (py - seg_v_y) * dy) / safe_l2
+    t = np.clip(t, 0.0, 1.0)
+    proj_x = seg_v_x + t * dx
+    proj_y = seg_v_y + t * dy
+    d = np.hypot(px - proj_x, py - proj_y)
+    if np.any(l2 == 0.0):
+        d_zero = np.hypot(px - seg_v_x, py - seg_v_y)
+        d = np.where(l2 == 0.0, d_zero, d)
+    return d
+
+
+def _seg_dist_many_points_single_seg(
+    pts_x: np.ndarray, pts_y: np.ndarray,
+    v_x: float, v_y: float,
+    w_x: float, w_y: float,
+) -> np.ndarray:
+    """Many points, one segment. Returns shape (P,)."""
+    dx = w_x - v_x
+    dy = w_y - v_y
+    l2 = dx * dx + dy * dy
+    if l2 == 0.0:
+        return np.hypot(pts_x - v_x, pts_y - v_y)
+    t = ((pts_x - v_x) * dx + (pts_y - v_y) * dy) / l2
+    t = np.clip(t, 0.0, 1.0)
+    proj_x = v_x + t * dx
+    proj_y = v_y + t * dy
+    return np.hypot(pts_x - proj_x, pts_y - proj_y)
+
+
+def _fleet_speed_batched(ships: np.ndarray, max_speed: float) -> np.ndarray:
+    """Vectorized fleet speed. Clamps to max_speed."""
+    ships_f = ships.astype(np.float64)
+    safe = np.maximum(ships_f, 1.0)
+    out = 1.0 + (max_speed - 1.0) * (np.log(safe) / math.log(1000.0)) ** 1.5
+    np.clip(out, 0.0, max_speed, out=out)
+    out[ships <= 0] = 0.0
+    return out
+
+
+# --- State ---
+
+@dataclass
+class GameConfig:
+    ship_speed: float = DEFAULT_MAX_SPEED
+    comet_speed: float = DEFAULT_COMET_SPEED
+    episode_steps: int = DEFAULT_EPISODE_STEPS
+
+
+@dataclass
+class GameState:
+    """Full game state, mirrors the reference engine's observation shape.
+
+    All arrays are dense and indexed contiguously — we rebuild on every
+    insert/remove to avoid alive-mask bookkeeping. Planet/fleet counts stay
+    small (<300 fleets, <60 planets) so compact-on-mutate is fine here and
+    keeps semantics identical to the list-based reference.
+    """
+    config: GameConfig
+    step: int = 0
+    angular_velocity: float = 0.0
+    next_fleet_id: int = 0
+
+    # Planets (including comets)
+    p_id: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    p_owner: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    p_x: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    p_y: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    p_radius: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    p_ships: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    p_production: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+
+    # Initial positions for rotation math
+    p_init_x: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    p_init_y: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+
+    # Fleets
+    f_id: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    f_owner: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    f_x: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    f_y: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    f_angle: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    f_from_pid: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    f_ships: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+
+    # Comet bookkeeping. Each group: {planet_ids, paths, path_index}
+    comets: List[Dict[str, Any]] = field(default_factory=list)
+    comet_planet_ids: List[int] = field(default_factory=list)
+
+    # ---- Structural helpers ----
+    def num_planets(self) -> int:
+        return int(self.p_id.shape[0])
+
+    def num_fleets(self) -> int:
+        return int(self.f_id.shape[0])
+
+    def _comet_pid_set(self) -> set:
+        return set(self.comet_planet_ids)
+
+    def planet_index(self, pid: int) -> int:
+        """Return current dense array index for planet id, or -1."""
+        idx = np.where(self.p_id == pid)[0]
+        return int(idx[0]) if idx.size else -1
+
+    def to_official_planets(self) -> List[List[Any]]:
+        """Emit planets as the engine's list-of-lists form."""
+        return [
+            [
+                int(self.p_id[i]),
+                int(self.p_owner[i]),
+                float(self.p_x[i]),
+                float(self.p_y[i]),
+                float(self.p_radius[i]),
+                int(self.p_ships[i]),
+                int(self.p_production[i]),
+            ]
+            for i in range(self.num_planets())
+        ]
+
+    def to_official_initial_planets(self) -> List[List[Any]]:
+        return [
+            [
+                int(self.p_id[i]),
+                -1,
+                float(self.p_init_x[i]),
+                float(self.p_init_y[i]),
+                float(self.p_radius[i]),
+                int(self.p_ships[i]),
+                int(self.p_production[i]),
+            ]
+            for i in range(self.num_planets())
+        ]
+
+    def to_official_fleets(self) -> List[List[Any]]:
+        return [
+            [
+                int(self.f_id[i]),
+                int(self.f_owner[i]),
+                float(self.f_x[i]),
+                float(self.f_y[i]),
+                float(self.f_angle[i]),
+                int(self.f_from_pid[i]),
+                int(self.f_ships[i]),
+            ]
+            for i in range(self.num_fleets())
+        ]
+
+
+# --- Ingest/append helpers ---
+
+def _ingest_planets(
+    state: GameState,
+    planets_list: List[List[Any]],
+    initial_planets: Optional[List[List[Any]]] = None,
+) -> None:
+    n = len(planets_list)
+    state.p_id = np.array([int(p[0]) for p in planets_list], dtype=np.int64) if n else np.zeros(0, dtype=np.int64)
+    state.p_owner = np.array([int(p[1]) for p in planets_list], dtype=np.int64) if n else np.zeros(0, dtype=np.int64)
+    state.p_x = np.array([float(p[2]) for p in planets_list], dtype=np.float64) if n else np.zeros(0, dtype=np.float64)
+    state.p_y = np.array([float(p[3]) for p in planets_list], dtype=np.float64) if n else np.zeros(0, dtype=np.float64)
+    state.p_radius = np.array([float(p[4]) for p in planets_list], dtype=np.float64) if n else np.zeros(0, dtype=np.float64)
+    state.p_ships = np.array([int(p[5]) for p in planets_list], dtype=np.int64) if n else np.zeros(0, dtype=np.int64)
+    state.p_production = np.array([int(p[6]) for p in planets_list], dtype=np.int64) if n else np.zeros(0, dtype=np.int64)
+
+    if initial_planets is not None and len(initial_planets) == n and n:
+        state.p_init_x = np.array([float(p[2]) for p in initial_planets], dtype=np.float64)
+        state.p_init_y = np.array([float(p[3]) for p in initial_planets], dtype=np.float64)
+    else:
+        state.p_init_x = state.p_x.copy()
+        state.p_init_y = state.p_y.copy()
+
+
+def _append_planets(state: GameState, new_planets: List[List[Any]]) -> None:
+    if not new_planets:
+        return
+    ids = np.array([int(p[0]) for p in new_planets], dtype=np.int64)
+    owners = np.array([int(p[1]) for p in new_planets], dtype=np.int64)
+    xs = np.array([float(p[2]) for p in new_planets], dtype=np.float64)
+    ys = np.array([float(p[3]) for p in new_planets], dtype=np.float64)
+    rs = np.array([float(p[4]) for p in new_planets], dtype=np.float64)
+    ships = np.array([int(p[5]) for p in new_planets], dtype=np.int64)
+    prods = np.array([int(p[6]) for p in new_planets], dtype=np.int64)
+    state.p_id = np.concatenate([state.p_id, ids])
+    state.p_owner = np.concatenate([state.p_owner, owners])
+    state.p_x = np.concatenate([state.p_x, xs])
+    state.p_y = np.concatenate([state.p_y, ys])
+    state.p_radius = np.concatenate([state.p_radius, rs])
+    state.p_ships = np.concatenate([state.p_ships, ships])
+    state.p_production = np.concatenate([state.p_production, prods])
+    # Newly spawned comets: initial_x/y recorded as the spawn position
+    # (the engine stores the first off-board placeholder in initial_planets).
+    state.p_init_x = np.concatenate([state.p_init_x, xs.copy()])
+    state.p_init_y = np.concatenate([state.p_init_y, ys.copy()])
+
+
+def _ingest_fleets(state: GameState, fleets_list: List[List[Any]]) -> None:
+    n = len(fleets_list)
+    state.f_id = np.array([int(f[0]) for f in fleets_list], dtype=np.int64) if n else np.zeros(0, dtype=np.int64)
+    state.f_owner = np.array([int(f[1]) for f in fleets_list], dtype=np.int64) if n else np.zeros(0, dtype=np.int64)
+    state.f_x = np.array([float(f[2]) for f in fleets_list], dtype=np.float64) if n else np.zeros(0, dtype=np.float64)
+    state.f_y = np.array([float(f[3]) for f in fleets_list], dtype=np.float64) if n else np.zeros(0, dtype=np.float64)
+    state.f_angle = np.array([float(f[4]) for f in fleets_list], dtype=np.float64) if n else np.zeros(0, dtype=np.float64)
+    state.f_from_pid = np.array([int(f[5]) for f in fleets_list], dtype=np.int64) if n else np.zeros(0, dtype=np.int64)
+    state.f_ships = np.array([int(f[6]) for f in fleets_list], dtype=np.int64) if n else np.zeros(0, dtype=np.int64)
+
+
+def _append_fleet(
+    state: GameState,
+    fid: int, owner: int,
+    x: float, y: float, angle: float,
+    from_pid: int, ships: int,
+) -> None:
+    state.f_id = np.append(state.f_id, fid)
+    state.f_owner = np.append(state.f_owner, owner)
+    state.f_x = np.append(state.f_x, x)
+    state.f_y = np.append(state.f_y, y)
+    state.f_angle = np.append(state.f_angle, angle)
+    state.f_from_pid = np.append(state.f_from_pid, from_pid)
+    state.f_ships = np.append(state.f_ships, ships)
+
+
+# --- Engine ---
+
+class FastEngine:
+    """Deterministic, numpy-accelerated orbit_wars engine.
+
+    Usage:
+        eng = FastEngine.from_scratch(num_agents=2, seed=42)
+        while not eng.done:
+            actions = [agent(obs) for agent in ...]
+            eng.step(actions)
+    """
+
+    def __init__(
+        self,
+        state: GameState,
+        num_agents: int = 2,
+        rng: Optional[Any] = None,
+    ):
+        self.state = state
+        self.num_agents = num_agents
+        self.done: bool = False
+        self.rewards: List[int] = [0] * num_agents
+        # IMPORTANT: use an instance-local RNG for all step-time randomness
+        # (comet ship counts, etc). If we used the global `random` module,
+        # MCTS rollouts would consume entropy from the same stream that the
+        # real Kaggle judge uses for its own engine, desynchronizing the
+        # outer game. See `_maybe_spawn_comets` — line 455-458 of the
+        # reference engine and our mirror at the same logical site. A fresh
+        # `random.Random()` seeds from os.urandom, decoupling from global.
+        #
+        # The parity validator EXPLICITLY passes `rng=random` (the module
+        # itself) to share the global stream with the reference engine.
+        # Duck typing: both the module and `random.Random()` expose
+        # `.randint(a, b)`.
+        self._rng = rng if rng is not None else random.Random()
+
+    # ---- Construction ----
+
+    @classmethod
+    def from_scratch(
+        cls,
+        num_agents: int = 2,
+        seed: Optional[int] = None,
+        config: Optional[GameConfig] = None,
+    ) -> "FastEngine":
+        """Generate a fresh game using the reference engine's map generator.
+
+        We import the reference generator to guarantee identical map layouts.
+        """
+        if seed is not None:
+            random.seed(seed)
+        cfg = config or GameConfig()
+        state = GameState(config=cfg)
+        state.angular_velocity = random.uniform(0.025, 0.05)
+
+        from kaggle_environments.envs.orbit_wars.orbit_wars import generate_planets, distance
+        planets_list = generate_planets()
+
+        num_groups = len(planets_list) // 4
+        if num_groups > 0:
+            home_group = random.randint(0, num_groups - 1)
+            base = home_group * 4
+
+            if num_agents == 4:
+                q1 = planets_list[base]
+                orb_r = distance((q1[2], q1[3]), (CENTER, CENTER))
+                if orb_r + q1[4] < ROTATION_RADIUS_LIMIT:
+                    for g in range(num_groups):
+                        gb = g * 4
+                        gp = planets_list[gb]
+                        g_orb = distance((gp[2], gp[3]), (CENTER, CENTER))
+                        if g_orb + gp[4] < ROTATION_RADIUS_LIMIT:
+                            if abs((gp[2] - CENTER) - (gp[3] - CENTER)) < 0.01:
+                                base = gb
+                                break
+
+            if num_agents == 2:
+                planets_list[base][1] = 0
+                planets_list[base][5] = 10
+                planets_list[base + 3][1] = 1
+                planets_list[base + 3][5] = 10
+            elif num_agents == 4:
+                for j in range(4):
+                    planets_list[base + j][1] = j
+                    planets_list[base + j][5] = 10
+
+        _ingest_planets(state, planets_list)
+        return cls(state, num_agents=num_agents)
+
+    @classmethod
+    def from_official_obs(
+        cls,
+        obs,
+        num_agents: int = 2,
+        config: Optional[GameConfig] = None,
+        rng: Optional[Any] = None,
+    ) -> "FastEngine":
+        """Initialize FastEngine from a running kaggle env's obs.
+
+        Args:
+            rng: an object with a `randint(a, b)` method used for step-time
+                randomness (comet ship sizing). Defaults to a fresh
+                `random.Random()` that is decoupled from the global random
+                module — important during MCTS rollouts to avoid
+                consuming entropy from the judge's global RNG stream.
+                Pass `random` (the module itself) when you WANT to share
+                global state, e.g. in the parity validator where both
+                engines must consume from the same stream.
+        """
+        cfg = config or GameConfig()
+        state = GameState(config=cfg)
+        state.angular_velocity = float(getattr(obs, "angular_velocity", 0.0))
+        state.step = int(getattr(obs, "step", 0))
+        state.next_fleet_id = int(getattr(obs, "next_fleet_id", 0))
+        _ingest_planets(
+            state,
+            [list(p) for p in getattr(obs, "planets", [])],
+            initial_planets=[list(p) for p in getattr(obs, "initial_planets", [])],
+        )
+        _ingest_fleets(state, [list(f) for f in getattr(obs, "fleets", [])])
+        # Deep-copy comets to decouple from reference engine state
+        state.comets = []
+        for g in getattr(obs, "comets", []):
+            state.comets.append({
+                "planet_ids": list(g["planet_ids"]),
+                "paths": [[list(pt) for pt in p] for p in g["paths"]],
+                "path_index": int(g["path_index"]),
+            })
+        state.comet_planet_ids = list(getattr(obs, "comet_planet_ids", []))
+        return cls(state, num_agents=num_agents, rng=rng)
+
+    # ---- Read-only API ----
+
+    def observation(self, player: int) -> Dict[str, Any]:
+        return {
+            "player": player,
+            "step": self.state.step,
+            "angular_velocity": self.state.angular_velocity,
+            "planets": self.state.to_official_planets(),
+            "initial_planets": self.state.to_official_initial_planets(),
+            "fleets": self.state.to_official_fleets(),
+            "next_fleet_id": self.state.next_fleet_id,
+            "comets": [dict(g) for g in self.state.comets],
+            "comet_planet_ids": list(self.state.comet_planet_ids),
+        }
+
+    def scores(self) -> List[int]:
+        scores = [0] * self.num_agents
+        for i in range(self.state.num_planets()):
+            o = int(self.state.p_owner[i])
+            if 0 <= o < self.num_agents:
+                scores[o] += int(self.state.p_ships[i])
+        for i in range(self.state.num_fleets()):
+            o = int(self.state.f_owner[i])
+            if 0 <= o < self.num_agents:
+                scores[o] += int(self.state.f_ships[i])
+        return scores
+
+    # ---- Main step ----
+
+    def step(self, actions: Sequence[Optional[Sequence]]) -> None:
+        """Run one turn. `actions[i]` is agent i's move list or None."""
+        if self.done:
+            return
+
+        st = self.state
+        # IMPORTANT: do NOT increment step at the start. The reference
+        # engine's interpreter reads `step` PRE-increment (the Kaggle harness
+        # advances `step` AFTER the interpreter returns). We post-increment at
+        # the end of this method so that subsequent turns read the right
+        # step value. from_official_obs() captures obs.step which is the
+        # post-previous-call value; that equals the step we'll use here.
+
+        # 1. Remove expired comets (those whose path_index is past end)
+        self._purge_expired_comets()
+
+        # 2. Spawn new comets at designated steps
+        self._maybe_spawn_comets()
+
+        # 3. Process player actions (fleet launches)
+        for player_id, action in enumerate(actions):
+            self._process_moves(player_id, action)
+
+        # 4. Production on owned planets
+        owned = st.p_owner != -1
+        if owned.any():
+            st.p_ships[owned] += st.p_production[owned]
+
+        # Combat events: planet_id -> list of (owner, ships) snapshots.
+        # We snapshot at collision time so fleet array indexing doesn't matter
+        # after subsequent movement/sweep/removal.
+        combat: Dict[int, List[Tuple[int, int]]] = {int(pid): [] for pid in st.p_id}
+
+        # Fleets caught by collisions (as indices into the current fleet arrays,
+        # at the time of collision). We maintain an alive-mask so later sweep
+        # passes can ignore already-destroyed fleets; at the end of step() we
+        # compact the arrays.
+        alive_mask = np.ones(st.num_fleets(), dtype=bool)
+
+        # 5. Fleet movement + collision
+        self._move_fleets_and_collide(alive_mask, combat)
+
+        # 6. Planet rotation + sweep
+        self._rotate_planets_and_sweep(alive_mask, combat)
+
+        # 7. Comet movement + sweep
+        self._move_comets_and_sweep(alive_mask, combat)
+
+        # 8. Remove expired-during-movement comets
+        self._purge_expired_comets()
+
+        # 9. Compact dead fleets
+        self._compact_fleets(alive_mask)
+
+        # 10. Combat resolution (using snapshots)
+        self._resolve_combat(combat)
+
+        # 11. Terminal check (uses PRE-increment step value, matching the
+        #     reference's `step >= episodeSteps - 2` check).
+        self._check_terminal()
+
+        # 12. Advance step (mirrors Kaggle harness post-call increment).
+        st.step += 1
+
+    # ---- Internal steps ----
+
+    def _purge_expired_comets(self) -> None:
+        """Remove comets whose path_index is past the end of their path."""
+        st = self.state
+        expired: List[int] = []
+        for group in st.comets:
+            idx = group["path_index"]
+            for i, pid in enumerate(group["planet_ids"]):
+                if idx >= len(group["paths"][i]):
+                    expired.append(pid)
+
+        if not expired:
+            return
+        expired_set = set(expired)
+        self._remove_planets_by_pid(expired_set)
+        st.comet_planet_ids = [pid for pid in st.comet_planet_ids if pid not in expired_set]
+        for group in st.comets:
+            group["planet_ids"] = [pid for pid in group["planet_ids"] if pid not in expired_set]
+        st.comets = [g for g in st.comets if g["planet_ids"]]
+
+    def _maybe_spawn_comets(self) -> None:
+        st = self.state
+        step = st.step
+        if (step + 1) not in COMET_SPAWN_STEPS:
+            return
+        from kaggle_environments.envs.orbit_wars.orbit_wars import generate_comet_paths
+        paths = generate_comet_paths(
+            st.to_official_initial_planets(),
+            st.angular_velocity,
+            step + 1,
+            st.comet_planet_ids,
+            st.config.comet_speed,
+        )
+        if not paths:
+            return
+        next_id = int(st.p_id.max()) + 1 if st.num_planets() > 0 else 0
+        # NOTE: we deliberately use the INSTANCE RNG here (not the global
+        # `random` module) so MCTS rollouts don't consume entropy from the
+        # Kaggle judge's global stream. See `__init__` for the full story.
+        comet_ships = min(
+            self._rng.randint(1, 99),
+            self._rng.randint(1, 99),
+            self._rng.randint(1, 99),
+            self._rng.randint(1, 99),
+        )
+        group: Dict[str, Any] = {"planet_ids": [], "paths": paths, "path_index": -1}
+        new_planets: List[List[Any]] = []
+        for i in range(len(paths)):
+            pid = next_id + i
+            group["planet_ids"].append(pid)
+            st.comet_planet_ids.append(pid)
+            new_planets.append([pid, -1, -99.0, -99.0, COMET_RADIUS, comet_ships, COMET_PRODUCTION])
+        st.comets.append(group)
+        _append_planets(st, new_planets)
+
+    def _process_moves(self, player_id: int, action: Optional[Sequence]) -> None:
+        st = self.state
+        if not action or not isinstance(action, list):
+            return
+        for move in action:
+            if not isinstance(move, (list, tuple)) or len(move) != 3:
+                continue
+            from_id, angle, ships = move
+            try:
+                from_id_i = int(from_id)
+                angle_f = float(angle)
+                ships_i = int(ships)
+            except (TypeError, ValueError):
+                continue
+            pi = st.planet_index(from_id_i)
+            if pi < 0:
+                continue
+            if int(st.p_owner[pi]) != player_id:
+                continue
+            if ships_i <= 0 or int(st.p_ships[pi]) < ships_i:
+                continue
+
+            st.p_ships[pi] -= ships_i
+            px = float(st.p_x[pi])
+            py = float(st.p_y[pi])
+            pr = float(st.p_radius[pi])
+            start_x = px + math.cos(angle_f) * (pr + 0.1)
+            start_y = py + math.sin(angle_f) * (pr + 0.1)
+            _append_fleet(st, st.next_fleet_id, player_id, start_x, start_y,
+                          angle_f, from_id_i, ships_i)
+            st.next_fleet_id += 1
+
+    def _move_fleets_and_collide(
+        self,
+        alive_mask: np.ndarray,
+        combat: Dict[int, List[Tuple[int, int]]],
+    ) -> None:
+        st = self.state
+        F = st.num_fleets()
+        if F == 0:
+            return
+
+        # Fleets just launched this turn are also in these arrays (appended by
+        # _process_moves). alive_mask was sized before launches — extend it.
+        if alive_mask.shape[0] < F:
+            extra = np.ones(F - alive_mask.shape[0], dtype=bool)
+            alive_mask_full = np.concatenate([alive_mask, extra])
+            # Mutate the caller's view by copying back — callers reassign below.
+            # We can't reassign the passed-in array; instead return via
+            # aliasing: write back into the buffer by changing everything the
+            # caller reads. Simplest: do this in step() before calling.
+            # To avoid confusion, we document in step() that alive_mask is
+            # created AFTER launches. Let's just operate on `alive_mask_full`
+            # locally and accept that launches added this turn are all alive.
+            alive_mask = alive_mask_full
+
+        max_speed = st.config.ship_speed
+        speeds = _fleet_speed_batched(st.f_ships, max_speed)
+        old_x = st.f_x.copy()
+        old_y = st.f_y.copy()
+        new_x = old_x + np.cos(st.f_angle) * speeds
+        new_y = old_y + np.sin(st.f_angle) * speeds
+
+        # Update positions in-place (reference: mutates fleet entries before
+        # running collision checks).
+        st.f_x = new_x
+        st.f_y = new_y
+
+        oob = (new_x < 0.0) | (new_x > BOARD_SIZE) | (new_y < 0.0) | (new_y > BOARD_SIZE)
+
+        sun_d = _seg_dist_single_point_many_segs(
+            CENTER, CENTER, old_x, old_y, new_x, new_y,
+        )
+        sun_hit = sun_d < SUN_RADIUS
+
+        P = st.num_planets()
+        planet_hit = np.zeros(F, dtype=bool)
+        planet_hit_pid = np.full(F, -1, dtype=np.int64)
+
+        if P > 0:
+            d = _pt_seg_dist_pairs(
+                st.p_x, st.p_y, old_x, old_y, new_x, new_y,
+            )  # shape (P, F)
+            hits = d < st.p_radius[:, None]
+            any_hit = hits.any(axis=0)
+            first_hit_p = np.argmax(hits, axis=0)
+            # A fleet is flagged as planet-hit only if it's not already OOB or
+            # sun-killed (reference uses `continue` to skip planet check).
+            planet_hit = any_hit & ~oob & ~sun_hit
+            planet_hit_pid = np.where(planet_hit, st.p_id[first_hit_p], -1)
+
+        # Record combat events and update alive_mask in precedence order.
+        # Iterating Python-side is fine — F per turn is small.
+        for fi in range(F):
+            if not alive_mask[fi]:
+                continue
+            if oob[fi] or sun_hit[fi]:
+                alive_mask[fi] = False
+            elif planet_hit[fi]:
+                pid = int(planet_hit_pid[fi])
+                combat[pid].append((int(st.f_owner[fi]), int(st.f_ships[fi])))
+                alive_mask[fi] = False
+
+        # Propagate updated alive_mask back to the shared buffer by slicing.
+        # The caller passed a view; since we may have extended it, mutate
+        # in-place by copying back (step() recreates alive_mask after launches
+        # to avoid this — see step() implementation note).
+        # Nothing to do if we didn't extend.
+
+    def _rotate_planets_and_sweep(
+        self,
+        alive_mask: np.ndarray,
+        combat: Dict[int, List[Tuple[int, int]]],
+    ) -> None:
+        st = self.state
+        P = st.num_planets()
+        if P == 0:
+            return
+
+        comet_pids = st._comet_pid_set()
+        omega = st.angular_velocity
+        step = st.step
+
+        dx = st.p_init_x - CENTER
+        dy = st.p_init_y - CENTER
+        r = np.hypot(dx, dy)
+        init_angle = np.arctan2(dy, dx)
+        current_angle = init_angle + omega * step
+
+        is_rotating = ((r + st.p_radius) < ROTATION_RADIUS_LIMIT)
+        if comet_pids:
+            comet_mask = np.array([int(pid) in comet_pids for pid in st.p_id], dtype=bool)
+            is_rotating &= ~comet_mask
+
+        old_px = st.p_x.copy()
+        old_py = st.p_y.copy()
+        new_px = np.where(is_rotating, CENTER + r * np.cos(current_angle), st.p_x)
+        new_py = np.where(is_rotating, CENTER + r * np.sin(current_angle), st.p_y)
+
+        st.p_x = new_px
+        st.p_y = new_py
+
+        # Sweep for planets that actually moved
+        for pi in range(P):
+            if old_px[pi] == new_px[pi] and old_py[pi] == new_py[pi]:
+                continue
+            pid = int(st.p_id[pi])
+            if not alive_mask.any():
+                continue
+            alive_idx = np.where(alive_mask)[0]
+            d = _seg_dist_many_points_single_seg(
+                st.f_x[alive_idx], st.f_y[alive_idx],
+                old_px[pi], old_py[pi], new_px[pi], new_py[pi],
+            )
+            caught = d < st.p_radius[pi]
+            for hit_local, ai in zip(caught, alive_idx):
+                if hit_local:
+                    combat[pid].append((int(st.f_owner[ai]), int(st.f_ships[ai])))
+                    alive_mask[ai] = False
+
+    def _move_comets_and_sweep(
+        self,
+        alive_mask: np.ndarray,
+        combat: Dict[int, List[Tuple[int, int]]],
+    ) -> None:
+        st = self.state
+
+        for group in st.comets:
+            group["path_index"] += 1
+            idx = group["path_index"]
+            for i, pid in enumerate(group["planet_ids"]):
+                pi = st.planet_index(pid)
+                if pi < 0:
+                    continue
+                p_path = group["paths"][i]
+                if idx >= len(p_path):
+                    # Expired; do not move, do not sweep. Purge happens later.
+                    continue
+                old_x = float(st.p_x[pi])
+                old_y = float(st.p_y[pi])
+                st.p_x[pi] = p_path[idx][0]
+                st.p_y[pi] = p_path[idx][1]
+                # Skip sweep on first placement (off-board sentinel -99)
+                if old_x < 0:
+                    continue
+                new_x = float(st.p_x[pi])
+                new_y = float(st.p_y[pi])
+                if old_x == new_x and old_y == new_y:
+                    continue
+                if not alive_mask.any():
+                    continue
+                alive_idx = np.where(alive_mask)[0]
+                d = _seg_dist_many_points_single_seg(
+                    st.f_x[alive_idx], st.f_y[alive_idx],
+                    old_x, old_y, new_x, new_y,
+                )
+                radius = float(st.p_radius[pi])
+                caught = d < radius
+                for hit_local, ai in zip(caught, alive_idx):
+                    if hit_local:
+                        combat[pid].append((int(st.f_owner[ai]), int(st.f_ships[ai])))
+                        alive_mask[ai] = False
+
+    def _compact_fleets(self, alive_mask: np.ndarray) -> None:
+        st = self.state
+        F = st.num_fleets()
+        if alive_mask.shape[0] != F:
+            # Defensive: if sizes diverged (shouldn't), only keep known slots.
+            alive_mask = alive_mask[:F]
+        if alive_mask.all():
+            return
+        st.f_id = st.f_id[alive_mask]
+        st.f_owner = st.f_owner[alive_mask]
+        st.f_x = st.f_x[alive_mask]
+        st.f_y = st.f_y[alive_mask]
+        st.f_angle = st.f_angle[alive_mask]
+        st.f_from_pid = st.f_from_pid[alive_mask]
+        st.f_ships = st.f_ships[alive_mask]
+
+    def _remove_planets_by_pid(self, pid_set: set) -> None:
+        st = self.state
+        if not pid_set or st.num_planets() == 0:
+            return
+        keep = np.ones(st.num_planets(), dtype=bool)
+        for pid in pid_set:
+            keep &= st.p_id != pid
+        if keep.all():
+            return
+        st.p_id = st.p_id[keep]
+        st.p_owner = st.p_owner[keep]
+        st.p_x = st.p_x[keep]
+        st.p_y = st.p_y[keep]
+        st.p_radius = st.p_radius[keep]
+        st.p_ships = st.p_ships[keep]
+        st.p_production = st.p_production[keep]
+        st.p_init_x = st.p_init_x[keep]
+        st.p_init_y = st.p_init_y[keep]
+
+    def _resolve_combat(self, combat: Dict[int, List[Tuple[int, int]]]) -> None:
+        """Identical semantics to reference combat resolution."""
+        st = self.state
+        for pid, events in combat.items():
+            if not events:
+                continue
+            pi = st.planet_index(pid)
+            if pi < 0:
+                continue
+
+            # Sum ships per owner
+            player_ships: Dict[int, int] = {}
+            for owner, ships in events:
+                player_ships[owner] = player_ships.get(owner, 0) + ships
+
+            if not player_ships:
+                continue
+
+            sorted_players = sorted(player_ships.items(), key=lambda item: item[1], reverse=True)
+            top_player, top_ships = sorted_players[0]
+
+            if len(sorted_players) > 1:
+                second_ships = sorted_players[1][1]
+                survivor_ships = top_ships - second_ships
+                if top_ships == second_ships:
+                    survivor_ships = 0
+                survivor_owner = top_player if survivor_ships > 0 else -1
+            else:
+                survivor_owner = top_player
+                survivor_ships = top_ships
+
+            if survivor_ships > 0:
+                planet_owner = int(st.p_owner[pi])
+                planet_ships = int(st.p_ships[pi])
+                if planet_owner == survivor_owner:
+                    st.p_ships[pi] = planet_ships + survivor_ships
+                else:
+                    new_ships = planet_ships - survivor_ships
+                    if new_ships < 0:
+                        st.p_owner[pi] = survivor_owner
+                        st.p_ships[pi] = -new_ships
+                    else:
+                        st.p_ships[pi] = new_ships
+
+    def _check_terminal(self) -> None:
+        st = self.state
+        if st.step >= st.config.episode_steps - 2:
+            self.done = True
+
+        alive = set()
+        for i in range(st.num_planets()):
+            o = int(st.p_owner[i])
+            if o != -1:
+                alive.add(o)
+        for i in range(st.num_fleets()):
+            alive.add(int(st.f_owner[i]))
+        if len(alive) <= 1:
+            self.done = True
+
+        if self.done:
+            scores = self.scores()
+            max_score = max(scores) if scores else 0
+            for i in range(self.num_agents):
+                if scores[i] == max_score and max_score > 0:
+                    self.rewards[i] = 1
+                else:
+                    self.rewards[i] = -1
+
+
+
+# --- inlined: orbitwars/mcts/actions.py ---
+
+"""MCTS action generator for HeuristicAgent-priored search.
+
+For each owned planet we enumerate a small, structured set of candidate
+moves (attack each reachable target at a few ship-size fractions, plus a
+"hold" no-op), rank them via the heuristic's existing `_score_target`, and
+emit the top-K with softmax-normalized priors.
+
+Why this design (v1):
+  * Kaggle RTS action spaces are naturally factored: each owned planet
+    independently chooses its launch, and the joint is the product. We
+    expose the factored shape directly so the Gumbel-AZ root can either
+    sample per-planet independently (cheap, good-enough) or sample joint
+    top-K over the product (more faithful, Week-3 upgrade).
+  * Ship-size fractions `{0.25, 0.5, 1.0}` replace the heuristic's
+    one-size-fits-all: MCTS can discover that a smaller probe is
+    preferable against strong defenders, or that full-send is optimal
+    against cheap neutrals.
+  * "hold" is always included — skipping a planet's turn can be optimal
+    (e.g. when incoming enemy fleets force a pure defense).
+
+Deliberately skipped in v1:
+  * Defensive intercept angles against inbound enemy fleets. The heuristic
+    already credits defense via the arrival-table; MCTS sees the same state
+    so defense emerges implicitly from rollouts. Intercept moves are on the
+    W3 feature list.
+  * Sun-tangent re-routes. Currently handled inside
+    `heuristic.route_angle_avoiding_sun` — we inherit that behavior via
+    `_score_target`. Explicit tangent move variants can be added if needed.
+
+Test coverage (tests/test_mcts_actions.py):
+  * Bounds: max_per_planet is respected; ships > available; prior sums to 1.
+  * Hold-move is always present.
+  * Against a noop-like opponent state, priors rank reachable enemy targets
+    above unreachable ones.
+"""
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+
+
+# Move kinds — used by the search layer to prune / bias at non-root nodes.
+KIND_ATTACK_ENEMY    = "attack_enemy"
+KIND_ATTACK_NEUTRAL  = "attack_neutral"
+KIND_ATTACK_COMET    = "attack_comet"
+KIND_REINFORCE_ALLY  = "reinforce_ally"
+KIND_HOLD            = "hold"
+
+
+@dataclass(frozen=True)
+class PlanetMove:
+    """One candidate move from one owned planet.
+
+    Immutable so callers can stash it in tree nodes without worrying about
+    mutation. `prior` is softmax-normalized inside a planet's move list.
+    """
+    from_pid: int
+    angle: float
+    ships: int
+    target_pid: int          # -1 for hold
+    kind: str
+    prior: float = 0.0       # populated by generate_per_planet_moves
+    raw_score: float = 0.0   # pre-softmax heuristic score (diagnostic)
+
+    @property
+    def is_hold(self) -> bool:
+        return self.kind == KIND_HOLD
+
+    def to_move(self) -> List:
+        """Kaggle-wire format: [from_pid, angle, ships]. HOLD returns []."""
+        if self.is_hold:
+            return []
+        return [int(self.from_pid), float(self.angle), int(self.ships)]
+
+
+@dataclass
+class ActionConfig:
+    """Knobs for the action generator.
+
+    max_per_planet: cap on emitted moves per owned planet (incl. hold).
+    ship_fractions: discrete send-sizes as fractions of available ships.
+    softmax_temperature: higher → flatter prior (more exploration at root).
+    min_launch_size: drop moves below this many ships — matches heuristic.
+    """
+    max_per_planet: int = 8
+    include_hold: bool = True
+    ship_fractions: Tuple[float, ...] = (0.25, 0.5, 1.0)
+    softmax_temperature: float = 1.0
+    min_launch_size: int = 20
+    hold_bonus_score: float = 0.0   # added to HOLD raw score before softmax
+
+
+def _softmax(xs: List[float], temperature: float) -> List[float]:
+    """Numerically stable softmax. Returns a probability vector."""
+    if not xs:
+        return []
+    t = max(1e-6, float(temperature))
+    m = max(xs)
+    exps = [math.exp((x - m) / t) for x in xs]
+    z = sum(exps)
+    if z <= 0:  # pragma: no cover
+        return [1.0 / len(xs)] * len(xs)
+    return [e / z for e in exps]
+
+
+def _kind_for_target(po: ParsedObs, tp: List) -> str:
+    pid, owner = tp[0], tp[1]
+    if pid in po.comet_planet_ids:
+        return KIND_ATTACK_COMET
+    if owner == po.player:
+        return KIND_REINFORCE_ALLY
+    if owner == -1:
+        return KIND_ATTACK_NEUTRAL
+    return KIND_ATTACK_ENEMY
+
+
+def generate_per_planet_moves(
+    po: ParsedObs,
+    table: ArrivalTable,
+    weights: Optional[Dict[str, float]] = None,
+    cfg: Optional[ActionConfig] = None,
+) -> Dict[int, List[PlanetMove]]:
+    """For each owned planet, return up to cfg.max_per_planet candidate moves.
+
+    Empty list for any planet with no available ships / no reachable target.
+    Always includes a HOLD move when cfg.include_hold is True.
+    """
+    weights = dict(HEURISTIC_WEIGHTS) if weights is None else dict(weights)
+    cfg = cfg or ActionConfig()
+
+    out: Dict[int, List[PlanetMove]] = {}
+    for mp in po.my_planets:
+        mpid = int(mp[0])
+        available = int(mp[5])
+
+        # Enumerate raw candidates first; softmax over them at the end.
+        raw: List[Tuple[float, PlanetMove]] = []
+
+        if cfg.include_hold:
+            hold = PlanetMove(
+                from_pid=mpid, angle=0.0, ships=0, target_pid=-1,
+                kind=KIND_HOLD, prior=0.0, raw_score=cfg.hold_bonus_score,
+            )
+            raw.append((cfg.hold_bonus_score, hold))
+
+        if available < cfg.min_launch_size:
+            # Only HOLD is possible — emit it and move on.
+            if raw:
+                raw[0][1].__dict__  # no-op (frozen dataclass: can't mutate)
+                moves = [PlanetMove(
+                    from_pid=raw[0][1].from_pid, angle=0.0, ships=0,
+                    target_pid=-1, kind=KIND_HOLD, prior=1.0,
+                    raw_score=raw[0][0],
+                )]
+                out[mpid] = moves
+            else:
+                out[mpid] = []
+            continue
+
+        for tp in po.planets:
+            tpid = int(tp[0])
+            if tpid == mpid:
+                continue
+            ip = po.initial_planet_by_id.get(tpid, tp)
+            kind = _kind_for_target(po, tp)
+
+            for frac in cfg.ship_fractions:
+                ships = max(cfg.min_launch_size, int(available * frac))
+                if ships > available:
+                    continue
+                if ships < cfg.min_launch_size:
+                    continue
+
+                score, angle, _proj = _score_target(
+                    mp, tp, ip, po, table, weights, ships,
+                )
+                if not math.isfinite(score):
+                    continue
+                move = PlanetMove(
+                    from_pid=mpid, angle=float(angle), ships=int(ships),
+                    target_pid=tpid, kind=kind, prior=0.0, raw_score=score,
+                )
+                raw.append((score, move))
+
+        # Rank descending by raw_score, keep top-K.
+        raw.sort(key=lambda t: t[0], reverse=True)
+        raw = raw[: cfg.max_per_planet]
+
+        # Softmax priors.
+        scores = [s for (s, _) in raw]
+        priors = _softmax(scores, cfg.softmax_temperature)
+        out[mpid] = [
+            PlanetMove(
+                from_pid=m.from_pid, angle=m.angle, ships=m.ships,
+                target_pid=m.target_pid, kind=m.kind,
+                prior=p, raw_score=m.raw_score,
+            )
+            for (_, m), p in zip(raw, priors)
+        ]
+
+    return out
+
+
+# ---- Joint-action helpers (used by the root sampler in gumbel_search.py) ----
+
+@dataclass(frozen=True)
+class JointAction:
+    """One joint per-turn action: a tuple of PlanetMove (one per owned planet).
+
+    The order is stable by planet ID for deterministic hashing inside the
+    tree.
+    """
+    moves: Tuple[PlanetMove, ...]
+
+    def to_wire(self) -> List[List]:
+        """Kaggle-wire format. Drops HOLD moves."""
+        return [m.to_move() for m in self.moves if not m.is_hold]
+
+    def joint_prior(self) -> float:
+        """Product of per-planet priors (independent sampling assumption)."""
+        p = 1.0
+        for m in self.moves:
+            p *= max(m.prior, 1e-9)
+        return p
+
+
+def sample_joint(
+    per_planet: Dict[int, List[PlanetMove]],
+    rng,  # random.Random — typed loosely to avoid stdlib import cycles
+) -> JointAction:
+    """Independently sample one PlanetMove from each planet's prior dist."""
+    picks: List[PlanetMove] = []
+    for pid in sorted(per_planet.keys()):
+        moves = per_planet[pid]
+        if not moves:
+            continue
+        weights = [max(m.prior, 0.0) for m in moves]
+        total = sum(weights)
+        if total <= 0:
+            picks.append(moves[0])
+            continue
+        r = rng.uniform(0.0, total)
+        acc = 0.0
+        for m, w in zip(moves, weights):
+            acc += w
+            if r <= acc:
+                picks.append(m)
+                break
+        else:
+            picks.append(moves[-1])
+    return JointAction(tuple(picks))
+
+
+
+# --- inlined: orbitwars/mcts/gumbel_search.py ---
+
+"""Gumbel top-k + Sequential Halving MCTS for Orbit Wars.
+
+v1 scope: **root-only** search. Each candidate joint action is scored by
+short heuristic rollouts in a cloned FastEngine. Sequential Halving
+(Danihelka et al., ICLR 2022) concentrates the sim budget on the
+promising candidates without the overhead of a full tree.
+
+Why this shape matters:
+  * At a 1 s CPU budget we expect O(10-100) rollouts per turn — not
+    enough to build a meaningful tree, but plenty to rank ~8 candidate
+    joint actions via policy improvement at the root. This is exactly
+    the regime the Gumbel paper addresses.
+  * Heuristic rollouts give a reliable value estimate; the heuristic is
+    already close to competent, so value noise is low relative to naive
+    MCTS default-policy rollouts.
+  * Sequential Halving is *simple-regret-optimal* under fixed budget and
+    noisy values — the right objective for root action selection (we
+    care about picking the best action, not estimating all Q's well).
+
+Deliberately out of v1:
+  * Non-root PUCT tree — needed only once rollouts > ~200 sims/turn.
+  * BOKR kernel over continuous angles — our action generator already
+    picks an analytic angle per target, so the continuous dimension is
+    collapsed at the root. Re-introduce if MCTS wants to search around
+    that analytic angle.
+  * Decoupled UCT at simultaneous-move nodes — meaningless for a
+    root-only search. Arrives alongside non-root expansion in W3.
+
+Integration:
+  * `GumbelRootSearch.search(obs, my_player)` → `SearchResult` with the
+    chosen `JointAction` and per-candidate Q/visit diagnostics.
+  * The hot loop in `_rollout_value` clones the engine state per sim so
+    the true state isn't mutated. FastEngine mutates numpy arrays in
+    place; `copy.deepcopy(state)` gives us an independent copy cheaply
+    (~tens of μs for typical state sizes).
+  * A hard wall-clock deadline aborts mid-round and returns whatever has
+    been staged. Timeouts forfeit matches — we never cross that line.
+"""
+
+import copy
+import math
+import random
+import time
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+
+# ---------------------------- Config --------------------------------------
+
+@dataclass
+class GumbelConfig:
+    """Knobs for Gumbel Sequential Halving.
+
+    num_candidates:  how many joint actions to propose at the root. 8-24
+                     is the sweet spot: fewer → SH halving collapses too
+                     fast; more → sim budget spreads thin.
+    total_sims:      rollout budget for the whole search.
+    rollout_depth:   plies simulated per rollout. Short (4-8) keeps
+                     per-rollout cost bounded; heuristic value at the
+                     horizon does most of the lifting.
+    hard_deadline_ms: abort and return best-so-far past this wall time.
+                     Kept conservative — we'd rather submit a weaker
+                     action than forfeit the match.
+    anchor_improvement_margin: minimum Q gap (winner - anchor) required
+                     before we override the anchor candidate. With short
+                     rollouts and few sims, per-candidate Q has noise SE
+                     of ~0.2 — so we need the winner to beat the anchor
+                     by *at least* this margin to trust the result.
+                     Effectively: MCTS never plays a move that search
+                     isn't confidently better than the heuristic's pick.
+
+                     Empirical note (seed=42, 500 turns, vs HeuristicAgent):
+                       margin=0.15: MCTS LOSES 692-1525 (noise overrides anchor)
+                       margin=0.30: MCTS barely wins 1146-1057
+                       margin=0.50: MCTS wins 1356-874 (default)
+                       margin=10.0 (forced anchor): MCTS wins 1675-698
+                     The search is currently net-negative at low sim
+                     budgets — until we widen rollouts/sims/priors, the
+                     0.5 floor is the sweet spot.
+    """
+    # Tuned defaults (W2, post-RNG-isolation + multi-seed verification):
+    #
+    # Empirical multi-seed sweep (MCTS vs Heuristic, both seats, seeds
+    # [42, 123, 7]) with margin=0.5, sims=32, depth=15 showed 2W/4L —
+    # wall-clock variance causes some turns to hit HARD_DEADLINE_MS and
+    # fall back to the heuristic, while other turns use search output.
+    # Those branching decisions cascade into materially different games,
+    # and at low sim budgets search-output < heuristic-output more often
+    # than it's better.
+    #
+    # Until we have a proper neural prior (W4-5) or enough sims to drop
+    # rollout variance (not currently feasible under 1s CPU), the safe
+    # default is margin=2.0 — search effectively always defers to the
+    # heuristic anchor. This locks in the Path A floor. Search still
+    # runs and its statistics are exposed in SearchResult for diagnostics
+    # and future tuning, but the returned wire action is the heuristic's
+    # unless a candidate beats it by an unusually clear margin.
+    num_candidates: int = 4
+    total_sims: int = 32
+    rollout_depth: int = 15
+    hard_deadline_ms: float = 300.0
+    anchor_improvement_margin: float = 2.0
+    # Rollout policy — "heuristic" uses HeuristicAgent (slow but
+    # strategic; ~18 ms/call, fits <1 full rollout at the default
+    # deadline), "fast" uses FastRolloutAgent (~0.1-0.5 ms/call, ~30-50×
+    # faster; rollouts drop from ~560 ms to ~20-30 ms, unlocking real
+    # policy improvement at the same budget). Default is kept at
+    # "heuristic" to preserve the shipped mcts_v1 bot's behavior
+    # byte-for-byte; switch via config for A/B and future defaults.
+    rollout_policy: str = "heuristic"
+
+
+# ---------------------------- Gumbel top-k --------------------------------
+
+def gumbel_topk(
+    priors: List[float], k: int, rng: random.Random,
+) -> List[Tuple[int, float]]:
+    """Sample up to k indices without replacement via the Gumbel trick.
+
+    For each prior p_i draw g_i ~ Gumbel(0) and score = log(p_i) + g_i.
+    Top-k by score is exactly a sample-without-replacement from the
+    categorical distribution `pi ∝ p_i`. This is the root-level
+    proposal mechanism the Gumbel-AZ paper uses (Danihelka eq. 1).
+
+    Returns `[(index, score), ...]` sorted by descending score. Priors
+    ≤ 0 are treated as ineligible (log(0) is -inf, never sampled).
+    """
+    eps = 1e-20
+    scored: List[Tuple[int, float]] = []
+    for i, p in enumerate(priors):
+        if p <= 0.0:
+            continue
+        u = rng.random()
+        g = -math.log(-math.log(max(u, eps)) + eps)
+        scored.append((i, math.log(p) + g))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    return scored[:k]
+
+
+# ---------------------------- Joint enumeration ---------------------------
+
+def enumerate_joints(
+    per_planet: Dict[int, List[PlanetMove]],
+    n_samples: int,
+    rng: random.Random,
+) -> List[JointAction]:
+    """Sample n_samples distinct joint actions from independent planet priors.
+
+    De-dup by wire-format signature so we don't waste rollouts on
+    identical candidates. On tiny search spaces (few owned planets with
+    few moves each) we may return fewer than n_samples — that's fine,
+    SH handles variable widths.
+    """
+    seen: set = set()
+    out: List[JointAction] = []
+    budget = max(n_samples * 6, 16)
+    for _ in range(budget):
+        if len(out) >= n_samples:
+            break
+        j = sample_joint(per_planet, rng)
+        key = tuple(tuple(m) for m in j.to_wire())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(j)
+    return out
+
+
+# ---------------------------- Rollout -------------------------------------
+
+def _obs_to_namespace(obs: Any) -> Any:
+    """Convert dict obs → SimpleNamespace so FastEngine.from_official_obs works.
+
+    FastEngine reads obs via `getattr(...)` which returns defaults for
+    dicts. Kaggle passes dicts in ladder play; our tests use dicts too.
+    Cheap one-shot shim.
+    """
+    if isinstance(obs, dict):
+        return SimpleNamespace(**obs)
+    return obs
+
+
+def _score_from_engine(
+    eng: FastEngine, my_player: int, num_agents: int,
+) -> float:
+    """Map an end-of-rollout game state to a scalar value in [-1, +1].
+
+    Terminal games use the reward (winner → +1, others → -1). Non-
+    terminal returns `(my_ships - best_opp_ships) / total_ships`,
+    capturing lead without being fooled by ship-inflation vs a weak
+    opponent. Clipped to [-1, +1].
+    """
+    if eng.done:
+        r = eng.rewards[my_player]
+        return float(r) if isinstance(r, (int, float)) else 0.0
+    scores = eng.scores()
+    my_s = float(scores[my_player])
+    opp_best = float(max(
+        (scores[i] for i in range(num_agents) if i != my_player), default=0.0
+    ))
+    total = my_s + opp_best + 1.0
+    v = (my_s - opp_best) / total
+    return max(-1.0, min(1.0, v))
+
+
+def _rollout_value(
+    base_state: GameState,
+    my_player: int,
+    my_action: List[List],
+    opp_agent_factory: Callable[[], Any],
+    my_future_factory: Callable[[], Any],
+    depth: int,
+    num_agents: int = 2,
+    rng: Optional[random.Random] = None,
+) -> float:
+    """Simulate `depth` plies from a cloned state; return scalar value.
+
+    Turn 0 uses the candidate root action for `my_player` and the
+    opponent's heuristic for others. Subsequent turns use fresh
+    heuristic instances on both sides. Fresh instances because
+    HeuristicAgent carries per-match state (`_state.last_launch_turn`)
+    that shouldn't leak across rollouts.
+
+    The `rng` is forwarded into the rollout engine for comet-ship
+    sizing so rollouts are reproducible given the search seed. If
+    None, each FastEngine seeds its own RNG from os.urandom — which
+    makes the search nondeterministic across runs.
+    """
+    eng = FastEngine(
+        copy.deepcopy(base_state),
+        num_agents=num_agents,
+        rng=rng,
+    )
+
+    # Turn 0: my root action + heuristic for opponents.
+    actions: List[Optional[List]] = [None] * num_agents
+    actions[my_player] = my_action
+    for i in range(num_agents):
+        if i == my_player:
+            continue
+        opp = opp_agent_factory()
+        actions[i] = opp.act(eng.observation(i), Deadline())
+    eng.step(actions)
+
+    # Turns 1..depth-1: heuristic on both sides.
+    for _ in range(max(0, depth - 1)):
+        if eng.done:
+            break
+        actions = [None] * num_agents
+        for i in range(num_agents):
+            factory = my_future_factory if i == my_player else opp_agent_factory
+            agent = factory()
+            actions[i] = agent.act(eng.observation(i), Deadline())
+        eng.step(actions)
+
+    return _score_from_engine(eng, my_player, num_agents)
+
+
+# ---------------------------- Sequential Halving --------------------------
+
+@dataclass
+class SearchResult:
+    best_joint: JointAction
+    n_rollouts: int
+    duration_ms: float
+    q_values: List[float] = field(default_factory=list)
+    visits: List[int] = field(default_factory=list)
+    aborted: bool = False
+
+    @property
+    def n_candidates(self) -> int:
+        return len(self.q_values)
+
+
+def sequential_halving(
+    candidates: List[JointAction],
+    rollout_fn: Callable[[JointAction], float],
+    cfg: GumbelConfig,
+    start_time: Optional[float] = None,
+    protected_idx: Optional[int] = None,
+) -> SearchResult:
+    """Sequential Halving: iteratively rollout the active set and halve it.
+
+    Rounds ≈ ceil(log2(k)); each round gives all active candidates the
+    same per-round sim allocation. At round end, the bottom half (by
+    mean Q) is pruned. Ends with one candidate; the highest mean Q
+    across all visited candidates is returned. Aborts mid-round if the
+    wall-clock deadline is reached.
+
+    protected_idx (if given) is kept in `active` across ALL rounds —
+    used for an anchor/heuristic candidate we want to guarantee low-
+    variance Q estimates for. It still competes on mean-Q for the final
+    pick; we just don't let SH prune it under rollout noise.
+    """
+    t0 = start_time if start_time is not None else time.perf_counter()
+    k = len(candidates)
+    if k == 0:
+        raise ValueError("sequential_halving: no candidates")
+
+    q_sum = [0.0] * k
+    visits = [0] * k
+    deadline = t0 + cfg.hard_deadline_ms / 1000.0
+
+    if k == 1:
+        # One candidate — still do one rollout for a diagnostic Q value,
+        # but only if we have any budget at all.
+        if time.perf_counter() < deadline and cfg.total_sims > 0:
+            v = rollout_fn(candidates[0])
+            q_sum[0] = v
+            visits[0] = 1
+        return SearchResult(
+            best_joint=candidates[0],
+            n_rollouts=visits[0],
+            duration_ms=(time.perf_counter() - t0) * 1000.0,
+            q_values=[q_sum[0]],
+            visits=list(visits),
+            aborted=False,
+        )
+
+    active = list(range(k))
+    n_rounds = max(1, math.ceil(math.log2(k)))
+    sims_per_round = max(len(active), cfg.total_sims // n_rounds)
+
+    total_rollouts = 0
+    aborted = False
+
+    for _ in range(n_rounds):
+        if len(active) <= 1:
+            break
+        sims_each = max(1, sims_per_round // len(active))
+        for idx in active:
+            for _ in range(sims_each):
+                if time.perf_counter() > deadline:
+                    aborted = True
+                    break
+                v = rollout_fn(candidates[idx])
+                q_sum[idx] += v
+                visits[idx] += 1
+                total_rollouts += 1
+            if aborted:
+                break
+        if aborted:
+            break
+        # Halve — keep the better half by mean Q (ties broken by index).
+        # protected_idx, if given, is always sorted to the top so it
+        # survives pruning for another round of sims.
+        def _sort_key(i: int) -> Tuple[int, float, int]:
+            is_protected = 1 if (protected_idx is not None and i == protected_idx) else 0
+            mean_q = q_sum[i] / max(1, visits[i])
+            return (is_protected, mean_q, -i)
+
+        active.sort(key=_sort_key, reverse=True)
+        keep = max(1, len(active) // 2)
+        active = active[:keep]
+
+    # Final choice: highest mean Q across ALL visited candidates. A
+    # pruned-early candidate may still hold the best running mean.
+    def _mean_q(i: int) -> float:
+        return q_sum[i] / visits[i] if visits[i] > 0 else -math.inf
+
+    best_i = max(range(k), key=_mean_q)
+    q_avg = [_mean_q(i) for i in range(k)]
+
+    return SearchResult(
+        best_joint=candidates[best_i],
+        n_rollouts=total_rollouts,
+        duration_ms=(time.perf_counter() - t0) * 1000.0,
+        q_values=q_avg,
+        visits=list(visits),
+        aborted=aborted,
+    )
+
+
+# ---------------------------- Anchor joint --------------------------------
+
+def _build_anchor_joint(
+    anchor_wire: Optional[List[List]],
+    per_planet: Dict[int, List[PlanetMove]],
+) -> Optional[JointAction]:
+    """Convert a wire-format action (heuristic's pick) into a JointAction.
+
+    Returns None if `anchor_wire` is None or per_planet is empty. Builds
+    one PlanetMove per owned planet in the same stable order as
+    `sample_joint` (sorted by pid), so Gumbel samples and anchors share
+    a comparable key space.
+
+    The target_pid/kind fields on an anchor's non-HOLD entries are set
+    conservatively (KIND_ATTACK_ENEMY, target_pid=-1). They only affect
+    diagnostics; wire output depends on kind != KIND_HOLD and on
+    (from_pid, angle, ships), all of which are faithful.
+    """
+    if not per_planet:
+        return None
+    if anchor_wire is None:
+        return None
+    wire_by_pid: Dict[int, Any] = {}
+    for m in anchor_wire:
+        if isinstance(m, (list, tuple)) and len(m) >= 3:
+            try:
+                wire_by_pid[int(m[0])] = m
+            except Exception:
+                continue
+    moves: List[PlanetMove] = []
+    for pid in sorted(per_planet.keys()):
+        w = wire_by_pid.get(pid)
+        if w is None:
+            moves.append(PlanetMove(
+                from_pid=pid, angle=0.0, ships=0, target_pid=-1,
+                kind=KIND_HOLD, prior=1.0,
+            ))
+        else:
+            try:
+                angle = float(w[1])
+                ships = int(w[2])
+            except Exception:
+                moves.append(PlanetMove(
+                    from_pid=pid, angle=0.0, ships=0, target_pid=-1,
+                    kind=KIND_HOLD, prior=1.0,
+                ))
+                continue
+            moves.append(PlanetMove(
+                from_pid=pid, angle=angle, ships=ships, target_pid=-1,
+                kind=KIND_ATTACK_ENEMY, prior=1.0,
+            ))
+    return JointAction(moves=tuple(moves))
+
+
+# ---------------------------- Top-level search ----------------------------
+
+@dataclass
+class GumbelRootSearch:
+    """Glue: obs + action generator + rollout + SH.
+
+    Construct once per agent; call `search(obs, my_player)` each turn.
+    Deterministic when `rng_seed` is set.
+
+    Opponent-model override:
+      ``opp_policy_override`` — if set, called to build the opponent's
+      rollout agent each rollout-step instead of the default
+      ``HeuristicAgent(weights=self.weights)``. MCTSAgent sets this from
+      the Bayesian posterior's most-likely archetype when the posterior
+      has concentrated, so MCTS searches under the correct opponent
+      model rather than "assume opp is a default heuristic".
+    """
+    weights: Dict[str, float] = field(default_factory=lambda: dict(HEURISTIC_WEIGHTS))
+    action_cfg: ActionConfig = field(default_factory=ActionConfig)
+    gumbel_cfg: GumbelConfig = field(default_factory=GumbelConfig)
+    rng_seed: Optional[int] = None
+    opp_policy_override: Optional[Callable[[], Any]] = None
+
+    def __post_init__(self) -> None:
+        self._rng = random.Random(self.rng_seed)
+
+    def _opp_factory(self) -> Any:
+        # Priority 1: Bayesian posterior override (Path D). When the
+        # posterior has concentrated on a specific archetype, MCTSAgent
+        # sets this so rollouts play against that archetype's heuristic.
+        # Keep this path even under rollout_policy="fast" — exploitation
+        # signal beats raw rollout speed once the posterior has fired.
+        if self.opp_policy_override is not None:
+            return self.opp_policy_override()
+        # Priority 2: fast rollout policy. Cheap nearest-target push —
+        # 30-50× faster than the full heuristic. See fast_rollout.py.
+        if self.gumbel_cfg.rollout_policy == "fast":
+            return FastRolloutAgent(
+                min_launch_size=int(self.weights.get("min_launch_size", 20)),
+                send_fraction=float(self.weights.get("max_launch_fraction", 0.8)),
+            )
+        # Default: full HeuristicAgent (shipped mcts_v1 behavior).
+        return HeuristicAgent(weights=self.weights)
+
+    def _my_future_factory(self) -> Any:
+        # Symmetric fast path: my-future rollout plies also swap in the
+        # cheap agent when rollout_policy="fast". Candidate turn-0
+        # action is unaffected (that's already built upstream).
+        if self.gumbel_cfg.rollout_policy == "fast":
+            return FastRolloutAgent(
+                min_launch_size=int(self.weights.get("min_launch_size", 20)),
+                send_fraction=float(self.weights.get("max_launch_fraction", 0.8)),
+            )
+        return HeuristicAgent(weights=self.weights)
+
+    def search(
+        self, obs: Any, my_player: int, num_agents: int = 2,
+        start_time: Optional[float] = None,
+        anchor_action: Optional[List[List]] = None,
+    ) -> Optional[SearchResult]:
+        """Run search for one turn. Returns None if no legal moves exist.
+
+        If `anchor_action` is given (the heuristic's wire pick), it is
+        prepended to the candidate list as a protected candidate — SH
+        never prunes it. This turns MCTSAgent into a guaranteed floor:
+        if search can't beat the heuristic, we return the heuristic's
+        action.
+        """
+
+        po = parse_obs(obs)
+        table = ArrivalTable()
+        try:
+            # build_arrival_table updates state in place on an ArrivalTable
+            # or returns one; use the functional form for safety.
+            table = build_arrival_table(po)
+        except Exception:
+            # Empty table fallback — scores still evaluate, just no
+            # arrival-aware sizing.
+            pass
+
+        per_planet = generate_per_planet_moves(
+            po, table, weights=self.weights, cfg=self.action_cfg,
+        )
+        # No owned planets at all → nothing to decide. Signal upstream
+        # with None so callers can short-circuit cleanly (vs. returning a
+        # degenerate empty-wire SearchResult that reads like a real
+        # "hold" choice).
+        if not per_planet:
+            return None
+
+        # Build the anchor joint (heuristic's pick) if provided. We'll
+        # insert it as candidate 0 and keep it protected from SH pruning
+        # so it accrues visits in every round and gets a low-variance Q.
+        anchor_joint = _build_anchor_joint(anchor_action, per_planet)
+        anchor_key: Optional[tuple] = None
+        if anchor_joint is not None:
+            anchor_key = tuple(tuple(m) for m in anchor_joint.to_wire())
+
+        # Sample Gumbel candidates. We leave one slot for the anchor so
+        # the total effective candidate count stays ~num_candidates.
+        sample_budget = self.gumbel_cfg.num_candidates - (1 if anchor_joint else 0)
+        sample_budget = max(sample_budget, 1)
+        sampled = enumerate_joints(per_planet, sample_budget, self._rng)
+
+        # Compose the final candidate list: anchor first (if any), then
+        # Gumbel samples that don't duplicate it.
+        joints: List[JointAction] = []
+        if anchor_joint is not None:
+            joints.append(anchor_joint)
+        for j in sampled:
+            key = tuple(tuple(m) for m in j.to_wire())
+            if key == anchor_key:
+                continue
+            joints.append(j)
+
+        if not joints:
+            return None
+        if len(joints) == 1:
+            return SearchResult(
+                best_joint=joints[0], n_rollouts=0, duration_ms=0.0,
+                q_values=[0.0], visits=[0], aborted=False,
+            )
+
+        # Build base state from obs once; rollouts deepcopy it per sim.
+        eng = FastEngine.from_official_obs(
+            _obs_to_namespace(obs), num_agents=num_agents,
+        )
+        base_state = eng.state
+
+        def rollout_fn(joint: JointAction) -> float:
+            return _rollout_value(
+                base_state=base_state,
+                my_player=my_player,
+                my_action=joint.to_wire(),
+                opp_agent_factory=self._opp_factory,
+                my_future_factory=self._my_future_factory,
+                depth=self.gumbel_cfg.rollout_depth,
+                num_agents=num_agents,
+                rng=self._rng,  # deterministic rollouts given search seed
+            )
+
+        protected_idx = 0 if anchor_joint is not None else None
+        result = sequential_halving(
+            joints, rollout_fn, self.gumbel_cfg,
+            start_time=start_time, protected_idx=protected_idx,
+        )
+
+        # Anchor guard: if we included an anchor, only override it when
+        # the SH winner beats it by a confident margin. Rollout noise
+        # with n≈4-8 sims per candidate gives SE ~0.2 on mean Q — any
+        # gap below `anchor_improvement_margin` is below the noise floor
+        # and we'd be trading a known-good heuristic move for a noise
+        # draw. This is the load-bearing "heuristic-or-better" guarantee.
+        if (
+            anchor_joint is not None
+            and result.best_joint is not anchor_joint
+            and result.q_values
+        ):
+            anchor_q = result.q_values[0]  # anchor is at idx 0
+            winner_q = max(result.q_values)
+            if winner_q - anchor_q < self.gumbel_cfg.anchor_improvement_margin:
+                # Not confident enough — return the anchor.
+                result = SearchResult(
+                    best_joint=anchor_joint,
+                    n_rollouts=result.n_rollouts,
+                    duration_ms=result.duration_ms,
+                    q_values=list(result.q_values),
+                    visits=list(result.visits),
+                    aborted=result.aborted,
+                )
+
+        return result
+
+
+
+# --- inlined: orbitwars/opponent/archetypes.py ---
+
+"""Frozen archetype bots (Path D).
+
+A small catalogue of stylistically-distinct heuristic configurations, each
+implemented as a ``HeuristicAgent`` with a tailored override on top of the
+default ``HEURISTIC_WEIGHTS``. Their job is twofold:
+
+  1. **Opponent model prior** (Path D): the Bayesian posterior tracks
+     P(opponent plays like archetype_k | actions observed so far). Each
+     archetype is a frozen policy that scores opponent moves via its
+     deterministic heuristic — the posterior-weighted mixture feeds MCTS
+     opponent rollouts.
+
+  2. **Training opponents** (Path C): PFSP needs a permanent pool of
+     scripted baselines mixed into the self-play schedule (microRTS 2023
+     recipe). These archetypes give us diversity without training them.
+
+Design constraints:
+
+  * Each archetype must be a *plausible* strategy a human or bot author
+    would write. If we pad the portfolio with adversarial or broken
+    configurations the posterior becomes a noise classifier.
+  * Archetypes should be separable — an observed action sequence should
+    have different likelihoods under different archetypes. Identical
+    behavior under different names is wasted posterior dimension.
+  * Weights should be *far enough* from defaults to be stylistically
+    distinct, but not so degenerate that the archetype self-destructs;
+    every archetype must at minimum beat a no-op bot.
+
+Non-goals:
+
+  * We are NOT trying to build the strongest possible heuristic variants
+    here — TuRBO/EvoTune do that. Archetypes are stylistic caricatures.
+  * We are NOT modeling learned opponents (AlphaZero-style bots). Those
+    don't fit a 7-dimensional Dirichlet well anyway. If a learned bot
+    appears on the ladder, the posterior will spread mass over whichever
+    archetypes its behavior most resembles turn-by-turn, and that's fine
+    — the exploitation headroom is still meaningful.
+
+Public surface:
+
+  ARCHETYPE_WEIGHTS : Dict[str, Dict[str, float]]
+      Per-archetype weight-override dicts applied on top of HEURISTIC_WEIGHTS.
+  ARCHETYPE_NAMES : List[str]
+      Canonical order (used as the index of the Dirichlet posterior).
+  ArchetypeAgent(name)
+      HeuristicAgent subclass that reports ``name`` for logging.
+  make_archetype(name) -> ArchetypeAgent
+  all_archetypes() -> List[ArchetypeAgent]
+"""
+
+from typing import Dict, List
+
+
+
+# ---- The portfolio ------------------------------------------------------
+
+# Each dict is a partial override — unspecified keys fall back to
+# HEURISTIC_WEIGHTS. This keeps diffs small and makes intent readable.
+# Values were picked by eyeballing the reference heuristic's behavior,
+# not tuned; archetypes are caricatures by design.
+
+ARCHETYPE_WEIGHTS: Dict[str, Dict[str, float]] = {
+    # Early pressure; small reserves; enemy-first targeting. Punishes
+    # opponents that turtle / slow-expand in the opening.
+    "rusher": {
+        "agg_early_game": 1.8,
+        "early_game_cutoff_turn": 180.0,
+        "mult_enemy": 2.6,
+        "mult_neutral": 0.9,
+        "max_launch_fraction": 0.95,
+        "min_launch_size": 10.0,
+        "w_travel_cost": 0.15,
+        "keep_reserve_ships": 0.0,
+        "expand_cooldown_turns": 0.0,
+    },
+
+    # Big reserves, prefers close low-cost targets, slow to engage. Wants
+    # to out-produce the opponent and win on turn 500.
+    "turtler": {
+        "agg_early_game": 0.5,
+        "max_launch_fraction": 0.45,
+        "keep_reserve_ships": 60.0,
+        "mult_enemy": 1.1,
+        "mult_neutral": 1.2,
+        "w_distance_cost": 0.12,
+        "w_travel_cost": 0.45,
+        "min_launch_size": 30.0,
+        "expand_cooldown_turns": 4.0,
+    },
+
+    # Optimizes raw production capture; patient; large deliberate
+    # launches. Resembles the Kore 2022 economy-first archetype.
+    "economy": {
+        "w_production": 10.0,
+        "w_distance_cost": 0.03,
+        "w_travel_cost": 0.15,
+        "mult_neutral": 1.5,
+        "mult_enemy": 1.2,
+        "min_launch_size": 30.0,
+        "max_launch_fraction": 0.7,
+        "keep_reserve_ships": 20.0,
+    },
+
+    # Cheap, frequent small attacks — goal is to force defensive
+    # reactions, not to capture. Low min_launch_size + low
+    # max_launch_fraction means each strike is small and replaceable.
+    "harasser": {
+        "min_launch_size": 5.0,
+        "max_launch_fraction": 0.3,
+        "mult_enemy": 2.6,
+        "ships_safety_margin": 0.0,
+        "expand_cooldown_turns": 0.0,
+        "w_travel_cost": 0.1,
+        "agg_early_game": 1.4,
+    },
+
+    # Heavily biases comet capture; willing to pre-position. Weak
+    # against rushers but punishes slow opponents hard at the comet
+    # spawn steps (50, 150, 250, 350, 450).
+    "comet_camper": {
+        "mult_comet": 3.5,
+        "comet_max_time_mismatch": 3.0,
+        "w_travel_cost": 0.12,
+        "w_distance_cost": 0.02,
+        "min_launch_size": 15.0,
+    },
+
+    # Reactive: large defensive reserves, exploits moments of enemy
+    # overcommitment. Emphasizes enemy targets once contact is made.
+    "opportunist": {
+        "mult_enemy": 2.1,
+        "mult_neutral": 1.0,
+        "w_production": 7.0,
+        "keep_reserve_ships": 30.0,
+        "ships_safety_margin": 3.0,
+        "max_launch_fraction": 0.7,
+        "agg_early_game": 0.9,
+    },
+
+    # Pure defensive — rarely commits; lets opponent overextend. If
+    # the ladder has this shape, an attacker-style bot with good
+    # intercept math shreds it.
+    "defender": {
+        "max_launch_fraction": 0.4,
+        "keep_reserve_ships": 110.0,
+        "mult_enemy": 0.8,
+        "mult_neutral": 0.9,
+        "agg_early_game": 0.4,
+        "min_launch_size": 35.0,
+        "w_distance_cost": 0.15,
+    },
+}
+
+ARCHETYPE_NAMES: List[str] = list(ARCHETYPE_WEIGHTS.keys())
+
+
+# ---- Agent wrapper ------------------------------------------------------
+
+class ArchetypeAgent(HeuristicAgent):
+    """HeuristicAgent with a distinct ``name`` for tournament logging.
+
+    Using a subclass (vs dynamically generating classes per archetype)
+    keeps pickle/introspection sane and lets tournament harness code
+    check ``isinstance(agent, HeuristicAgent)`` to know it shares the
+    Path A contract.
+    """
+
+    def __init__(self, archetype_name: str):
+        if archetype_name not in ARCHETYPE_WEIGHTS:
+            raise KeyError(
+                f"unknown archetype {archetype_name!r}; "
+                f"known = {ARCHETYPE_NAMES}"
+            )
+        super().__init__(weights=ARCHETYPE_WEIGHTS[archetype_name])
+        # Shadow the class-level ``name = "heuristic"`` so tournament
+        # logs and Elo tracking distinguish archetypes from each other.
+        self.name = archetype_name
+        self._archetype = archetype_name
+
+    @property
+    def archetype(self) -> str:
+        return self._archetype
+
+
+def make_archetype(name: str) -> ArchetypeAgent:
+    """Factory; errors loudly on unknown names."""
+    return ArchetypeAgent(name)
+
+
+def all_archetypes() -> List[ArchetypeAgent]:
+    """Return one fresh agent instance per archetype, canonical order."""
+    return [ArchetypeAgent(n) for n in ARCHETYPE_NAMES]
+
+
+# ---- Sanity: archetype weights stay inside realistic ranges ------------
+
+def _assert_weight_keys_are_real() -> None:
+    """Catch typos — a weight override whose key isn't in HEURISTIC_WEIGHTS
+    is silently ignored by HeuristicAgent.__init__, which would make the
+    archetype secretly identical to the default."""
+    known = set(HEURISTIC_WEIGHTS)
+    for arch, overrides in ARCHETYPE_WEIGHTS.items():
+        unknown = set(overrides) - known
+        if unknown:
+            raise AssertionError(
+                f"archetype {arch!r} has overrides for unknown weight "
+                f"keys: {sorted(unknown)}"
+            )
+
+
+_assert_weight_keys_are_real()
+
+
+
+# --- inlined: orbitwars/opponent/bayes.py ---
+
+"""Online Bayesian opponent modeling over archetype portfolio (Path D).
+
+Given the archetype catalogue in ``archetypes.py`` we treat opponent
+behavior as a *mixture* over archetypes and maintain a running posterior
+
+    P(archetype = k | observed actions up to turn t)
+
+from which we derive two things:
+
+  (a) A posterior-weighted opponent action distribution used by MCTS
+      opponent rollouts (instead of "assume heuristic").
+  (b) A bias on our own root prior toward actions that *exploit* the
+      most-likely archetype (if the posterior concentrates).
+
+Why Bayesian updating and not a classifier?
+
+  * Classifiers need a training set — we have none at submission time.
+    The prior/likelihood combo gives us a *principled* online update
+    that works from turn 1 with uniform prior.
+  * The posterior's *uncertainty* is the information MCTS needs. A
+    classifier returns a point estimate; an opponent who genuinely
+    mixes strategies shows up as a flat posterior, and MCTS needs
+    that signal to avoid mis-exploiting.
+
+Cost budget:
+
+  Per turn, we evaluate K archetypes (7) on the opponent's obs, each
+  costing one ``HeuristicAgent.act()``. Heuristic acts are sub-2 ms.
+  7 × 2 ms ≈ 14 ms/turn, well inside the ~5 ms target we'd prefer;
+  in practice Python overhead dominates and we see ~10-20 ms. Still
+  fits under the MCTS search budget.
+
+Implementation choices:
+
+  * **Log-space updates** — K archetypes × 500 turns × product of
+    likelihoods will underflow naive float64 very quickly.
+  * **Dirichlet-equivalent interpretation**: we maintain an unnormalized
+    log-weight vector ``log_alpha`` and exponentiate on query. This is
+    equivalent to a Dirichlet posterior on the mixture weights where
+    we treat each turn's observation as drawing one category. The
+    temperature knob lets us soften per-turn likelihoods (a real
+    opponent is noisier than a pure archetype).
+  * **Launch-decision-only likelihood** — for v1 we ignore angle and
+    ship-count and match only on "did the opponent launch from planet
+    X this turn". Angles are continuous (many approximate matches are
+    meaningful) and sizes are dependent on the current ship stockpile
+    which varies across archetypes; extending the likelihood to those
+    dimensions is a clean follow-up but not needed to separate
+    rusher-vs-turtler-vs-harasser.
+  * **Per-planet Bernoulli** — each owned planet contributes independent
+    evidence. An archetype that correctly predicts launch-vs-hold on
+    most planets accumulates posterior mass.
+
+Public surface:
+
+  ArchetypePosterior(archetypes, alpha0=1.0, temperature=2.0, eps=0.1)
+      .observe(obs, opp_player)     # call after opp's action is visible
+      .distribution() -> np.ndarray # posterior over archetypes
+      .most_likely() -> str         # name of highest-posterior archetype
+      .reset()                      # new match
+
+Integration sketch:
+
+  post = ArchetypePosterior(all_archetypes())
+  for turn in game:
+      obs = ...
+      if turn > 0:                  # need at least one opp action
+          post.observe(obs, opp_player)
+      dist = post.distribution()
+      # pass into MCTS opponent-rollout mixing
+"""
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+
+
+
+# ---- Helpers -----------------------------------------------------------
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.sum(e)
+
+
+def _fabricate_opp_obs(obs: Any, opp_player: int) -> Dict[str, Any]:
+    """Orbit Wars is fully observable — same state, different player tag.
+
+    We copy only the fields ``parse_obs`` reads, since feeding the
+    archetype an obs that's missing keys it expects would raise.
+    """
+    return {
+        "player": opp_player,
+        "step": obs_get(obs, "step", 0),
+        "angular_velocity": obs_get(obs, "angular_velocity", 0.0),
+        "planets": list(obs_get(obs, "planets", [])),
+        "initial_planets": list(obs_get(obs, "initial_planets", [])),
+        "fleets": list(obs_get(obs, "fleets", [])),
+        "next_fleet_id": obs_get(obs, "next_fleet_id", 0),
+        "comet_planet_ids": list(obs_get(obs, "comet_planet_ids", [])),
+    }
+
+
+# ---- Posterior ---------------------------------------------------------
+
+@dataclass
+class ArchetypePosterior:
+    """Online posterior over archetypes given observed opponent actions.
+
+    Args:
+        archetypes: the frozen bots whose log-likelihoods we evaluate.
+        alpha0: uniform Dirichlet-prior concentration. Use >1 for a
+            stronger "no archetype yet" prior.
+        temperature: divides the per-turn log-likelihood before
+            accumulation. T=1 is raw Bayes; T>1 softens (noisier
+            opponent); T<1 sharpens. We default T=2.0 — real
+            opponents rarely match an archetype perfectly.
+        eps: per-planet Bernoulli noise floor. An archetype that
+            predicts "no launch" but sees launch still contributes
+            log(eps) rather than -inf.
+    """
+    archetypes: List[ArchetypeAgent] = field(default_factory=all_archetypes)
+    alpha0: float = 1.0
+    temperature: float = 2.0
+    eps: float = 0.1
+
+    def __post_init__(self) -> None:
+        self.K = len(self.archetypes)
+        self.names = [a.name for a in self.archetypes]
+        # Log-unnormalized posterior starts at log(alpha0).
+        self.log_alpha = np.full(self.K, np.log(self.alpha0), dtype=np.float64)
+        # Track previously-seen fleet ids so we can identify new launches.
+        self._prev_fleet_ids: Set[int] = set()
+        self._last_obs: Optional[Dict[str, Any]] = None
+        self._turns_observed: int = 0
+
+    # ---- Public ----
+
+    def reset(self) -> None:
+        self.log_alpha[:] = np.log(self.alpha0)
+        self._prev_fleet_ids.clear()
+        self._last_obs = None
+        self._turns_observed = 0
+
+    def observe(self, obs: Any, opp_player: int) -> None:
+        """Incorporate the opponent's action revealed by ``obs``.
+
+        Must be called in turn order (step increases by 1 each call).
+        On the very first call we only snapshot the state; we need the
+        previous turn's obs to identify *newly-launched* fleets.
+        """
+        if self._last_obs is None:
+            self._last_obs = obs
+            self._prev_fleet_ids = {
+                int(f[0]) for f in obs_get(obs, "fleets", [])
+            }
+            return
+
+        # Identify fleets launched by opp this turn.
+        opp_launches = self._opp_launches_this_turn(obs, opp_player)
+
+        # Snapshot current fleet ids for the next turn's diff.
+        self._prev_fleet_ids = {
+            int(f[0]) for f in obs_get(obs, "fleets", [])
+        }
+
+        # Evidence is over *opp-owned planets that exist* on the
+        # previous turn's obs — launches come from there. We evaluate
+        # each archetype on the previous turn's state (what opp "saw"
+        # when deciding), not the current state (which reflects their
+        # action + our action + world updates).
+        prev_obs = self._last_obs
+        self._last_obs = obs
+
+        opp_planet_ids = {
+            int(pl[0]) for pl in obs_get(prev_obs, "planets", [])
+            if int(pl[1]) == opp_player
+        }
+        if not opp_planet_ids:
+            # Nothing to condition on — opp has been eliminated.
+            return
+
+        for k, arch in enumerate(self.archetypes):
+            predicted = self._predicted_launches(arch, prev_obs, opp_player)
+            log_lik = self._log_likelihood(
+                observed_launches=opp_launches,
+                predicted_launches=predicted,
+                planet_ids=opp_planet_ids,
+            )
+            self.log_alpha[k] += log_lik / self.temperature
+
+        self._turns_observed += 1
+
+    def distribution(self) -> np.ndarray:
+        """Posterior over archetypes as a probability vector."""
+        return _softmax(self.log_alpha)
+
+    def most_likely(self) -> str:
+        return self.names[int(np.argmax(self.log_alpha))]
+
+    def turns_observed(self) -> int:
+        return self._turns_observed
+
+    # ---- Internals ----
+
+    def _opp_launches_this_turn(
+        self, obs: Any, opp_player: int,
+    ) -> Set[int]:
+        """Set of planet ids the opponent launched from this turn.
+
+        Uses fleet-id diffing against the previous turn's snapshot. A
+        fleet is "new" if its id wasn't in the prior obs.
+        """
+        launches: Set[int] = set()
+        for f in obs_get(obs, "fleets", []):
+            fid = int(f[0])
+            if fid in self._prev_fleet_ids:
+                continue
+            owner = int(f[1])
+            from_pid = int(f[5])
+            if owner == opp_player:
+                launches.add(from_pid)
+        return launches
+
+    def _predicted_launches(
+        self, archetype: ArchetypeAgent, obs: Any, opp_player: int,
+    ) -> Set[int]:
+        """What set of planets would `archetype` launch from, playing
+        for `opp_player` on this obs?"""
+        opp_obs = _fabricate_opp_obs(obs, opp_player)
+        dl = Deadline()
+        action = archetype.act(opp_obs, dl)
+        launches: Set[int] = set()
+        for mv in action or []:
+            if len(mv) >= 1:
+                launches.add(int(mv[0]))
+        return launches
+
+    def _log_likelihood(
+        self,
+        observed_launches: Set[int],
+        predicted_launches: Set[int],
+        planet_ids: Set[int],
+    ) -> float:
+        """Per-planet Bernoulli log-likelihood.
+
+        For each planet the opponent owned:
+          If archetype predicts launch and obs shows launch  → log(1-eps)
+          If archetype predicts launch and obs shows hold    → log(eps)
+          If archetype predicts hold and obs shows hold      → log(1-eps)
+          If archetype predicts hold and obs shows launch    → log(eps)
+
+        We only evaluate on planets the opp actually owns (planet_ids) —
+        planets they lost this turn don't carry an action decision.
+        """
+        if not planet_ids:
+            return 0.0
+        log_hit = np.log(1.0 - self.eps)
+        log_miss = np.log(self.eps)
+        total = 0.0
+        for pid in planet_ids:
+            obs_launch = pid in observed_launches
+            pred_launch = pid in predicted_launches
+            total += log_hit if (obs_launch == pred_launch) else log_miss
+        return total
+
+
+
+# --- inlined: orbitwars/bots/mcts_bot.py ---
+
+"""Path B bot: Gumbel top-k + Sequential Halving over heuristic rollouts.
+
+Integration of `orbitwars.mcts.gumbel_search` behind the `Agent` contract.
+On each turn we:
+  1. Enumerate per-planet candidate moves via the heuristic's scorer.
+  2. Sample K joint actions via the Gumbel top-k trick.
+  3. Allocate a rollout budget with Sequential Halving.
+  4. Return the highest-mean-Q joint's wire format.
+
+Safety:
+  * We stage a heuristic action by EARLY_FALLBACK_MS so a search blow-up
+    never results in a no-op turn.
+  * Any exception inside search falls back to the staged heuristic move.
+  * Rollouts respect an internal hard deadline well below actTimeout.
+"""
+
+import time
+from typing import Any, Dict, Optional
+
+
+
+class MCTSAgent(Agent):
+    """Gumbel Sequential Halving with heuristic-priored rollouts.
+
+    The agent keeps a single `HeuristicAgent` around as the safe
+    fallback. Searches are stateless per call (the GumbelRootSearch
+    owns only its RNG).
+
+    Opponent modeling (Path D):
+      If ``use_opponent_model`` is True (default), the agent observes
+      the opponent's actions each turn and maintains an online
+      ArchetypePosterior. The posterior is exposed as
+      ``self.opp_posterior`` for diagnostics. A follow-up change will
+      route the posterior into MCTS rollouts so search biases toward
+      moves that exploit the most-likely archetype — v1 just collects
+      the evidence so the data is there when we light up the integration.
+    """
+
+    name = "mcts"
+
+    def __init__(
+        self,
+        weights: Optional[Dict[str, float]] = None,
+        action_cfg: Optional[ActionConfig] = None,
+        gumbel_cfg: Optional[GumbelConfig] = None,
+        rng_seed: Optional[int] = None,
+        use_opponent_model: bool = True,
+    ):
+        self.weights = dict(HEURISTIC_WEIGHTS) if weights is None else dict(weights)
+        self.action_cfg = action_cfg or ActionConfig()
+        self.gumbel_cfg = gumbel_cfg or GumbelConfig()
+        self._fallback = HeuristicAgent(weights=self.weights)
+        self._search = GumbelRootSearch(
+            weights=self.weights,
+            action_cfg=self.action_cfg,
+            gumbel_cfg=self.gumbel_cfg,
+            rng_seed=rng_seed,
+        )
+        self._use_opponent_model = use_opponent_model
+        # Posterior is created lazily on turn 0 so per-match state
+        # resets come free with the existing turn-0 reset path below.
+        self.opp_posterior: Optional[ArchetypePosterior] = None
+
+        # Posterior telemetry — cheap counters so smokes can reason about
+        # WHY a run did or didn't see a use-model delta (vs. a null result
+        # with no insight into whether the override ever fired). Fields:
+        #   turns_observed   — turns the posterior saw an update this match
+        #   override_fires   — turns `opp_policy_override` was set to an archetype
+        #   override_clears  — turns we explicitly dropped the override (gate failed)
+        #   last_top_name    — most recent argmax archetype (for sanity in logs)
+        #   last_top_prob    — most recent max of dist() (0.0 if no posterior yet)
+        # Reset on turn 0 along with the other per-match state below.
+        self.telemetry: Dict[str, Any] = {
+            "turns_observed": 0,
+            "override_fires": 0,
+            "override_clears": 0,
+            "last_top_name": None,
+            "last_top_prob": 0.0,
+        }
+
+    # Posterior → search override tuning. Conservative: require ~15
+    # turns of evidence AND a top-archetype probability at least 2.5x
+    # the uniform 1/K baseline. Below that, the posterior is noise.
+    _POSTERIOR_MIN_TURNS: int = 15
+    _POSTERIOR_MIN_TOP_PROB: float = 0.35
+
+    def _maybe_route_posterior_to_search(self) -> None:
+        """If the posterior has concentrated, set the search's opponent
+        rollout policy to the matching archetype. Otherwise clear any
+        prior override."""
+        post = self.opp_posterior
+        if post is None:
+            return
+        # Always refresh telemetry when posterior exists, even below the
+        # turns gate — telemetry answers "did the smoke run long enough?"
+        # which only makes sense if we see turns_observed climb.
+        self.telemetry["turns_observed"] = post.turns_observed()
+        if post.turns_observed() < self._POSTERIOR_MIN_TURNS:
+            return
+        dist = post.distribution()
+        top_prob = float(dist.max())
+        self.telemetry["last_top_prob"] = top_prob
+        self.telemetry["last_top_name"] = post.most_likely()
+        if top_prob < self._POSTERIOR_MIN_TOP_PROB:
+            # Not concentrated → no override (opp rolls under default heuristic).
+            if self._search.opp_policy_override is not None:
+                self._search.opp_policy_override = None
+                self.telemetry["override_clears"] += 1
+            return
+        top_name = post.most_likely()
+        # Late-bind the name so every call produces a fresh archetype
+        # (HeuristicAgent has per-match state that rollouts must not share).
+        self._search.opp_policy_override = lambda n=top_name: make_archetype(n)
+        self.telemetry["override_fires"] += 1
+
+    def act(self, obs: Any, deadline: Deadline) -> Action:
+        # Always stage no_op first so any premature return is legal.
+        deadline.stage(no_op())
+
+        # Stage the heuristic action as our floor. If search wins, we
+        # overwrite; if it doesn't, we return this.
+        try:
+            heuristic_move = self._fallback.act(obs, deadline)
+            deadline.stage(heuristic_move)
+        except Exception:
+            heuristic_move = no_op()
+
+        # Reset heuristic state on turn 0 to match the per-match lifecycle.
+        step = obs_get(obs, "step", 0)
+        if step == 0:
+            # Fresh heuristic both for fallback and for the search's
+            # internal rollouts.
+            self._fallback = HeuristicAgent(weights=self.weights)
+            self._search = GumbelRootSearch(
+                weights=self.weights,
+                action_cfg=self.action_cfg,
+                gumbel_cfg=self.gumbel_cfg,
+                rng_seed=None,  # fresh RNG; deterministic only if seeded at ctor.
+            )
+            # Per-match opponent posterior — archetypes are stateful
+            # (HeuristicAgent holds _LaunchState), so we reset between games.
+            if self._use_opponent_model:
+                self.opp_posterior = ArchetypePosterior()
+            # Also clear any stale override from the previous match — the
+            # new opponent is an unknown, back to default heuristic rollouts.
+            self._search.opp_policy_override = None
+            # Reset per-match telemetry so smokes running back-to-back
+            # matches don't see stale counts leaking across games.
+            self.telemetry = {
+                "turns_observed": 0,
+                "override_fires": 0,
+                "override_clears": 0,
+                "last_top_name": None,
+                "last_top_prob": 0.0,
+            }
+
+        my_player = int(obs_get(obs, "player", 0))
+
+        # Opponent-model observation. Cheap (<20 ms on a dense mid-game
+        # obs) and wrapped in try/except so a defect in the posterior
+        # never escapes to the search path. v1 is 2-player only: opp is
+        # the other seat.
+        #
+        # Exploitation: once the posterior has concentrated (>=15 turns
+        # observed AND top archetype probability > 0.35, i.e. ~2.5x the
+        # uniform 1/7 floor), we route the top archetype's HeuristicAgent
+        # as the opponent's rollout policy instead of the generic
+        # HeuristicAgent(self.weights). This makes MCTS search under the
+        # *actual* inferred opponent model rather than "assume default
+        # heuristic". Threshold and grace period are conservative — a
+        # wrong override is worse than no override, since search then
+        # optimizes against a phantom opponent.
+        if self._use_opponent_model and self.opp_posterior is not None:
+            try:
+                opp_player = 1 - my_player  # 2-player assumption
+                self.opp_posterior.observe(obs, opp_player=opp_player)
+                self._maybe_route_posterior_to_search()
+            except Exception:
+                # Posterior is informational-only in v1; a bad update
+                # must never break the turn.
+                pass
+
+        # Respect the outer agent-level deadline too: if we've already
+        # burned most of actTimeout staging the fallback, skip search.
+        remaining = deadline.remaining_ms(HARD_DEADLINE_MS)
+        if remaining < 50.0:
+            return heuristic_move
+
+        # Tighten the search-internal deadline to whatever the outer
+        # Deadline gives us, minus a small safety margin for wrap-up.
+        safe_budget = min(self.gumbel_cfg.hard_deadline_ms, remaining - 40.0)
+        if safe_budget <= 10.0:
+            return heuristic_move
+
+        # Rebuild a one-shot config with the tightened deadline. All other
+        # fields (including anchor_improvement_margin!) must be preserved
+        # so the safety floor still protects us under the tight budget.
+        tight_cfg = GumbelConfig(
+            num_candidates=self.gumbel_cfg.num_candidates,
+            total_sims=self.gumbel_cfg.total_sims,
+            rollout_depth=self.gumbel_cfg.rollout_depth,
+            hard_deadline_ms=safe_budget,
+            anchor_improvement_margin=self.gumbel_cfg.anchor_improvement_margin,
+        )
+
+        # Wrap the entire swap+search+restore so ANY failure (including
+        # attribute access on a broken search object) degrades to the
+        # heuristic. Agents in ladder play must never bubble.
+        saved_cfg = None
+        try:
+            saved_cfg = self._search.gumbel_cfg
+            self._search.gumbel_cfg = tight_cfg
+            t0 = time.perf_counter()
+            # Pass the heuristic's move in as the anchor candidate:
+            # search will only overwrite it with something evaluated to
+            # be better, so the MCTS agent is guaranteed heuristic-or-
+            # better in expectation.
+            result = self._search.search(
+                obs, my_player, start_time=t0,
+                anchor_action=heuristic_move,
+            )
+        except Exception:
+            return heuristic_move
+        finally:
+            if saved_cfg is not None:
+                try:
+                    self._search.gumbel_cfg = saved_cfg
+                except Exception:
+                    pass
+
+        if result is None:
+            return heuristic_move
+
+        action = result.best_joint.to_wire()
+        deadline.stage(action)
+        return action
+
+
+def build(**overrides) -> MCTSAgent:
+    """Factory for packaging / tournament registration."""
+    return MCTSAgent(**overrides)
+
+
+
+
+# --- agent entry point ---
+
+agent = MCTSAgent(rng_seed=0).as_kaggle_agent()
