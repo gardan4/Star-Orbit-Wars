@@ -1,0 +1,76 @@
+{
+  "strategy": "RandomSearch",
+  "n_trials": 2,
+  "started_at": 1776808312.0423694,
+  "finished_at": 1776808373.7597182,
+  "best_index": 1,
+  "best_win_rate": 0.5,
+  "trials": [
+    {
+      "trial": 0,
+      "weights": {
+        "w_production": 3.120102760191824,
+        "w_ships_cost": 0.8474337369372327,
+        "w_distance_cost": 0.381887309488307,
+        "w_travel_cost": 0.7652070772182651,
+        "mult_neutral": 1.5367617525666288,
+        "mult_enemy": 2.302506217464817,
+        "mult_comet": 3.292805566341539,
+        "mult_reinforce_ally": 1.5774467022710263,
+        "ships_safety_margin": 0.9385958677423489,
+        "min_launch_size": 6.5591112087103465,
+        "max_launch_fraction": 0.8521885935278827,
+        "expand_cooldown_turns": 8.655341358101067,
+        "keep_reserve_ships": 38.1140041228971,
+        "agg_early_game": 0.5052651333777767,
+        "early_game_cutoff_turn": 133.61615821644043,
+        "sun_avoidance_epsilon": 0.14430800646815653,
+        "comet_max_time_mismatch": 1.1438111063522634,
+        "expand_bias": 1.8905413911078446
+      },
+      "win_rate": 0.0,
+      "hard_win_rate": 0.0,
+      "n_games": 2,
+      "fitness_wall_seconds": 31.089048900001217,
+      "by_opponent": {
+        "starter": [
+          0.0,
+          2
+        ]
+      }
+    },
+    {
+      "trial": 1,
+      "weights": {
+        "w_production": 18.07783542342393,
+        "w_ships_cost": 0.030589983033553536,
+        "w_distance_cost": 0.0127229304967304,
+        "w_travel_cost": 1.6242374183804897,
+        "mult_neutral": 2.8235325720576805,
+        "mult_enemy": 1.967900764672241,
+        "mult_comet": 1.1613370459400056,
+        "mult_reinforce_ally": 0.8442331511654346,
+        "ships_safety_margin": 0.29040787574867943,
+        "min_launch_size": 17.193041645016926,
+        "max_launch_fraction": 0.4940988342855148,
+        "expand_cooldown_turns": 9.916244827637012,
+        "keep_reserve_ships": 11.654222512878631,
+        "agg_early_game": 1.0771663538524607,
+        "early_game_cutoff_turn": 65.63431120130659,
+        "sun_avoidance_epsilon": 0.09192069314754672,
+        "comet_max_time_mismatch": 1.448908072952428,
+        "expand_bias": 0.04297941053181775
+      },
+      "win_rate": 0.5,
+      "hard_win_rate": 0.5,
+      "n_games": 2,
+      "fitness_wall_seconds": 30.626938799978234,
+      "by_opponent": {
+        "starter": [
+          0.5,
+          2
+        ]
+      }
+    }
+  ]
+}

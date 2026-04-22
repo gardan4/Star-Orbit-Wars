@@ -1,0 +1,30 @@
+[project]
+name = "orbit-wars"
+version = "0.1.0"
+description = "Kaggle Orbit Wars bot — heuristic-first, search-amplified, learning-optional"
+requires-python = ">=3.13"
+dependencies = [
+  "numpy>=2.0",
+  "jsonschema>=3.0.1",
+  "pyjson5",
+  "requests>=2.25.1",
+]
+
+[project.optional-dependencies]
+# Kaggle CLI for submissions
+kaggle = ["kaggle"]
+# TuRBO tuning (Week 2)
+turbo = ["ax-platform", "botorch", "torch"]
+# PPO self-play (Week 4)
+rl = ["torch"]
+# JAX engine (Week 4)
+jax = ["jax", "jaxlib"]
+# Dev tooling
+dev = ["pytest", "pytest-xdist", "black", "ruff"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orbitwars"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
