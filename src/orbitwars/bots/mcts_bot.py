@@ -249,17 +249,36 @@ class MCTSAgent(Agent):
         # Always stage no_op first so any premature return is legal.
         deadline.stage(no_op())
 
-        # Stage the heuristic action as our floor. If search wins, we
-        # overwrite; if it doesn't, we return this.
-        try:
-            heuristic_move = self._fallback.act(obs, deadline)
-            deadline.stage(heuristic_move)
-        except Exception:
-            heuristic_move = no_op()
-
-        # Reset heuristic state on turn 0 to match the per-match lifecycle.
-        step = obs_get(obs, "step", 0)
-        if step == 0:
+        # ── Match-start detection MUST precede self._fallback.act() ──
+        # Seat 0: obs.step==0 signals a new game.
+        # Seat 1: obs.step is None (Kaggle engine quirk); we use
+        # next_fleet_id regression (or first-call) as the match-start
+        # signal.
+        #
+        # Detecting BEFORE calling fallback.act is load-bearing: the
+        # reset below replaces self._fallback with a fresh HeuristicAgent.
+        # If we called self._fallback.act first and then replaced it, the
+        # first call's _turn_counter increment (0→1) would be discarded
+        # by the replacement, leaving the new fallback's counter at None.
+        # On turn 2 its counter then advances None→1 instead of 1→2, so
+        # for the remainder of the match fallback._turn_counter is
+        # ALWAYS one turn behind a freshly-created HeuristicAgent reading
+        # the same observations. MCTS threads that stale counter to
+        # search as step_override, so both the anchor heuristic_move AND
+        # the search's synthetic obs.step drift off-by-one — which
+        # silently breaks anchor-lock at seat 1 (confirmed 3/30 turns
+        # diverge by tools/diag_mcts_vs_heur_actions_seat1.py). Seat 0
+        # is unaffected because obs.step is authoritative there and
+        # HeuristicAgent ignores _turn_counter when raw_step is set.
+        raw_step = obs_get(obs, "step", None)
+        curr_nfid = int(obs_get(obs, "next_fleet_id", 0))
+        if raw_step is not None:
+            fresh_game = (int(raw_step) == 0)
+        else:
+            prev_nfid = getattr(self, "_prev_next_fleet_id", None)
+            fresh_game = prev_nfid is None or prev_nfid > curr_nfid
+        self._prev_next_fleet_id = curr_nfid
+        if fresh_game:
             # Fresh heuristic both for fallback and for the search's
             # internal rollouts.
             self._fallback = HeuristicAgent(weights=self.weights)
@@ -288,6 +307,17 @@ class MCTSAgent(Agent):
                 "last_top_name": None,
                 "last_top_prob": 0.0,
             }
+
+        # Stage the heuristic action as our floor. If search wins, we
+        # overwrite; if it doesn't, we return this. The fallback here is
+        # guaranteed to be the one we'll keep for this match (fresh-game
+        # replacement already happened above), so its _turn_counter
+        # stays in lockstep with an outside shadow HeuristicAgent.
+        try:
+            heuristic_move = self._fallback.act(obs, deadline)
+            deadline.stage(heuristic_move)
+        except Exception:
+            heuristic_move = no_op()
 
         my_player = int(obs_get(obs, "player", 0))
 
@@ -393,10 +423,16 @@ class MCTSAgent(Agent):
             # search will only overwrite it with something evaluated to
             # be better, so the MCTS agent is guaranteed heuristic-or-
             # better in expectation.
+            # Thread step from the fallback's turn counter. self._fallback.act
+            # was called above and updated its monotonic _turn_counter;
+            # we reuse it so search sees the same step even on seat 1
+            # (where obs.step is None).
+            step_override = getattr(self._fallback, "_turn_counter", None)
             result = self._search.search(
                 obs, my_player, start_time=t0,
                 anchor_action=heuristic_move,
                 outer_hard_stop_at=outer_hard_stop_at,
+                step_override=step_override,
             )
         except Exception:
             return heuristic_move

@@ -2,7 +2,7 @@
   "strategy": "AxTurbo",
   "n_trials": 25,
   "started_at": 1776870550.2665396,
-  "finished_at": 1776880820.9731271,
+  "finished_at": 1776889444.2719424,
   "best_index": 0,
   "best_win_rate": 0.4,
   "trials": [
@@ -67,6 +67,71 @@
         ],
         "defender": [
           0.9,
+          10
+        ]
+      }
+    },
+    {
+      "trial": 1,
+      "weights": {
+        "w_production": 16.938078022561967,
+        "w_ships_cost": 0.2182952966541052,
+        "w_distance_cost": 0.31070483895018697,
+        "w_travel_cost": 2.8661389695480466,
+        "mult_neutral": 0.36695527965202923,
+        "mult_enemy": 0.6915343250147998,
+        "mult_comet": 0.6247848051600159,
+        "mult_reinforce_ally": 1.1959149409085512,
+        "ships_safety_margin": 0.496514099650085,
+        "min_launch_size": 24.696230557747185,
+        "max_launch_fraction": 0.5511227532289922,
+        "expand_cooldown_turns": 0.41981703601777554,
+        "keep_reserve_ships": 14.726437255740166,
+        "agg_early_game": 0.9639361426234245,
+        "early_game_cutoff_turn": 37.797266244888306,
+        "sun_avoidance_epsilon": 0.019694457948207858,
+        "comet_max_time_mismatch": 0.03955699969083071,
+        "expand_bias": 1.558309979736805
+      },
+      "win_rate": 0.17777777777777778,
+      "hard_win_rate": 0.17777777777777778,
+      "n_games": 90,
+      "fitness_wall_seconds": 8623.891619800008,
+      "by_opponent": {
+        "starter": [
+          0.2,
+          10
+        ],
+        "random": [
+          1.0,
+          10
+        ],
+        "rusher": [
+          0.0,
+          10
+        ],
+        "turtler": [
+          0.0,
+          10
+        ],
+        "economy": [
+          0.0,
+          10
+        ],
+        "harasser": [
+          0.0,
+          10
+        ],
+        "comet_camper": [
+          0.0,
+          10
+        ],
+        "opportunist": [
+          0.1,
+          10
+        ],
+        "defender": [
+          0.3,
           10
         ]
       }

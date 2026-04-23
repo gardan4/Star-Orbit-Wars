@@ -1,0 +1,11 @@
+﻿.venv\Scripts\python.exe : ERROR: usage: __main__.py [options] [file_or_dir] [file_or_dir] [...]
+At line:1 char:24
++ ... PATH = "."; .venv\Scripts\python.exe -m pytest tests\test_mcts_bot.py ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: usage: _...e_or_dir] [...]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+__main__.py: error: unrecognized arguments: --timeout=180
+  inifile: C:\Users\Marc\Desktop\Orbit Wars\pyproject.toml
+  rootdir: C:\Users\Marc\Desktop\Orbit Wars
+

@@ -1,6 +1,60 @@
 # Orbit Wars — Repo Status & Architecture
 
-*Last updated: 2026-04-22 (W2→W3 transition, 6-week plan)*
+*Last updated: 2026-04-24 (W3→W4 transition; **v7 on ladder at 599.0 post-settle**; v6 at 623.3 — 24 Elo gap likely noise given local mirror parity; both >> v5)*
+
+**Kaggle submission trail** (public score, most recent first; post-settle values in brackets when different from initial):
+- v7 (entropy-leak fix in FastEngine._maybe_spawn_comets): **599.0** [initial 708.2 → settled 599.0 over ~24h]
+- v6 (seat-1 anchor-lock off-by-one fix): 623.3 [initial 667.4 → settled 623.3]
+- v5 (seat-1 step inference + comet path bookkeeping + zero-miss gate): 523.0
+- v4 (outer_hard_stop_at threading): 475.2 (regression)
+- v3 (decoupled UCT + Bayes + fast-archetype rollouts): 535.0
+- v2.1 (hardened per-ply deadlines): 539.1
+- v1 (W3 first real: MCTS v2 Gumbel SH + Bayes + margin=2.0 floor): 455.1
+
+**v7 post-settle regression vs v6 (-24 Elo): honest reading.** After the ladder
+stabilized, v7 sits 24 Elo below v6 despite proving strictly more correct
+locally (multi-seed smoke 3W/3L cum=0 vs v6's 3W/3L cum=-12540). Working
+hypotheses, ranked by plausibility:
+
+1. **Small-N noise.** 24 Elo is ~10-20 ladder games of variance at these
+   rating levels. Neither bot has played enough games for the gap to be
+   significant at p<0.05. Waiting another day/week would likely compress it.
+2. **Lost accidental exploration.** v6's entropy leak injected ~25k perturbations
+   per game into the judge's global `random` stream, shifting comet spawn
+   locations. Opponents who implicitly over-fit to "standard" comet distributions
+   may have been disrupted by v6's accidental randomization. v7 plays to the
+   canonical distribution, so those opponents execute their prepared lines.
+   Untestable without Kaggle A/B infrastructure.
+3. **MCTS-collapses-to-heur trap.** At margin=2.0 anchor-lock, MCTS's wire
+   actions are byte-identical to heur in >95% of turns (locally verified). The
+   MCTS edge on the ladder comes from the 1-5% of turns where it diverges, and
+   that edge is apparently small. v7's "cleaner" determinism doesn't change
+   this — v6 vs v7 shouldn't matter much, supporting H1.
+
+**Decision: don't chase this.** v7 is correct; v6 is buggy; the 24-Elo gap
+is within noise envelope. Rolling back to v6 would revert a validated
+correctness fix for a plausibly-ghost Elo. Continuing W4 NN work instead.
+
+The **v6 → v7** fix mechanism: `FastEngine._maybe_spawn_comets`
+calls `kaggle_environments.envs.orbit_wars.generate_comet_paths`, which internally
+calls `random.uniform` up to ~900 times (per-path retry loop bounded at 300 iters).
+In isolation mode (`self._rng is not random`, i.e. all MCTS rollouts) that global
+consumption LEAKS entropy from the Kaggle judge's stream — the same stream used
+by the real env for *its* comet spawns. Measurement (`tools/diag_who_touches_global_random.py`):
+heur-vs-heur at seed=123 made 3166 global random calls; MCTS-vs-heur (pre-fix)
+made **28888** — a 9x leak, all attributable to `orbit_wars.py:{233,234,242}`
+inside `generate_comet_paths`. Fix: snapshot/restore `random.getstate()` around
+the call in isolation mode only (parity validator still explicitly shares global
+state via `rng=random`). Multi-seed smoke went **3W/3L cum=-12540 → 3W/3L cum=0**
+(perfect mirror symmetry — MCTS is now byte-identical to heur across all 6
+seeds x seats). All paired games differ only by the map's inherent per-seed
+seat advantage.
+
+The v5 → v6 delta (+9.7) validates the `_turn_counter` ordering fix: moving the
+fresh-game detection + `self._fallback` replacement BEFORE the first
+`self._fallback.act()` call eliminates a 1-turn off-by-one in the seat-1 step
+inference path (obs.step is None at seat 1). Pre-fix diagnostic showed 3/30
+wire-action divergences at seat 1; post-fix is 0/30.
 
 This is the project map. If you just cloned the repo, read this first.
 
@@ -183,7 +237,7 @@ python -m orbitwars.tune.turbo_runner --trials 25 --games 20
 The rest of W2 was spent hunting a mystery: MCTSAgent lost 16-3323 to the heuristic despite the anchor-joint floor. Four root causes found, all fixed in sequence:
 
 - **11. Anchor-joint floor** — prepend heuristic's move as candidate 0; `protected_idx` keeps it alive across SH rounds; margin guard (`winner_q - anchor_q ≥ margin`) prevents rollout-noise overrides.
-- **12. Global RNG pollution** — `FastEngine._maybe_spawn_comets` called `random.randint(1, 99)` on the *global* `random` module. Every MCTS rollout that crossed a comet spawn step drained the same stream the Kaggle judge uses, desynchronizing the real game's subsequent comet ship counts. Fix: instance-local `random.Random()` per FastEngine; validator opts into sharing via `rng=random` kwarg.
+- **12. Global RNG pollution (partial fix in W2)** — `FastEngine._maybe_spawn_comets` called `random.randint(1, 99)` on the *global* `random` module. Fix: instance-local `random.Random()` per FastEngine; validator opts into sharing via `rng=random` kwarg. **NOTE: this only closed HALF the leak — the OTHER half was `generate_comet_paths` itself, caught in v7; see §5 item 23.**
 - **13. tight_cfg strip** — `mcts_bot.act` rebuilds GumbelConfig to tighten `hard_deadline_ms`, but the rebuild dropped `anchor_improvement_margin`, silently reverting to the default (0.15) every turn. Fix: copy the field explicitly. Regression test added.
 - **14. Non-deterministic rollouts** — After the RNG-isolation fix, each FastEngine rollout used an os.urandom-seeded RNG → different runs of MCTSAgent produced different outcomes on the same seed. Fix: thread `self._rng` from the search into each rollout's FastEngine.
 
@@ -232,6 +286,13 @@ The rest of W2 was spent hunting a mystery: MCTSAgent lost 16-3323 to the heuris
   - Under shipped margin=2.0 the override is INERT (margin blocks the wire action from changing), so there is no ladder-side risk. Posterior still logs correctly for diagnostics. **Safe to keep as shipped.**
   - If/when we lower margin (post-W4 neural priors), the override integration must be fixed: (a) port the archetype's two relevant knobs (`min_launch_size`, `max_launch_fraction`) onto `FastRolloutAgent` so fast-override stays fast, and/or (b) cache / early-exit the posterior once concentration reaches 0.99+ to kill the 27 ms/turn overhead.
   - Good writeup material — the instrumentation works, the posterior concentrates correctly, the negative empirical signal has a concrete and measurable mechanism attached (not "we don't know why it's bad").
+- **24. W4 architecture scaffolds (2026-04-24)** — shipped both candidates for the W4 bake-off as importable skeletons with pinned signatures and estimated param counts:
+  - **Candidate A (`src/orbitwars/nn/conv_policy.py`)** — centralized per-entity-grid conv over a (B, 12, 50, 50) feature tensor. 12 channels documented in `feature_channels()` (ship density p0/p1, production p0/p1/neutral, planet_radius, is_orbiting, is_comet, sun_distance, fleet_angle_cos/sin, turn_phase). 6 ResBlocks at 64 channels + policy head + value head. `param_count_estimate(ConvPolicyCfg())` = 503,923. Lux S1/S3 winning architecture; translation-equivariant under 4-fold mirror symmetry (free data augmentation).
+  - **Candidate B (`src/orbitwars/nn/set_transformer.py`)** — SAB blocks (plain self-attention, ISAB explicitly dropped per plan — N≤320 makes ISAB slower) over a (B, 320, 19) per-entity tensor. 19 features in `entity_feature_schema()` (identity: is_valid + 3-way type one-hot + 3-way ownership; kinematics: pos_x/y, velocity_x/y, is_orbiting, orbital_angular_vel; capacity: ships, production, radius, sun_distance; globals: turn_phase, score_diff). 4 SAB blocks at d_model=128, 4 heads, learned per-head distance bias (`logits_ij -= scale * euclidean_dist(pos_i, pos_j)`), NeRF-style Fourier coord encoding with 8 bands. `param_count_estimate(SetTransformerCfg())` = 603,187.
+  - **Both models emit the same 8-channel per-owned-planet action distribution** (`ACTION_LOOKUP` identical across both files: 4 angle buckets × 2 ship fractions). MCTS integration is therefore architecture-agnostic — the Path C → Path B integration layer can load either without conditional logic.
+  - **Torch blocks are commented out in both files** until the feature encoder (`orbitwars.features.obs_encode`) and action decoder land. Torch 2.11.0+cpu IS installed; the scaffolds stay disabled by choice to avoid a half-wired module. Switchover is uncomment + instantiate.
+  - Bake-off plan per W4 todo: train each to 1M PPO env steps against the same PFSP opponent pool, ship the higher-Elo winner; the loser becomes an ablation data point in the W6 writeup.
+- **23. Full entropy-leak fix (v7, 2026-04-23)** — traced the residual seat-1 catastrophic losses (v6 multi-seed 3W/3L cum=-12540 with seed=123 seat=1 mcts=0) to `FastEngine._maybe_spawn_comets` calling `kaggle_environments.envs.orbit_wars.generate_comet_paths`, which consumes `random.uniform` up to 3x300=900 times per spawn step on the GLOBAL `random` module. Under env.run the judge's comet spawns at steps {50, 150, 250, 350, 450} draw from the same global stream, so every MCTS rollout crossing a spawn boundary desynchronized the real game's future spawns. Measurement (`tools/diag_who_touches_global_random.py`): heur-vs-heur seed=123 consumed 3166 global random calls; MCTS-vs-heur pre-fix consumed 28888 (9x leak). Fix: snapshot/restore `random.getstate()` around the `generate_comet_paths` call when `self._rng is not random` — keeps parity-validator semantics (explicitly passes `rng=random` to share global state). New `tests/test_fast_engine_isolation.py` locks the invariant at every spawn step (6 passed, 2 skipped due to game ending before steps 350/450 on seed=42). **Multi-seed smoke post-fix: 3W/3L cum=0** — perfect mirror symmetry across seeds {42,123,7} × both seats. MCTS at margin=2.0 anchor-lock is now byte-identical to heur in wire actions; remaining score deltas are pure map per-seat advantage (±46 on seed=42, ±3882 on seed=123, ±2185 on seed=7). Bundled as `submissions/mcts_v7.py` (+1581 bytes vs v6), notebook `gardan4/orbit-wars-mcts-v7`, submitted 2026-04-23 15:34 UTC.
 - **22. Fast rollout policy** — `orbitwars.bots.fast_rollout.FastRolloutAgent` is a ~50-line nearest-target static-push agent (single `atan2` per launch, no arrival table, no Newton solve). Selectable via `GumbelConfig.rollout_policy={"heuristic", "fast"}`; default stays `"heuristic"` to preserve shipped mcts_v1 behavior. **Measured head-to-head at mid-game obs, depth=15 rollouts**:
 
 | | per `act()` | per rollout | sims @ 300 ms budget |
@@ -241,7 +302,7 @@ The rest of W2 was spent hunting a mystery: MCTSAgent lost 16-3323 to the heuris
 
   This is the fix for item 1 in §7: going from 2 sims/turn to 27 sims/turn at 300 ms budget means SH finally has signal above rollout noise. Expected impact: real policy improvement in MCTS at the same CPU budget; unlocks Path D exploitation signal that the running smoke is currently NOT showing (rusher cell: posterior identifies rusher at p=1.00 for 275+ fires/game, but use_model=True/False both give 2W/2L — consistent with "search was budget-starved" rather than "opponent model doesn't help"). 6 new tests lock in action validity (ownership, ship cap, finite angle) plus the sim-count inequality vs. the heuristic policy at matched budget.
 
-Test count: 117 → 128 (+11 from Path D empirical + fast rollout work).
+Test count: 117 → 128 (+11 from Path D empirical + fast rollout work) → 136 (+8 from v7 isolation regression tests, 6 passed + 2 skipped).
 
 ### W2 empirical validation 📊
 Seed=42, 500 turns, MCTSAgent (defaults) vs HeuristicAgent:
@@ -291,7 +352,9 @@ Anchor-lock sanity: `tools/diag_mcts_vs_heur_actions.py` confirms **0/30 turns d
 - [ ] **BOKR kernel sub-action selector** for continuous-angle UCB.
 
 ### W4 (GPU rental begins)
-- [ ] JAX engine (`src/orbitwars/engine/jax_engine.py`) for offline self-play.
+- [x] JAX engine skeleton (`src/orbitwars/engine/jax_engine.py`) — 28-field State, reset/step stubs, 300 lines. Bodies deferred to W4 when GPU is rented.
+- [x] Conv policy scaffold (`src/orbitwars/nn/conv_policy.py`) — ~504K params estimate at default cfg, 12 input channels documented, commented torch module pinned for W4 switchover.
+- [x] Set-Transformer scaffold (`src/orbitwars/nn/set_transformer.py`) — ~603K params estimate at default cfg, 19 per-entity features, learned relative-distance attention bias, Fourier-encoded coords, same 8-channel ACTION_LOOKUP as conv (architecture-agnostic decode).
 - [ ] Arch bake-off: centralized per-entity-grid conv vs set-transformer — train 1M steps each, pick winner.
 - [ ] BC warm-start from Path A.
 - [ ] Begin PPO + PFSP run.
@@ -321,4 +384,8 @@ Anchor-lock sanity: `tools/diag_mcts_vs_heur_actions.py` confirms **0/30 turns d
 
 ## 8. Status summary
 
-Week 2 closes with **MCTSAgent shipped at the heuristic-floor default** (margin=2.0) — the four critical bugs that caused the initial catastrophic losses are fixed, tested, and regression-guarded. The single-seed win turned out to be a timing-variance artifact once we ran the multi-seed sweep; rather than chase phantom wins, we lock in the Path A floor and let W3 (archetypes, opponent model, more sims) and W4-5 (neural prior) do the lifting that actually makes search net-positive. Next week: archetype portfolio + Bayesian opponent model, then first real Kaggle submission.
+Week 2 closed with **MCTSAgent shipped at the heuristic-floor default** (margin=2.0) — the four critical bugs that caused the initial catastrophic losses are fixed, tested, and regression-guarded.
+
+**W3 shipped seven ladder versions** (v1→v7). Each was gated on local wins + zero-timeout soaks. **Post-settle: v7 at 599.0, v6 at 623.3** (+144 over v1's 455.1). The initial v7 Elo (708.2) was optimistic; after ~24h of ladder play both v6 and v7 declined (-44 and -109 respectively) as the matchmaker exposed them to stronger opponents. The 24-Elo gap v6>v7 is within noise at these sample sizes — see §1 for a full post-mortem. Local semantics are unchanged: v7 is strictly more correct (perfect mirror parity vs v6's -12540 cum). Time-budget audit post-v7: p95=396ms, max=594ms, 0 turns >= 850ms (v4 was p95=423, max=882) — the fix also slightly improved tail latency by removing the retry-loop overhead inside comet spawn.
+
+Next (W4 prep): (a) Set-Transformer scaffold as candidate-B for the W4 arch bake-off (conv_policy.py is candidate A, skeleton shipped), (b) 4-player smoke re-run — prior attempt lost its task ID after one match showed seat=0 4th place (need coverage before W4 since 4p feature-encoder must handle 4-way symmetry), (c) BOKR kernel wiring decision deferred to W4 (default off is correct given current tail; revisit when NN prior reduces mean turn time).

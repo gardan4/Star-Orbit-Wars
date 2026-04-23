@@ -1,0 +1,17 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.13.5, pytest-9.0.3, pluggy-1.6.0 -- C:\Users\Marc\Desktop\Orbit Wars\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Marc\Desktop\Orbit Wars
+configfile: pyproject.toml
+collecting ... collected 8 items
+
+tests/test_fast_engine_isolation.py::test_isolation_mode_does_not_perturb_global_random_at_comet_spawn PASSED [ 12%]
+tests/test_fast_engine_isolation.py::test_isolation_mode_still_produces_valid_paths_at_comet_spawn PASSED [ 25%]
+tests/test_fast_engine_isolation.py::test_parity_mode_still_consumes_global_random PASSED [ 37%]
+tests/test_fast_engine_isolation.py::test_isolation_holds_across_all_spawn_steps[50] PASSED [ 50%]
+tests/test_fast_engine_isolation.py::test_isolation_holds_across_all_spawn_steps[150] PASSED [ 62%]
+tests/test_fast_engine_isolation.py::test_isolation_holds_across_all_spawn_steps[250] PASSED [ 75%]
+tests/test_fast_engine_isolation.py::test_isolation_holds_across_all_spawn_steps[350] SKIPPED [ 87%]
+tests/test_fast_engine_isolation.py::test_isolation_holds_across_all_spawn_steps[450] SKIPPED [100%]
+
+======================== 6 passed, 2 skipped in 47.11s ========================

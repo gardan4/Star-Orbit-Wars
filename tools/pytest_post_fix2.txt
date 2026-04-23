@@ -1,0 +1,13 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.13.5, pytest-9.0.3, pluggy-1.6.0
+rootdir: C:\Users\Marc\Desktop\Orbit Wars
+configfile: pyproject.toml
+collected 119 items
+
+tests\test_mcts_bot.py ...........................                       [ 22%]
+tests\test_gumbel_search.py ................................             [ 49%]
+tests\test_bokr_widen.py ....................                            [ 66%]
+tests\test_sim_move.py ..........                                        [ 74%]
+tests\test_zero_miss.py ..............................                   [100%]
+
+======================= 119 passed in 957.82s (0:15:57) =======================

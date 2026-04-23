@@ -622,6 +622,7 @@ class GumbelRootSearch:
         start_time: Optional[float] = None,
         anchor_action: Optional[List[List]] = None,
         outer_hard_stop_at: Optional[float] = None,
+        step_override: Optional[int] = None,
     ) -> Optional[SearchResult]:
         """Run search for one turn. Returns None if no legal moves exist.
 
@@ -646,7 +647,7 @@ class GumbelRootSearch:
         """
         from orbitwars.bots.heuristic import ArrivalTable, parse_obs
 
-        po = parse_obs(obs)
+        po = parse_obs(obs, step_override=step_override)
         table = ArrivalTable()
         try:
             # build_arrival_table updates state in place on an ArrivalTable

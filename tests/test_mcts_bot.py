@@ -683,3 +683,52 @@ def test_mcts_agent_telemetry_resets_builder_counters_on_step_zero():
     assert agent.telemetry["builder_clears"] == 0
     # And the underlying builder is cleared on the search too.
     assert agent._search.opp_candidate_builder is None
+
+
+def test_fallback_turn_counter_tracks_shadow_at_seat_1():
+    """Regression: MCTSAgent._fallback._turn_counter must advance in
+    lockstep with a standalone HeuristicAgent at seat 1 (obs.step None).
+
+    The original bug: act() called self._fallback.act() BEFORE the
+    fresh-game reset that replaced self._fallback. On turn 1 the old
+    fallback's counter advanced 0→1, then got discarded. On turn 2 the
+    new fallback's counter advanced None→1 instead of 1→2, leaving it
+    permanently one behind a parallel shadow HeuristicAgent. Because
+    MCTSAgent threads ``step_override = fallback._turn_counter`` into
+    search, the anchor heuristic_move was computed at step N-1 while
+    the engine observed it at step N — silently breaking anchor-lock
+    at seat 1 (3/30 turns diverged vs. 0/30 at seat 0; confirmed by
+    tools/diag_mcts_vs_heur_actions_seat1.py prior to the fix).
+
+    This test simulates a seat-1 stream (step stripped from obs) and
+    asserts counter-parity across 10 turns.
+    """
+    from orbitwars.bots.heuristic import HeuristicAgent
+
+    mcts = MCTSAgent(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=2, total_sims=2, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            anchor_improvement_margin=10.0,
+        ),
+        rng_seed=0,
+    )
+    shadow = HeuristicAgent()
+
+    def _strip_step(o):
+        # Emulate the Kaggle seat-1 obs shape (obs.step is None / absent).
+        o2 = dict(o)
+        o2.pop("step", None)
+        return o2
+
+    # 10 turns with obs.step omitted. next_fleet_id stays 0 (no launches
+    # in the synthetic obs), which is fine — match-start is detected on
+    # the first call (prev_nfid is None), not on nfid regression.
+    for _ in range(10):
+        obs = _strip_step(_mk_obs())
+        mcts.act(obs, Deadline())
+        shadow.act(obs, Deadline())
+        assert mcts._fallback._turn_counter == shadow._turn_counter, (
+            f"Counter drift: mcts._fallback={mcts._fallback._turn_counter} "
+            f"vs shadow={shadow._turn_counter}"
+        )

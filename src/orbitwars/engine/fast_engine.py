@@ -555,13 +555,38 @@ class FastEngine:
         if (step + 1) not in COMET_SPAWN_STEPS:
             return
         from kaggle_environments.envs.orbit_wars.orbit_wars import generate_comet_paths
-        paths = generate_comet_paths(
-            st.to_official_initial_planets(),
-            st.angular_velocity,
-            step + 1,
-            st.comet_planet_ids,
-            st.config.comet_speed,
-        )
+        # CRITICAL: `generate_comet_paths` internally calls `random.uniform`
+        # (orbit_wars.py:233,234,242) to draw ellipse eccentricity, semi-major
+        # axis, and orientation — up to ~900 calls per spawn via the 300-try
+        # retry loop. Those calls go to the GLOBAL `random` module regardless
+        # of what rng we pass around. During MCTS rollouts that cross a spawn
+        # step (every rollout past turn 50/150/250/350/450), this consumption
+        # perturbs the Kaggle judge's own global random stream — which is what
+        # the judge's engine uses for the REAL comet spawn at that step. Net
+        # effect: rollout bookkeeping changes the game trajectory in ways the
+        # agent can't see. Empirically on seed=123 this flipped outcome from
+        # heur-P1 winning to MCTS-P1 losing despite MCTS returning the SAME
+        # wire action as heur on every turn (see tools/diag_mcts_divergence_
+        # in_env_run.py + tools/diag_who_touches_global_random.py).
+        #
+        # Fix: snapshot + restore global `random` state around the call —
+        # ONLY in isolation mode. When `self._rng is random` (the module
+        # itself — parity validator only), we intentionally DO consume
+        # global state to match official behavior for parity checks.
+        _isolate = self._rng is not random
+        if _isolate:
+            _saved_global_state = random.getstate()
+        try:
+            paths = generate_comet_paths(
+                st.to_official_initial_planets(),
+                st.angular_velocity,
+                step + 1,
+                st.comet_planet_ids,
+                st.config.comet_speed,
+            )
+        finally:
+            if _isolate:
+                random.setstate(_saved_global_state)
         if not paths:
             return
         next_id = int(st.p_id.max()) + 1 if st.num_planets() > 0 else 0
