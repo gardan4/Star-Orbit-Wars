@@ -25,6 +25,17 @@ dev = ["pytest", "pytest-xdist", "black", "ruff"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/orbitwars"]
 
+[tool.pytest.ini_options]
+# Register custom marks so `pytest.mark.slow` doesn't emit a
+# PytestUnknownMarkWarning. Slow tests still run by default (they're
+# measured in milliseconds in this suite); the mark is a semantic hint
+# so a future `pytest -m "not slow"` can skip the real-game ones
+# (e.g. `test_fitness_parallel` spins a 2-worker pool + plays real
+# kaggle games — 10-30 s on Windows).
+markers = [
+  "slow: tests that spawn multiprocessing pools or play real Kaggle games (>5 s)",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

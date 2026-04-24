@@ -1,0 +1,9 @@
+{"ts": 1777036036.992852, "event": "start", "stamp": "20260424_150716", "args": {"llm": "mock", "llm_model": "claude-sonnet-4-5-20250929", "generations": 2, "candidates_per_gen": 3, "top_k": 4, "pool": "starter", "games": 2, "workers": 1, "step_timeout": 1.0, "seed": 0, "run_dir": "runs"}, "pool": "starter", "n_opponents": 1, "games_per_opponent": 2, "workers": 1}
+{"ts": 1777036066.5571792, "event": "candidate", "cid": "b5a272a333bf", "generation": 0, "win_rate": 0.5, "hard_win_rate": 0.5, "n_games": 2, "wall_seconds": 29.564106600009836, "by_opponent": {"starter": {"wr": 0.5, "n": 2}}}
+{"ts": 1777036066.5584176, "event": "duplicate", "cid": "b5a272a333bf", "generation": 1}
+{"ts": 1777036107.4764435, "event": "candidate", "cid": "6275c4cee5dd", "generation": 1, "win_rate": 0.5, "hard_win_rate": 0.5, "n_games": 2, "wall_seconds": 40.917972399969585, "by_opponent": {"starter": {"wr": 0.5, "n": 2}}}
+{"ts": 1777036126.3340614, "event": "candidate", "cid": "2b3217aa5124", "generation": 1, "win_rate": 1.0, "hard_win_rate": 1.0, "n_games": 2, "wall_seconds": 18.85751929995604, "by_opponent": {"starter": {"wr": 1.0, "n": 2}}}
+{"ts": 1777036126.334767, "event": "duplicate", "cid": "6275c4cee5dd", "generation": 2}
+{"ts": 1777036126.3353152, "event": "duplicate", "cid": "2b3217aa5124", "generation": 2}
+{"ts": 1777036126.3359606, "event": "duplicate", "cid": "b5a272a333bf", "generation": 2}
+{"ts": 1777036126.3373184, "event": "end", "best": {"cid": "2b3217aa5124", "score": 1.0, "generation": 1, "parent_ids": ["b5a272a333bf"], "n_games": 2, "wall_seconds": 18.85751929995604}}

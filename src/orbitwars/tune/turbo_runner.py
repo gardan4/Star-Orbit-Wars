@@ -308,6 +308,7 @@ def _build_fitness_cfg(
     games_per_opp: int,
     step_timeout: float,
     seed_base: int,
+    workers: int = 1,
 ) -> FitnessConfig:
     if pool_name == "starter":
         opps = starter_pool()
@@ -322,6 +323,7 @@ def _build_fitness_cfg(
         games_per_opponent=games_per_opp,
         step_timeout=step_timeout,
         seed_base=seed_base,
+        workers=workers,
     )
 
 
@@ -337,11 +339,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--step-timeout", type=float, default=5.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default=None)
+    ap.add_argument(
+        "--workers", type=int, default=1,
+        help="Parallel workers for per-game fitness eval. 1=serial (legacy). "
+             "7-8 gives ~7x speedup on an 8-core CPU.",
+    )
     args = ap.parse_args(argv)
 
     out_path = Path(args.out) if args.out else None
     fitness_cfg = _build_fitness_cfg(
         args.pool, args.games_per_opp, args.step_timeout, args.seed,
+        workers=args.workers,
     )
 
     if args.strategy == "random":

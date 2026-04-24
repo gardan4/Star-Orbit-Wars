@@ -59,12 +59,23 @@ class Deadline:
     still shows "plenty of time left".
     """
 
-    __slots__ = ("_t0", "_best", "_hard_stop_at")
+    __slots__ = ("_t0", "_best", "_hard_stop_at", "_extra_budget_ms")
 
-    def __init__(self, hard_stop_at: float | None = None) -> None:
+    def __init__(
+        self,
+        hard_stop_at: float | None = None,
+        extra_budget_ms: float = 0.0,
+    ) -> None:
         self._t0 = time.perf_counter()
         self._best: Action = no_op()
         self._hard_stop_at = hard_stop_at
+        # Per-turn boost drawn from ``obs.remainingOverageTime``. When the
+        # Kaggle overage bank is fat, the agent wrapper can pass a
+        # positive value here; every ``remaining_ms`` / ``should_stop``
+        # call then treats the caller's base deadline as lifted by this
+        # many milliseconds. Zero keeps behavior identical to turns that
+        # don't (or can't) use the bank. See ``Agent.deadline_boost_ms``.
+        self._extra_budget_ms = float(max(0.0, extra_budget_ms))
 
     def stage(self, action: Action) -> None:
         """Mark this action as the current best; returned if deadline hits."""
@@ -73,15 +84,20 @@ class Deadline:
     def elapsed_ms(self) -> float:
         return (time.perf_counter() - self._t0) * 1000.0
 
+    @property
+    def extra_budget_ms(self) -> float:
+        """Read-only accessor for the overage-bank boost applied this turn."""
+        return self._extra_budget_ms
+
     def remaining_ms(self, deadline_ms: float = SEARCH_DEADLINE_MS) -> float:
-        return deadline_ms - self.elapsed_ms()
+        return (deadline_ms + self._extra_budget_ms) - self.elapsed_ms()
 
     def should_stop(self, deadline_ms: float = SEARCH_DEADLINE_MS) -> bool:
         # An external hard stop (e.g. outer MCTS deadline) always wins.
         if self._hard_stop_at is not None:
             if time.perf_counter() >= self._hard_stop_at:
                 return True
-        return self.elapsed_ms() >= deadline_ms
+        return self.elapsed_ms() >= deadline_ms + self._extra_budget_ms
 
     def best(self) -> Action:
         return self._best
@@ -100,6 +116,29 @@ class Agent:
     def act(self, obs, deadline: Deadline) -> Action:  # pragma: no cover — abstract
         raise NotImplementedError
 
+    # ---- Overage-bank hook ---------------------------------------------
+    #
+    # The Kaggle simulator draws from ``obs.remainingOverageTime`` whenever
+    # a turn overshoots ``actTimeout`` (1 s). Most agents don't need that
+    # — trivial baselines finish in <10 ms. But search-heavy agents can
+    # benefit from spending the bank on the opening turns, where a deeper
+    # look-ahead pays off before the map has diverged. Subclasses opt in
+    # by overriding ``deadline_boost_ms``. The default is 0 (no boost),
+    # which preserves existing behavior for every shipped agent.
+    #
+    # Safety: the boost is read INSIDE ``kaggle_agent``'s try/except, so
+    # a misbehaving override can't forfeit the match — it at worst
+    # returns 0 and we fall back to the standard 850 ms deadline.
+    def deadline_boost_ms(self, obs, step: int) -> float:  # pragma: no cover — default
+        """Extra per-turn budget in ms drawn from ``obs.remainingOverageTime``.
+
+        Returns 0.0 by default. Subclasses that want to exploit the
+        overage bank should override and return a positive number on
+        turns where a longer search is worth the bank draw. The wrapper
+        adds this to both the search deadline and the hard-timeout guard.
+        """
+        return 0.0
+
     # ---- Kaggle submission wrapper ----
     def as_kaggle_agent(self) -> Callable:
         """Return a plain callable usable as a Kaggle submission.
@@ -109,10 +148,24 @@ class Agent:
         """
 
         def kaggle_agent(obs, cfg=None):
-            dl = Deadline()
+            # Compute the per-turn overage boost first so Deadline knows
+            # its true ceiling before ``act`` does anything expensive. Any
+            # exception here degrades gracefully to zero-boost behavior —
+            # we'd rather run under the default 850 ms ceiling than forfeit
+            # on a malformed override.
+            try:
+                step = int(obs_get(obs, "step", 0))
+                boost_ms = float(self.deadline_boost_ms(obs, step))
+                if not math.isfinite(boost_ms) or boost_ms < 0.0:
+                    boost_ms = 0.0
+            except Exception:
+                boost_ms = 0.0
+            dl = Deadline(extra_budget_ms=boost_ms)
             try:
                 result = self.act(obs, dl)
-                if dl.elapsed_ms() > HARD_DEADLINE_MS:
+                # The hard-timeout guard lifts by the same boost so the
+                # wrapper doesn't reject an otherwise-legal overage turn.
+                if dl.elapsed_ms() > HARD_DEADLINE_MS + boost_ms:
                     return dl.best()
                 return result if isinstance(result, list) else dl.best()
             except Exception:

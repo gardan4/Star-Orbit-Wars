@@ -1,0 +1,36 @@
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Round-robin: 2 bundles, 20 games/pair, timeout=1.0s
+
+=== mcts_v7 vs v8 (20 games) ===
+  g0: seed=42 mcts_v7=seat0, v8=seat1 steps=378 mcts_v7 LOSS [p95 mcts_v7=49ms v8=35ms]
+  g1: seed=1042 v8=seat0, mcts_v7=seat1 steps=217 mcts_v7 LOSS [p95 mcts_v7=188ms v8=40ms]
+  g2: seed=2042 mcts_v7=seat0, v8=seat1 steps=438 mcts_v7 LOSS [p95 mcts_v7=224ms v8=43ms]
+  g3: seed=3042 v8=seat0, mcts_v7=seat1 steps=363 mcts_v7 WIN [p95 mcts_v7=80ms v8=35ms]
+  g4: seed=4042 mcts_v7=seat0, v8=seat1 steps=177 mcts_v7 LOSS [p95 mcts_v7=61ms v8=36ms]
+  g5: seed=5042 v8=seat0, mcts_v7=seat1 steps=499 mcts_v7 LOSS [p95 mcts_v7=77ms v8=59ms]
+  g6: seed=6042 mcts_v7=seat0, v8=seat1 steps=279 mcts_v7 LOSS [p95 mcts_v7=101ms v8=40ms]
+  g7: seed=7042 v8=seat0, mcts_v7=seat1 steps=435 mcts_v7 LOSS [p95 mcts_v7=68ms v8=48ms]
+  g8: seed=8042 mcts_v7=seat0, v8=seat1 steps=145 mcts_v7 LOSS [p95 mcts_v7=74ms v8=42ms]
+  g9: seed=9042 v8=seat0, mcts_v7=seat1 steps=155 mcts_v7 LOSS [p95 mcts_v7=106ms v8=45ms]
+  g10: seed=10042 mcts_v7=seat0, v8=seat1 steps=424 mcts_v7 LOSS [p95 mcts_v7=72ms v8=55ms]
+  g11: seed=11042 v8=seat0, mcts_v7=seat1 steps=205 mcts_v7 LOSS [p95 mcts_v7=178ms v8=49ms]
+  g12: seed=12042 mcts_v7=seat0, v8=seat1 steps=301 mcts_v7 LOSS [p95 mcts_v7=78ms v8=52ms]
+  g13: seed=13042 v8=seat0, mcts_v7=seat1 steps=173 mcts_v7 WIN [p95 mcts_v7=68ms v8=46ms]
+  g14: seed=14042 mcts_v7=seat0, v8=seat1 steps=164 mcts_v7 LOSS [p95 mcts_v7=103ms v8=70ms]
+  g15: seed=15042 v8=seat0, mcts_v7=seat1 steps=499 mcts_v7 LOSS [p95 mcts_v7=130ms v8=75ms]
+  g16: seed=16042 mcts_v7=seat0, v8=seat1 steps=388 mcts_v7 LOSS [p95 mcts_v7=114ms v8=73ms]
+  g17: seed=17042 v8=seat0, mcts_v7=seat1 steps=267 mcts_v7 LOSS [p95 mcts_v7=117ms v8=80ms]
+  g18: seed=18042 mcts_v7=seat0, v8=seat1 steps=213 mcts_v7 LOSS [p95 mcts_v7=110ms v8=69ms]
+  g19: seed=19042 v8=seat0, mcts_v7=seat1 steps=303 mcts_v7 LOSS [p95 mcts_v7=98ms v8=80ms]
+
+--- Summary (20 games, 592.1s) ---
+
+Elo ranking:
+  v8                   elo= 1587.9  p50=    36ms  p95=    66ms
+  mcts_v7              elo= 1412.1  p50=    46ms  p95=   103ms
+
+Head-to-head (W-L-T, row vs col):
+                              mcts_v7             v8
+  mcts_v7                           —2-18-            0
+  v8                  18-2-            0              —

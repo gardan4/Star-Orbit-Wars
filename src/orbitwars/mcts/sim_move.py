@@ -262,6 +262,8 @@ def decoupled_exp3_root(
     hard_deadline_ms: float,
     eta: float = 0.3,
     start_time: Optional[float] = None,
+    protected_my_idx: Optional[int] = None,
+    rng: Optional["_r.Random"] = None,  # noqa: F821  (lazy type ref)
 ) -> DecoupledSearchResult:
     """Decoupled Exp3 — softmax-weighted picks with importance-weighted updates.
 
@@ -281,12 +283,22 @@ def decoupled_exp3_root(
     eta is the learning rate. 0.3 is a safe default for [-1, +1] rewards
     and budgets in the 16-128 range; tune later.
 
-    NOTE (v1): This is included for future A/B testing per the plan's
-    "regret matching as a flag-gated W4 A/B test". Not wired into
-    GumbelRootSearch yet.
+    protected_my_idx (if given) is guaranteed at least one rollout at
+    every opp candidate before the softmax draw kicks in — same role as
+    decoupled_ucb_root's ``protected_my_idx`` / sequential_halving's
+    ``protected_idx``. This is load-bearing for the anchor_guard in
+    mcts_bot: without it, a low-total_sims EXP3 run may never visit the
+    heuristic anchor and return a garbage marginal Q that the guard
+    can't distinguish from "actually worse than anchor".
+
+    rng (optional): pre-seeded ``random.Random`` instance. If ``None``
+    we allocate a fresh unseeded instance — fine for production where
+    we want per-search variance, but tests should pass a seeded RNG
+    for determinism.
     """
     import random as _r
-    rng = _r.Random()
+    if rng is None:
+        rng = _r.Random()
 
     t0 = start_time if start_time is not None else time.perf_counter()
     deadline = t0 + hard_deadline_ms / 1000.0
@@ -320,6 +332,29 @@ def decoupled_exp3_root(
             if r <= cumulative:
                 return i
         return len(p) - 1
+
+    # Phase 0: anchor warm-up. Mirror decoupled_ucb_root's protected
+    # warm-up so the anchor's marginal Q is always well-estimated before
+    # the softmax has a chance to "forget" it. We still importance-weight
+    # under p_my/p_opp even during warm-up, keeping the Exp3 regret bound
+    # intact — the draw is just forced.
+    if protected_my_idx is not None and 0 <= protected_my_idx < n_my:
+        for j in range(n_opp):
+            if total_rollouts >= total_sims:
+                break
+            if time.perf_counter() > deadline:
+                aborted = True
+                break
+            p_my = _softmax(cum_my)
+            p_opp = _softmax(cum_opp)
+            v = rollout_fn(my_candidates[protected_my_idx], opp_candidates[j])
+            cum_my[protected_my_idx] += v / max(p_my[protected_my_idx], 1e-6)
+            cum_opp[j] += (-v) / max(p_opp[j], 1e-6)
+            my_q_sum[protected_my_idx] += v
+            my_visits[protected_my_idx] += 1
+            opp_q_sum[j] += -v
+            opp_visits[j] += 1
+            total_rollouts += 1
 
     while total_rollouts < total_sims and not aborted:
         if time.perf_counter() > deadline:

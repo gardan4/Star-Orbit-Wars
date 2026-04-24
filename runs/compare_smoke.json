@@ -1,0 +1,84 @@
+{
+  "args": {
+    "weights_a": "defaults",
+    "weights_b": "defaults",
+    "label_a": "def1",
+    "label_b": "def2",
+    "pool": "starter",
+    "games_per_opp": 2,
+    "step_timeout": 1.0,
+    "seed": 0,
+    "workers": 1,
+    "out": "runs/compare_smoke.json"
+  },
+  "a": {
+    "label": "def1",
+    "win_rate": 0.5,
+    "hard_win_rate": 0.5,
+    "n_games": 2,
+    "wall_seconds": 31.275254400097765,
+    "weights": {
+      "w_production": 5.0,
+      "w_ships_cost": 0.02,
+      "w_distance_cost": 0.05,
+      "w_travel_cost": 0.3,
+      "mult_neutral": 1.0,
+      "mult_enemy": 1.8,
+      "mult_comet": 1.5,
+      "mult_reinforce_ally": 0.0,
+      "ships_safety_margin": 1.0,
+      "min_launch_size": 20.0,
+      "max_launch_fraction": 0.8,
+      "expand_cooldown_turns": 0.0,
+      "keep_reserve_ships": 0.0,
+      "agg_early_game": 1.0,
+      "early_game_cutoff_turn": 100.0,
+      "sun_avoidance_epsilon": 0.02,
+      "comet_max_time_mismatch": 1.5,
+      "expand_bias": 0.5
+    }
+  },
+  "b": {
+    "label": "def2",
+    "win_rate": 0.5,
+    "hard_win_rate": 0.5,
+    "n_games": 2,
+    "wall_seconds": 32.677472599898465,
+    "weights": {
+      "w_production": 5.0,
+      "w_ships_cost": 0.02,
+      "w_distance_cost": 0.05,
+      "w_travel_cost": 0.3,
+      "mult_neutral": 1.0,
+      "mult_enemy": 1.8,
+      "mult_comet": 1.5,
+      "mult_reinforce_ally": 0.0,
+      "ships_safety_margin": 1.0,
+      "min_launch_size": 20.0,
+      "max_launch_fraction": 0.8,
+      "expand_cooldown_turns": 0.0,
+      "keep_reserve_ships": 0.0,
+      "agg_early_game": 1.0,
+      "early_game_cutoff_turn": 100.0,
+      "sun_avoidance_epsilon": 0.02,
+      "comet_max_time_mismatch": 1.5,
+      "expand_bias": 0.5
+    }
+  },
+  "delta_win_rate": 0.0,
+  "ci95": [
+    -0.98,
+    0.98
+  ],
+  "paired_win_rate_for_a": 0.5,
+  "paired_se": 0.3535533905932738,
+  "per_opp": {
+    "starter": {
+      "a_wr": 0.5,
+      "a_n": 2,
+      "b_wr": 0.5,
+      "b_n": 2,
+      "delta": 0.0
+    }
+  }
+}

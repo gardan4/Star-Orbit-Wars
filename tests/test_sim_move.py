@@ -240,3 +240,65 @@ def test_decoupled_exp3_respects_deadline():
     )
     assert result.aborted is True
     assert result.n_rollouts < 500
+
+
+def test_decoupled_exp3_protected_my_idx_visits_all_opp():
+    """Anchor-lock contract (W4 A/B): the protected my candidate must
+    be paired with every opp at least once, BEFORE the softmax is free
+    to collapse onto a single my arm. Mirrors
+    test_decoupled_ucb_protected_my_idx_visits_all_opp — same guarantee
+    for the Exp3 variant so swapping variants doesn't break the
+    anchor_guard upstream."""
+    my = [_mk_joint(i) for i in range(4)]
+    opp = [_mk_joint(j) for j in range(3)]
+
+    # Make the protected arm (index 0) WORSE than the others so Exp3 would
+    # never pick it after warm-up — if warm-up is missing, visits[0] stays
+    # at 0.
+    def rollout(mi, oi):
+        if mi is my[0]:
+            return -1.0
+        return +0.5
+
+    import random as _r
+    rng = _r.Random(42)  # deterministic for CI
+    result = decoupled_exp3_root(
+        my, opp, rollout,
+        total_sims=30, hard_deadline_ms=5000.0,
+        protected_my_idx=0, rng=rng,
+    )
+    # Protected arm paired with every opp at least once.
+    assert result.my_visits[0] >= len(opp), (
+        f"protected arm under-visited: visits[0]={result.my_visits[0]} < "
+        f"n_opp={len(opp)}; warm-up phase missing?"
+    )
+    # And every opp has at least one visit too (warm-up covers them).
+    for j in range(len(opp)):
+        assert result.opp_visits[j] >= 1, (
+            f"opp[{j}] never visited in warm-up"
+        )
+
+
+def test_decoupled_exp3_rng_seed_is_deterministic():
+    """Two identical runs with a seeded RNG must produce identical
+    histograms. Load-bearing for deterministic tests downstream that
+    want to assert on Exp3 output without flakiness."""
+    my = [_mk_joint(i) for i in range(3)]
+    opp = [_mk_joint(j) for j in range(2)]
+
+    def rollout(mi, oi):
+        return 0.1 * (hash((id(mi), id(oi))) % 7 - 3)
+
+    import random as _r
+    a = decoupled_exp3_root(
+        my, opp, rollout,
+        total_sims=40, hard_deadline_ms=5000.0,
+        rng=_r.Random(123),
+    )
+    b = decoupled_exp3_root(
+        my, opp, rollout,
+        total_sims=40, hard_deadline_ms=5000.0,
+        rng=_r.Random(123),
+    )
+    assert a.my_visits == b.my_visits
+    assert a.opp_visits == b.opp_visits

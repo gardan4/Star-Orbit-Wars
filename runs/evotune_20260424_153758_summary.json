@@ -1,0 +1,51 @@
+{
+  "stamp": "20260424_153758",
+  "args": {
+    "llm": "mock",
+    "llm_model": "claude-sonnet-4-5-20250929",
+    "generations": 2,
+    "candidates_per_gen": 3,
+    "top_k": 2,
+    "pool": "starter",
+    "games": 4,
+    "workers": 1,
+    "step_timeout": 1.0,
+    "seed": 42,
+    "run_dir": "runs"
+  },
+  "n_candidates_evaluated": 3,
+  "best_overall": {
+    "cid": "b5a272a333bf",
+    "score": 1.0,
+    "generation": 0,
+    "parent_ids": [],
+    "n_games": 4,
+    "wall_seconds": 53.230428599985316
+  },
+  "best_per_generation": [
+    {
+      "cid": "b5a272a333bf",
+      "score": 1.0,
+      "generation": 0,
+      "parent_ids": [],
+      "n_games": 4,
+      "wall_seconds": 53.230428599985316
+    },
+    {
+      "cid": "b5a272a333bf",
+      "score": 1.0,
+      "generation": 0,
+      "parent_ids": [],
+      "n_games": 4,
+      "wall_seconds": 53.230428599985316
+    },
+    {
+      "cid": "b5a272a333bf",
+      "score": 1.0,
+      "generation": 0,
+      "parent_ids": [],
+      "n_games": 4,
+      "wall_seconds": 53.230428599985316
+    }
+  ]
+}

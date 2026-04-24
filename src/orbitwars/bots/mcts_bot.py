@@ -121,6 +121,54 @@ class MCTSAgent(Agent):
     # a phantom branch), so we keep the builder = None.
     _POSTERIOR_DECOUPLED_MIN_SECOND_PROB: float = 0.20
 
+    # ---- Overage-bank lift (plan §W3) ---------------------------------
+    #
+    # The Kaggle simulator overruns actTimeout by drawing from the
+    # remainingOverageTime bank. On opening turns the map hasn't
+    # diverged much yet and deeper search pays off; on late turns most
+    # outcomes are decided and going long just burns the bank. We lift
+    # the deadline only when BOTH conditions hold:
+    #   (1) turn index is in the opening window (default 10),
+    #   (2) the bank is generously padded beyond the emergency reserve.
+    # Outside that window we return 0 so the standard 850 ms deadline
+    # applies. The reserve is kept in the bank for late-game turn-time
+    # spikes — if we burn the bank dry we forfeit the match on the
+    # next slow turn.
+    #
+    # These constants live at the class level so a specific MCTSAgent
+    # subclass (or an experiment harness) can tighten/loosen them in
+    # isolation without editing the base.py default.
+    _OVERAGE_OPENING_TURNS: int = 10        # turns that may be lifted
+    _OVERAGE_RESERVE_SEC: float = 2.0       # floor we never draw below
+    _OVERAGE_MIN_BANK_SEC: float = 5.0      # refuse to lift below this bank
+    _OVERAGE_MAX_BOOST_MS: float = 2000.0   # per-turn ceiling on the lift
+    # ``(bank - reserve)`` is amortized across the opening window; no
+    # single turn gets more than ``_OVERAGE_MAX_BOOST_MS``.
+
+    def deadline_boost_ms(self, obs: Any, step: int) -> float:
+        """Read the overage bank and decide how much to lift this turn.
+
+        Design — see class-level OVERAGE_* constants for the thresholds.
+        Returns 0 whenever the lift is unsafe (outside opening window,
+        bank below the reserve, missing field). Any exception in here
+        is caught by the wrapper and converted to 0 so a malformed obs
+        never forfeits a match.
+        """
+        if step >= self._OVERAGE_OPENING_TURNS:
+            return 0.0
+        bank = float(obs_get(obs, "remainingOverageTime", 0.0))
+        if bank < self._OVERAGE_MIN_BANK_SEC:
+            # Bank too tight — leave it alone for the late-game safety net.
+            return 0.0
+        # Amortize the *usable* bank (above the reserve) across the
+        # remaining opening turns. This keeps us honest when the map is
+        # still shared between the agents — we don't blow the entire
+        # bank on turn 0 and starve ourselves on turn 9.
+        remaining_opening_turns = max(1, self._OVERAGE_OPENING_TURNS - step)
+        usable_bank_ms = max(0.0, bank - self._OVERAGE_RESERVE_SEC) * 1000.0
+        per_turn_ms = usable_bank_ms / float(remaining_opening_turns)
+        return min(self._OVERAGE_MAX_BOOST_MS, per_turn_ms)
+
     def _maybe_route_posterior_to_search(self) -> None:
         """If the posterior has concentrated, set the search's opponent
         rollout policy to the matching archetype. Otherwise clear any
@@ -367,8 +415,17 @@ class MCTSAgent(Agent):
         # elapsed past 900 ms. The audit measures EXACTLY this number.
         _ROLLOUT_OVERSHOOT_BUDGET_MS = 260.0
         _WRAPUP_BUDGET_MS = 40.0
+        # The cap normally comes straight from the Gumbel config; on
+        # turns where ``Agent.deadline_boost_ms`` has lifted the outer
+        # deadline from the overage bank, lift the cap by the same
+        # amount so search can actually consume the extra budget.
+        # Without this, ``remaining`` grows but the cap below still
+        # clamps us to the 300 ms default and the boost is wasted.
+        effective_cap_ms = (
+            self.gumbel_cfg.hard_deadline_ms + deadline.extra_budget_ms
+        )
         safe_budget = min(
-            self.gumbel_cfg.hard_deadline_ms,
+            effective_cap_ms,
             remaining - _ROLLOUT_OVERSHOOT_BUDGET_MS - _WRAPUP_BUDGET_MS,
         )
         if safe_budget <= 10.0:

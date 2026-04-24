@@ -135,6 +135,26 @@ class GumbelConfig:
     # no-op-to-loss on turn-0-heavy matches. Flag it on once paired
     # with (b) posterior caching.
     use_decoupled_sim_move: bool = False
+    # Variant of the decoupled-root bandit to use when
+    # ``use_decoupled_sim_move`` is True. Options:
+    #   "ucb"   — decoupled_ucb_root (default, shipped in v7/v8 as the
+    #             principled sim-move fix; UCB exploration bonus + mean-Q
+    #             argmax over warm-started rollouts).
+    #   "exp3"  — decoupled_exp3_root (flag-gated W4 A/B test per plan
+    #             §W4: "Regret-matching A/B test at sim-move nodes; ship
+    #             if beats decoupled-UCT by ≥5pp"). Exp3 is minimax-
+    #             optimal for adversarial bandits — the theoretically
+    #             correct choice when the opp is non-stationary, as it is
+    #             on the ladder where archetypes vary by seat. Same
+    #             anchor-protection contract as ucb via ``protected_my_idx``.
+    # Both variants fall through to sequential_halving when there are
+    # <2 opp candidates (the posterior-sampled pool couldn't supply
+    # enough distinct opps).
+    sim_move_variant: str = "ucb"
+    # Exp3 learning rate — only used when sim_move_variant="exp3".
+    # 0.3 is safe for [-1, +1] rewards and budgets in the 16-128 range
+    # (matches sim_move.decoupled_exp3_root default); tune if A/B wants.
+    exp3_eta: float = 0.3
     # Number of opp candidate actions to sample when decoupling is on.
     # Typical: 2-3. Larger K = better marginalization, worse per-cell
     # noise under fixed total_sims. 2 is the minimum where decoupling
@@ -783,7 +803,10 @@ class GumbelRootSearch:
                 opp_wires = []
 
         if len(opp_wires) >= 2:
-            from orbitwars.mcts.sim_move import decoupled_ucb_root
+            from orbitwars.mcts.sim_move import (
+                decoupled_ucb_root,
+                decoupled_exp3_root,
+            )
 
             def decoupled_rollout_fn(my_joint: JointAction, opp_wire: List[List]) -> float:
                 return _rollout_value(
@@ -809,15 +832,46 @@ class GumbelRootSearch:
             if outer_hard_stop_at is not None:
                 tight_ms = max(1.0, (rollout_deadline_sec - t0_rollout) * 1000.0)
                 dec_hard_ms = min(dec_hard_ms, tight_ms)
-            dres = decoupled_ucb_root(
-                my_candidates=joints,
-                opp_candidates=opp_wires,
-                rollout_fn=decoupled_rollout_fn,
-                total_sims=self.gumbel_cfg.total_sims,
-                hard_deadline_ms=dec_hard_ms,
-                start_time=start_time,
-                protected_my_idx=protected_idx,
-            )
+            # Dispatch UCB vs Exp3. Unknown variant names fall back to
+            # UCB with a warning — better than crashing mid-game, and
+            # the config is the only place a typo can sneak in.
+            variant = getattr(self.gumbel_cfg, "sim_move_variant", "ucb")
+            if variant == "exp3":
+                dres = decoupled_exp3_root(
+                    my_candidates=joints,
+                    opp_candidates=opp_wires,
+                    rollout_fn=decoupled_rollout_fn,
+                    total_sims=self.gumbel_cfg.total_sims,
+                    hard_deadline_ms=dec_hard_ms,
+                    eta=getattr(self.gumbel_cfg, "exp3_eta", 0.3),
+                    start_time=start_time,
+                    protected_my_idx=protected_idx,
+                    rng=self._rng,
+                )
+            else:
+                # "ucb" (default) and any unknown variant name.
+                if variant != "ucb":
+                    # Silent fallback is a footgun — log on once per
+                    # config object so callers notice typos.
+                    if not getattr(self.gumbel_cfg, "_variant_warned", False):
+                        print(
+                            f"[gumbel_search] unknown sim_move_variant "
+                            f"{variant!r}; falling back to 'ucb'",
+                            flush=True,
+                        )
+                        try:
+                            setattr(self.gumbel_cfg, "_variant_warned", True)
+                        except Exception:
+                            pass
+                dres = decoupled_ucb_root(
+                    my_candidates=joints,
+                    opp_candidates=opp_wires,
+                    rollout_fn=decoupled_rollout_fn,
+                    total_sims=self.gumbel_cfg.total_sims,
+                    hard_deadline_ms=dec_hard_ms,
+                    start_time=start_time,
+                    protected_my_idx=protected_idx,
+                )
             # Map DecoupledSearchResult → SearchResult so the anchor-guard
             # below operates without branching (it indexes q_values[0] as
             # the anchor's marginal Q, which is exactly my_q_values[0]).

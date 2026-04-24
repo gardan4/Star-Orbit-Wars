@@ -1,0 +1,157 @@
+{
+  "config": {
+    "bank_seconds": 60.0,
+    "seed": 42,
+    "n_turns_traced": 15,
+    "gumbel_cfg": {
+      "num_candidates": 16,
+      "total_sims": 32,
+      "rollout_depth": 15,
+      "hard_deadline_ms": 300.0
+    }
+  },
+  "per_turn": [
+    {
+      "step": 0,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 0.20480004604905844,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": true
+    },
+    {
+      "step": 0,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 0.560999964363873,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 1,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 0.9818000253289938,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 2,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 0.9088000515475869,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 3,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 1.0093000018969178,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 4,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 646.3863999815658,
+      "n_rollouts": 32,
+      "search_duration_ms": 644.4016000023112,
+      "used_fallback": false
+    },
+    {
+      "step": 5,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 323.15929990727454,
+      "n_rollouts": 15,
+      "search_duration_ms": 321.06390001717955,
+      "used_fallback": false
+    },
+    {
+      "step": 6,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 1.954600098542869,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 7,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 1.7433000029996037,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 8,
+      "extra_budget_ms": 2000.0,
+      "wall_ms": 4.5405999990180135,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 9,
+      "extra_budget_ms": 0.0,
+      "wall_ms": 2.167200087569654,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 10,
+      "extra_budget_ms": 0.0,
+      "wall_ms": 303.3831000793725,
+      "n_rollouts": 13,
+      "search_duration_ms": 300.95339997205883,
+      "used_fallback": false
+    },
+    {
+      "step": 11,
+      "extra_budget_ms": 0.0,
+      "wall_ms": 4.505600081756711,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 12,
+      "extra_budget_ms": 0.0,
+      "wall_ms": 2.221900038421154,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    },
+    {
+      "step": 13,
+      "extra_budget_ms": 0.0,
+      "wall_ms": 3.9954999228939414,
+      "n_rollouts": 0,
+      "search_duration_ms": 0.0,
+      "used_fallback": false
+    }
+  ],
+  "opening_mean_n_rollouts": 4.2727272727272725,
+  "opening_mean_wall_ms": 89.41973637874153,
+  "opening_mean_extra_budget_ms": 1818.1818181818182,
+  "midgame_mean_n_rollouts": 3.25,
+  "midgame_mean_wall_ms": 78.52652503061108,
+  "midgame_mean_extra_budget_ms": 0.0,
+  "n_active_opening": 2,
+  "n_active_midgame": 1,
+  "active_opening_mean_n_rollouts": 23.5,
+  "active_opening_mean_search_ms": 482.73275000974536,
+  "active_midgame_mean_n_rollouts": 13.0,
+  "active_midgame_mean_search_ms": 300.95339997205883,
+  "rewards": [
+    1,
+    -1
+  ],
+  "final_scores": [
+    5303,
+    0
+  ],
+  "total_steps": 238,
+  "game_wall_seconds": 88.64414129999932
+}

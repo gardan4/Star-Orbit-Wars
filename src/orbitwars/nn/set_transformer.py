@@ -49,13 +49,19 @@ N<=300 entities, SAB is faster in wall-clock despite the asymptotic
 disadvantage. Plan explicitly drops ISAB; if later iterations push N
 into the low-thousands, Perceiver-IO is the upgrade path (not ISAB).
 
-**Dependencies:** ``torch`` 2.11.0+cpu is installed. Torch blocks stay
-commented until the feature encoder and action decoder glue lands.
+**Dependencies:** ``torch`` 2.11.0+cpu is installed. Torch blocks are live
+— obs_encode.encode_entities feeds the forward pass; action decode uses
+``ACTION_LOOKUP`` below (same layout as conv_policy). Forward-pass smoke
+tests pin shape + dtype (see tests/test_nn_forward.py).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
@@ -142,14 +148,13 @@ def entity_feature_schema() -> Tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Torch module skeleton — body stubbed, signatures pinned.
-#
-# Fill in when the obs encoder lands. The key design elements:
+# Torch module — live. Key design elements:
 #   * Fourier positional encoding applied to pos_x, pos_y -> 2*n_bands extra
-#     dims, concatenated to the raw feature vector before the stem linear.
-#   * Relative-distance attention bias: compute pairwise euclidean distances
-#     once per forward pass, broadcast-add to attention logits per head
-#     with a learned per-head scale.
+#     dims (sin/cos per band per axis, so 4*n_bands channels total),
+#     concatenated to the raw feature vector before the stem linear.
+#   * Relative-distance attention bias: pairwise euclidean distances
+#     computed once per forward pass, broadcast-added to attention logits
+#     per head with a learned per-head scale.
 #   * Entity mask: standard additive mask (-inf on padding rows) so
 #     padding entities get zero attention weight.
 #   * Two heads:
@@ -159,143 +164,170 @@ def entity_feature_schema() -> Tuple[str, ...]:
 #       - Value: masked-mean pool over valid entities -> MLP -> scalar.
 # ---------------------------------------------------------------------------
 
-# TODO(W4): uncomment and implement.
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-#
-# def _fourier_encode(coords: torch.Tensor, n_bands: int) -> torch.Tensor:
-#     """Standard NeRF-style sinusoidal encoding.
-#
-#     Args:
-#       coords: (..., 2) raw (x, y) in [0, 100].
-#       n_bands: number of frequency bands.
-#
-#     Returns:
-#       (..., 4 * n_bands) tensor of [sin(2^k * x), cos(2^k * x),
-#       sin(2^k * y), cos(2^k * y)] for k=0..n_bands-1. Coords are
-#       normalized to [-1, 1] first so the period of the highest
-#       band covers the whole board.
-#     """
-#     # Normalize [0, 100] -> [-1, 1]
-#     xy = (coords / 50.0) - 1.0
-#     freqs = 2.0 ** torch.arange(n_bands, device=coords.device, dtype=coords.dtype)
-#     # (..., 2, n_bands)
-#     scaled = xy.unsqueeze(-1) * freqs * torch.pi
-#     sin = torch.sin(scaled)
-#     cos = torch.cos(scaled)
-#     # Flatten last two dims
-#     return torch.cat([sin, cos], dim=-1).flatten(-2, -1)
-#
-# class SABWithDistBias(nn.Module):
-#     """Set Attention Block with learned relative-distance bias.
-#
-#     Forward:
-#       1. Multi-head self-attention with mask + per-head distance bias.
-#       2. Residual + LayerNorm.
-#       3. MLP with GELU + residual + LayerNorm.
-#     """
-#     def __init__(self, d_model: int, n_heads: int, mlp_ratio: float,
-#                  dist_bias_init: float):
-#         super().__init__()
-#         self.n_heads = n_heads
-#         self.qkv = nn.Linear(d_model, 3 * d_model)
-#         self.proj = nn.Linear(d_model, d_model)
-#         # Per-head learned scale for the distance bias. Initialized small.
-#         self.dist_scale = nn.Parameter(
-#             torch.full((n_heads,), dist_bias_init)
-#         )
-#         self.ln1 = nn.LayerNorm(d_model)
-#         self.ln2 = nn.LayerNorm(d_model)
-#         hidden = int(d_model * mlp_ratio)
-#         self.mlp = nn.Sequential(
-#             nn.Linear(d_model, hidden),
-#             nn.GELU(),
-#             nn.Linear(hidden, d_model),
-#         )
-#
-#     def forward(self, x: torch.Tensor, pairwise_dist: torch.Tensor,
-#                 mask: torch.Tensor) -> torch.Tensor:
-#         """
-#         Args:
-#           x: (B, N, d_model) entity embeddings.
-#           pairwise_dist: (B, N, N) precomputed euclidean distances.
-#           mask: (B, N) bool; True = valid, False = padding.
-#
-#         Returns:
-#           (B, N, d_model) updated embeddings. Padded rows retain input.
-#         """
-#         B, N, D = x.shape
-#         H = self.n_heads
-#         qkv = self.qkv(x).reshape(B, N, 3, H, D // H).permute(2, 0, 3, 1, 4)
-#         q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, N, d_head)
-#         attn = (q @ k.transpose(-2, -1)) / (D // H) ** 0.5  # (B, H, N, N)
-#         # Add per-head negative-distance bias.
-#         attn = attn - self.dist_scale.view(1, H, 1, 1) * pairwise_dist.unsqueeze(1)
-#         # Mask invalid keys.
-#         mask_kv = mask.view(B, 1, 1, N)  # (B, 1, 1, N)
-#         attn = attn.masked_fill(~mask_kv, float("-inf"))
-#         attn = F.softmax(attn, dim=-1)
-#         out = (attn @ v).transpose(1, 2).reshape(B, N, D)
-#         x = self.ln1(x + self.proj(out))
-#         x = self.ln2(x + self.mlp(x))
-#         return x
-#
-# class SetTransformerPolicy(nn.Module):
-#     """Set-transformer policy + value network.
-#
-#     Inputs are per-entity feature vectors; outputs are per-entity
-#     policy logits and a scalar value. Read owned-planet rows from
-#     the policy output at decode time.
-#     """
-#     def __init__(self, cfg: SetTransformerCfg, n_features: int):
-#         super().__init__()
-#         self.cfg = cfg
-#         # Stem: raw features + Fourier(pos) -> d_model.
-#         fourier_dim = 4 * cfg.n_fourier_bands
-#         self.stem = nn.Linear(n_features + fourier_dim, cfg.d_model)
-#         self.blocks = nn.ModuleList([
-#             SABWithDistBias(cfg.d_model, cfg.n_heads, cfg.mlp_ratio,
-#                             cfg.dist_bias_init)
-#             for _ in range(cfg.n_blocks)
-#         ])
-#         self.policy_head = nn.Linear(cfg.d_model, cfg.n_action_channels)
-#         self.value_head = nn.Sequential(
-#             nn.Linear(cfg.d_model, cfg.value_hidden),
-#             nn.ReLU(),
-#             nn.Linear(cfg.value_hidden, 1),
-#             nn.Tanh(),
-#         )
-#
-#     def forward(self, features: torch.Tensor, mask: torch.Tensor):
-#         """
-#         Args:
-#           features: (B, N, F) entity features. pos_x / pos_y are
-#             at fixed offsets (see entity_feature_schema) and are
-#             used both as raw features AND Fourier-encoded.
-#           mask: (B, N) bool; True = valid.
-#
-#         Returns:
-#           policy_logits: (B, N, n_action_channels) per-entity logits.
-#             Decode by indexing owned-planet rows.
-#           value: (B, 1) scalar in [-1, 1].
-#         """
-#         # Fixed offsets from entity_feature_schema.
-#         POS_X, POS_Y = 7, 8
-#         pos = features[..., [POS_X, POS_Y]]  # (B, N, 2)
-#         fourier = _fourier_encode(pos, self.cfg.n_fourier_bands)
-#         x = torch.cat([features, fourier], dim=-1)
-#         x = self.stem(x)
-#         # Precompute pairwise distance once per forward pass.
-#         pairwise_dist = torch.cdist(pos, pos, p=2)  # (B, N, N)
-#         for block in self.blocks:
-#             x = block(x, pairwise_dist, mask)
-#         policy = self.policy_head(x)
-#         # Masked mean pool for value.
-#         m = mask.float().unsqueeze(-1)  # (B, N, 1)
-#         pooled = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
-#         value = self.value_head(pooled)
-#         return policy, value
+
+def _fourier_encode(coords: torch.Tensor, n_bands: int) -> torch.Tensor:
+    """Standard NeRF-style sinusoidal encoding.
+
+    Args:
+      coords: ``(..., 2)`` raw ``(x, y)`` in ``[0, 100]``.
+      n_bands: number of frequency bands.
+
+    Returns:
+      ``(..., 4 * n_bands)`` tensor of
+      ``[sin(2^k * x), cos(2^k * x), sin(2^k * y), cos(2^k * y)]`` for
+      ``k=0..n_bands-1``. Coords are normalized to ``[-1, 1]`` first so
+      the period of the lowest band covers the whole board.
+    """
+    # Normalize [0, 100] -> [-1, 1]
+    xy = (coords / 50.0) - 1.0
+    freqs = 2.0 ** torch.arange(
+        n_bands, device=coords.device, dtype=coords.dtype
+    )
+    # (..., 2, n_bands)
+    scaled = xy.unsqueeze(-1) * freqs * torch.pi
+    sin = torch.sin(scaled)
+    cos = torch.cos(scaled)
+    # Flatten last two dims: (..., 2, n_bands) * 2 -> (..., 4 * n_bands)
+    return torch.cat([sin, cos], dim=-1).flatten(-2, -1)
+
+
+class SABWithDistBias(nn.Module):
+    """Set Attention Block with learned relative-distance bias.
+
+    Forward:
+      1. Multi-head self-attention with mask + per-head distance bias.
+      2. Residual + LayerNorm.
+      3. MLP with GELU + residual + LayerNorm.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        mlp_ratio: float,
+        dist_bias_init: float,
+    ):
+        super().__init__()
+        self.n_heads = n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(d_model, d_model)
+        # Per-head learned scale for the distance bias. Initialized small.
+        self.dist_scale = nn.Parameter(
+            torch.full((n_heads,), dist_bias_init)
+        )
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        hidden = int(d_model * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        pairwise_dist: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+          x: ``(B, N, d_model)`` entity embeddings.
+          pairwise_dist: ``(B, N, N)`` precomputed euclidean distances.
+          mask: ``(B, N)`` bool; True = valid, False = padding.
+
+        Returns:
+          ``(B, N, d_model)`` updated embeddings. Padded rows retain
+          their residual-pass input (attention over them is masked out).
+        """
+        B, N, D = x.shape
+        H = self.n_heads
+        qkv = self.qkv(x).reshape(B, N, 3, H, D // H).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, N, d_head)
+        attn = (q @ k.transpose(-2, -1)) / (D // H) ** 0.5  # (B, H, N, N)
+        # Add per-head negative-distance bias (nearer entities attend
+        # more strongly because dist_scale is positive after init).
+        attn = attn - self.dist_scale.view(1, H, 1, 1) * pairwise_dist.unsqueeze(1)
+        # Mask invalid keys. Rows corresponding to padding entities are
+        # still computed (they get softmaxed over valid keys only), but
+        # their value outputs are discarded by the downstream masked pool.
+        mask_kv = mask.view(B, 1, 1, N)  # (B, 1, 1, N)
+        attn = attn.masked_fill(~mask_kv, float("-inf"))
+        attn = F.softmax(attn, dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        x = self.ln1(x + self.proj(out))
+        x = self.ln2(x + self.mlp(x))
+        return x
+
+
+class SetTransformerPolicy(nn.Module):
+    """Set-transformer policy + value network.
+
+    Inputs are per-entity feature vectors; outputs are per-entity
+    policy logits and a scalar value. Read owned-planet rows from the
+    policy output at decode time.
+    """
+
+    def __init__(self, cfg: SetTransformerCfg, n_features: int | None = None):
+        super().__init__()
+        self.cfg = cfg
+        if n_features is None:
+            n_features = len(entity_feature_schema())
+        self.n_features = n_features
+        # Stem: raw features + Fourier(pos) -> d_model.
+        fourier_dim = 4 * cfg.n_fourier_bands
+        self.stem = nn.Linear(n_features + fourier_dim, cfg.d_model)
+        self.blocks = nn.ModuleList(
+            [
+                SABWithDistBias(
+                    cfg.d_model,
+                    cfg.n_heads,
+                    cfg.mlp_ratio,
+                    cfg.dist_bias_init,
+                )
+                for _ in range(cfg.n_blocks)
+            ]
+        )
+        self.policy_head = nn.Linear(cfg.d_model, cfg.n_action_channels)
+        self.value_head = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.value_hidden),
+            nn.ReLU(),
+            nn.Linear(cfg.value_hidden, 1),
+            nn.Tanh(),
+        )
+
+    def forward(
+        self, features: torch.Tensor, mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+          features: ``(B, N, F)`` entity features. ``pos_x`` / ``pos_y``
+            are at fixed offsets (see ``entity_feature_schema``) and are
+            used both as raw features AND Fourier-encoded.
+          mask: ``(B, N)`` bool; True = valid.
+
+        Returns:
+          policy_logits: ``(B, N, n_action_channels)`` per-entity logits.
+            Decode by indexing owned-planet rows.
+          value: ``(B, 1)`` scalar in ``[-1, 1]``.
+        """
+        # Fixed offsets from entity_feature_schema — guarded by
+        # tests/test_obs_encode.py::test_pos_feature_offsets_are_what_model_expects.
+        POS_X, POS_Y = 7, 8
+        pos = features[..., [POS_X, POS_Y]]  # (B, N, 2)
+        fourier = _fourier_encode(pos, self.cfg.n_fourier_bands)
+        x = torch.cat([features, fourier], dim=-1)
+        x = self.stem(x)
+        # Precompute pairwise distance once per forward pass.
+        pairwise_dist = torch.cdist(pos, pos, p=2)  # (B, N, N)
+        for block in self.blocks:
+            x = block(x, pairwise_dist, mask)
+        policy = self.policy_head(x)
+        # Masked mean pool for value.
+        m = mask.float().unsqueeze(-1)  # (B, N, 1)
+        pooled = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+        value = self.value_head(pooled)
+        return policy, value
 
 
 def param_count_estimate(cfg: SetTransformerCfg, n_features: int = 19) -> int:

@@ -39,17 +39,20 @@ per-entity-grid conv policies over a dense spatial tensor. The recipe:
   * PFSP opponent pool: ``orbitwars.training.pfsp_pool`` (not yet created).
   * Distillation: ``orbitwars.nn.distill`` (not yet created).
 
-**Dependencies:** ``torch`` 2.11.0+cpu is installed as of W3 tail (CPU-only
-for skeleton work; GPU build deferred to W4 when training starts). The
-torch module definitions below are still commented out — they will be
-enabled once the feature encoder (``features/obs_encode.py``) and the
-action decoder are in place, so the first import error surfaces at the
-plumbing layer rather than at module-load.
+**Dependencies:** ``torch`` 2.11.0+cpu is installed as of W3 tail. CPU-only
+for now; swap to the CUDA build on the local RTX 3070 when PPO training
+starts. The torch modules below are live — obs_encode.py is shipped,
+action decode (ACTION_LOOKUP below + planet_to_grid_coords) is in place,
+and forward-pass smoke tests pin shape + dtype (see tests/test_nn_forward.py).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
@@ -106,66 +109,84 @@ def feature_channels() -> Tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Torch module skeleton — body stubbed, signatures pinned.
-#
-# torch 2.11.0+cpu is installed. The block below stays commented until the
-# surrounding glue (``features/obs_encode.py``, action decoder) lands so we
-# don't carry a half-wired module. W4 switchover: uncomment, replace the
-# ``nn.BatchNorm2d`` with ``nn.GroupNorm`` if batch size < 16 is expected
-# at inference, and instantiate via ``ConvPolicy(ConvPolicyCfg())``.
+# Torch module — live. GroupNorm rather than BatchNorm2d so batch=1 MCTS
+# leaf evaluation does not leak running-mean drift across games. The
+# GroupNorm group count defaults to min(8, C); at C=64 that is 8 groups
+# of 8 channels each — standard choice from Wu & He (2018).
 # ---------------------------------------------------------------------------
 
-# TODO(W4): uncomment and implement.
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-#
-# class ResBlock(nn.Module):
-#     """Standard 3x3 conv residual block, pre-activation variant."""
-#     def __init__(self, c: int):
-#         super().__init__()
-#         self.bn1 = nn.BatchNorm2d(c)
-#         self.conv1 = nn.Conv2d(c, c, 3, padding=1)
-#         self.bn2 = nn.BatchNorm2d(c)
-#         self.conv2 = nn.Conv2d(c, c, 3, padding=1)
-#
-#     def forward(self, x):
-#         y = self.conv1(F.relu(self.bn1(x)))
-#         y = self.conv2(F.relu(self.bn2(y)))
-#         return x + y
-#
-# class ConvPolicy(nn.Module):
-#     """Centralized per-entity-grid conv policy + value network."""
-#     def __init__(self, cfg: ConvPolicyCfg):
-#         super().__init__()
-#         self.cfg = cfg
-#         self.stem = nn.Conv2d(cfg.n_channels, cfg.backbone_channels, 3, padding=1)
-#         self.blocks = nn.ModuleList([ResBlock(cfg.backbone_channels)
-#                                      for _ in range(cfg.n_blocks)])
-#         self.policy_head = nn.Conv2d(cfg.backbone_channels,
-#                                      cfg.n_action_channels, 1)
-#         self.value_head = nn.Sequential(
-#             nn.AdaptiveAvgPool2d(1),
-#             nn.Flatten(),
-#             nn.Linear(cfg.backbone_channels, cfg.value_hidden),
-#             nn.ReLU(),
-#             nn.Linear(cfg.value_hidden, 1),
-#             nn.Tanh(),
-#         )
-#
-#     def forward(self, x):
-#         """Args:
-#           x: (B, n_channels, H, W) input grid.
-#         Returns:
-#           policy_logits: (B, n_action_channels, H, W) per-cell action logits.
-#           value: (B, 1) scalar game value in [-1, 1].
-#         """
-#         h = self.stem(x)
-#         for block in self.blocks:
-#             h = block(h)
-#         policy = self.policy_head(h)
-#         value = self.value_head(h)
-#         return policy, value
+
+class ResBlock(nn.Module):
+    """Standard 3x3 conv residual block, pre-activation variant.
+
+    Uses GroupNorm (not BatchNorm2d) so inference at batch=1 — which is
+    the MCTS leaf-eval regime — is statistically identical to training.
+    BatchNorm2d running-stats drift across PFSP checkpoint boundaries in
+    subtle ways; GroupNorm sidesteps it entirely.
+    """
+
+    def __init__(self, c: int, num_groups: int = 8):
+        super().__init__()
+        groups = min(num_groups, c)
+        self.gn1 = nn.GroupNorm(groups, c)
+        self.conv1 = nn.Conv2d(c, c, 3, padding=1)
+        self.gn2 = nn.GroupNorm(groups, c)
+        self.conv2 = nn.Conv2d(c, c, 3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.conv1(F.relu(self.gn1(x)))
+        y = self.conv2(F.relu(self.gn2(y)))
+        return x + y
+
+
+class ConvPolicy(nn.Module):
+    """Centralized per-entity-grid conv policy + value network.
+
+    Input: ``(B, cfg.n_channels, cfg.grid_h, cfg.grid_w)`` feature grid
+    from ``orbitwars.features.obs_encode.encode_grid``.
+
+    Outputs:
+      * ``policy_logits``: ``(B, cfg.n_action_channels, H, W)`` — read
+        the logits at each owned-planet grid cell via
+        ``planet_to_grid_coords`` then softmax + decode with
+        ``ACTION_LOOKUP``.
+      * ``value``: ``(B, 1)`` scalar in ``[-1, 1]``.
+    """
+
+    def __init__(self, cfg: ConvPolicyCfg):
+        super().__init__()
+        self.cfg = cfg
+        self.stem = nn.Conv2d(
+            cfg.n_channels, cfg.backbone_channels, 3, padding=1
+        )
+        self.blocks = nn.ModuleList(
+            [ResBlock(cfg.backbone_channels) for _ in range(cfg.n_blocks)]
+        )
+        self.policy_head = nn.Conv2d(
+            cfg.backbone_channels, cfg.n_action_channels, 1
+        )
+        self.value_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(cfg.backbone_channels, cfg.value_hidden),
+            nn.ReLU(),
+            nn.Linear(cfg.value_hidden, 1),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Args:
+          x: ``(B, cfg.n_channels, cfg.grid_h, cfg.grid_w)`` input grid.
+
+        Returns:
+          policy_logits, value — see class docstring for shapes.
+        """
+        h = self.stem(x)
+        for block in self.blocks:
+            h = block(h)
+        policy = self.policy_head(h)
+        value = self.value_head(h)
+        return policy, value
 
 
 def param_count_estimate(cfg: ConvPolicyCfg) -> int:

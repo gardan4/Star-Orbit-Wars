@@ -1,0 +1,140 @@
+{
+  "args": {
+    "weights_a": "runs/turbo_v2_20260424.json",
+    "weights_b": "defaults",
+    "label_a": "turbo_v2",
+    "label_b": "defaults",
+    "pool": "w2",
+    "games_per_opp": 10,
+    "step_timeout": 1.0,
+    "seed": 0,
+    "workers": 7,
+    "out": "runs/compare_turbo_v2_vs_defaults.json"
+  },
+  "a": {
+    "label": "turbo_v2",
+    "win_rate": 0.8333333333333334,
+    "hard_win_rate": 0.8333333333333334,
+    "n_games": 90,
+    "wall_seconds": 196.1266908000689,
+    "weights": {
+      "w_production": 19.440082334447652,
+      "w_ships_cost": 0.13802833948284388,
+      "w_distance_cost": 0.09539055917412043,
+      "w_travel_cost": 0.13828593213111162,
+      "mult_neutral": 1.36488540424034,
+      "mult_enemy": 2.263682206347585,
+      "mult_comet": 1.7020629160106184,
+      "mult_reinforce_ally": 0.2916624844074249,
+      "ships_safety_margin": 3.350880299694836,
+      "min_launch_size": 29.121542111970484,
+      "max_launch_fraction": 0.6944328492507339,
+      "expand_cooldown_turns": 3.9825727604329586,
+      "keep_reserve_ships": 5.717945722863078,
+      "agg_early_game": 1.4049309324473143,
+      "early_game_cutoff_turn": 99.72046632319689,
+      "sun_avoidance_epsilon": 0.07407572213560343,
+      "comet_max_time_mismatch": 3.9275696966797113,
+      "expand_bias": 1.414374615997076
+    }
+  },
+  "b": {
+    "label": "defaults",
+    "win_rate": 0.6,
+    "hard_win_rate": 0.6,
+    "n_games": 90,
+    "wall_seconds": 264.1758437999524,
+    "weights": {
+      "w_production": 5.0,
+      "w_ships_cost": 0.02,
+      "w_distance_cost": 0.05,
+      "w_travel_cost": 0.3,
+      "mult_neutral": 1.0,
+      "mult_enemy": 1.8,
+      "mult_comet": 1.5,
+      "mult_reinforce_ally": 0.0,
+      "ships_safety_margin": 1.0,
+      "min_launch_size": 20.0,
+      "max_launch_fraction": 0.8,
+      "expand_cooldown_turns": 0.0,
+      "keep_reserve_ships": 0.0,
+      "agg_early_game": 1.0,
+      "early_game_cutoff_turn": 100.0,
+      "sun_avoidance_epsilon": 0.02,
+      "comet_max_time_mismatch": 1.5,
+      "expand_bias": 0.5
+    }
+  },
+  "delta_win_rate": 0.2333333333333334,
+  "ci95": [
+    0.1061615529400596,
+    0.3605051137266072
+  ],
+  "paired_win_rate_for_a": 0.6166666666666667,
+  "paired_se": 0.05124981180332805,
+  "per_opp": {
+    "comet_camper": {
+      "a_wr": 0.4,
+      "a_n": 10,
+      "b_wr": 0.1,
+      "b_n": 10,
+      "delta": 0.30000000000000004
+    },
+    "defender": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "economy": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 0.6,
+      "b_n": 10,
+      "delta": 0.4
+    },
+    "harasser": {
+      "a_wr": 0.7,
+      "a_n": 10,
+      "b_wr": 0.3,
+      "b_n": 10,
+      "delta": 0.39999999999999997
+    },
+    "opportunist": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 0.3,
+      "b_n": 10,
+      "delta": 0.7
+    },
+    "random": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "rusher": {
+      "a_wr": 0.4,
+      "a_n": 10,
+      "b_wr": 0.5,
+      "b_n": 10,
+      "delta": -0.09999999999999998
+    },
+    "starter": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 0.7,
+      "b_n": 10,
+      "delta": 0.30000000000000004
+    },
+    "turtler": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 0.9,
+      "b_n": 10,
+      "delta": 0.09999999999999998
+    }
+  }
+}

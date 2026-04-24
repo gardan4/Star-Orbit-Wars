@@ -1,0 +1,430 @@
+{
+  "weights": {
+    "w_production": 5.0,
+    "w_ships_cost": 0.02,
+    "w_distance_cost": 0.05,
+    "w_travel_cost": 0.3,
+    "mult_neutral": 1.0,
+    "mult_enemy": 1.8,
+    "mult_comet": 1.5,
+    "mult_reinforce_ally": 0.0,
+    "ships_safety_margin": 1.0,
+    "min_launch_size": 20.0,
+    "max_launch_fraction": 0.8,
+    "expand_cooldown_turns": 0.0,
+    "keep_reserve_ships": 0.0,
+    "agg_early_game": 1.0,
+    "early_game_cutoff_turn": 100.0,
+    "sun_avoidance_epsilon": 0.02,
+    "comet_max_time_mismatch": 1.5,
+    "expand_bias": 0.5
+  },
+  "pool": "w2",
+  "games_per_opp": 5,
+  "step_timeout": 1.0,
+  "seed": 0,
+  "win_rate": 0.6666666666666666,
+  "hard_win_rate": 0.6666666666666666,
+  "n_games": 45,
+  "wall_seconds": 593.8377752000233,
+  "by_opponent": {
+    "starter": [
+      0.8,
+      5
+    ],
+    "random": [
+      1.0,
+      5
+    ],
+    "rusher": [
+      0.4,
+      5
+    ],
+    "turtler": [
+      1.0,
+      5
+    ],
+    "economy": [
+      0.8,
+      5
+    ],
+    "harasser": [
+      0.6,
+      5
+    ],
+    "comet_camper": [
+      0.2,
+      5
+    ],
+    "opportunist": [
+      0.2,
+      5
+    ],
+    "defender": [
+      1.0,
+      5
+    ]
+  },
+  "games": [
+    {
+      "opp_name": "starter",
+      "seed": 0,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 181,
+      "wall_seconds": 4.798921000037808
+    },
+    {
+      "opp_name": "starter",
+      "seed": 1,
+      "hero_seat": 1,
+      "reward": -1,
+      "steps": 499,
+      "wall_seconds": 16.945375900017098
+    },
+    {
+      "opp_name": "starter",
+      "seed": 2,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 283,
+      "wall_seconds": 8.375935600022785
+    },
+    {
+      "opp_name": "starter",
+      "seed": 3,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 105,
+      "wall_seconds": 2.0765771999722347
+    },
+    {
+      "opp_name": "starter",
+      "seed": 4,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 175,
+      "wall_seconds": 6.077019699965604
+    },
+    {
+      "opp_name": "random",
+      "seed": 997,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 205,
+      "wall_seconds": 9.69108719995711
+    },
+    {
+      "opp_name": "random",
+      "seed": 998,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 147,
+      "wall_seconds": 4.888729600002989
+    },
+    {
+      "opp_name": "random",
+      "seed": 999,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 135,
+      "wall_seconds": 5.679436599952169
+    },
+    {
+      "opp_name": "random",
+      "seed": 1000,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 292,
+      "wall_seconds": 10.74433419998968
+    },
+    {
+      "opp_name": "random",
+      "seed": 1001,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 95,
+      "wall_seconds": 2.791130499972496
+    },
+    {
+      "opp_name": "rusher",
+      "seed": 1994,
+      "hero_seat": 0,
+      "reward": -1,
+      "steps": 141,
+      "wall_seconds": 7.801213200029451
+    },
+    {
+      "opp_name": "rusher",
+      "seed": 1995,
+      "hero_seat": 1,
+      "reward": -1,
+      "steps": 164,
+      "wall_seconds": 6.44157330004964
+    },
+    {
+      "opp_name": "rusher",
+      "seed": 1996,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 267,
+      "wall_seconds": 11.545727299991995
+    },
+    {
+      "opp_name": "rusher",
+      "seed": 1997,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 225,
+      "wall_seconds": 8.138292599993292
+    },
+    {
+      "opp_name": "rusher",
+      "seed": 1998,
+      "hero_seat": 0,
+      "reward": -1,
+      "steps": 158,
+      "wall_seconds": 6.304691199969966
+    },
+    {
+      "opp_name": "turtler",
+      "seed": 2991,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 282,
+      "wall_seconds": 12.140152400010265
+    },
+    {
+      "opp_name": "turtler",
+      "seed": 2992,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 174,
+      "wall_seconds": 6.504340500046965
+    },
+    {
+      "opp_name": "turtler",
+      "seed": 2993,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 178,
+      "wall_seconds": 6.322174199973233
+    },
+    {
+      "opp_name": "turtler",
+      "seed": 2994,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 188,
+      "wall_seconds": 8.197655299969483
+    },
+    {
+      "opp_name": "turtler",
+      "seed": 2995,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 182,
+      "wall_seconds": 8.75556909997249
+    },
+    {
+      "opp_name": "economy",
+      "seed": 3988,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 159,
+      "wall_seconds": 6.338629800011404
+    },
+    {
+      "opp_name": "economy",
+      "seed": 3989,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 165,
+      "wall_seconds": 9.399920900003053
+    },
+    {
+      "opp_name": "economy",
+      "seed": 3990,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 337,
+      "wall_seconds": 18.420400300004985
+    },
+    {
+      "opp_name": "economy",
+      "seed": 3991,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 390,
+      "wall_seconds": 23.620124799956102
+    },
+    {
+      "opp_name": "economy",
+      "seed": 3992,
+      "hero_seat": 0,
+      "reward": -1,
+      "steps": 306,
+      "wall_seconds": 19.55857539997669
+    },
+    {
+      "opp_name": "harasser",
+      "seed": 4985,
+      "hero_seat": 0,
+      "reward": -1,
+      "steps": 499,
+      "wall_seconds": 46.95347780000884
+    },
+    {
+      "opp_name": "harasser",
+      "seed": 4986,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 174,
+      "wall_seconds": 9.755832199996803
+    },
+    {
+      "opp_name": "harasser",
+      "seed": 4987,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 166,
+      "wall_seconds": 10.802574699977413
+    },
+    {
+      "opp_name": "harasser",
+      "seed": 4988,
+      "hero_seat": 1,
+      "reward": -1,
+      "steps": 222,
+      "wall_seconds": 20.59831969998777
+    },
+    {
+      "opp_name": "harasser",
+      "seed": 4989,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 171,
+      "wall_seconds": 12.914283299993258
+    },
+    {
+      "opp_name": "comet_camper",
+      "seed": 5982,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 170,
+      "wall_seconds": 11.034470300015528
+    },
+    {
+      "opp_name": "comet_camper",
+      "seed": 5983,
+      "hero_seat": 1,
+      "reward": -1,
+      "steps": 289,
+      "wall_seconds": 22.52647949999664
+    },
+    {
+      "opp_name": "comet_camper",
+      "seed": 5984,
+      "hero_seat": 0,
+      "reward": -1,
+      "steps": 183,
+      "wall_seconds": 11.641729899973143
+    },
+    {
+      "opp_name": "comet_camper",
+      "seed": 5985,
+      "hero_seat": 1,
+      "reward": -1,
+      "steps": 185,
+      "wall_seconds": 10.715537399984896
+    },
+    {
+      "opp_name": "comet_camper",
+      "seed": 5986,
+      "hero_seat": 0,
+      "reward": -1,
+      "steps": 247,
+      "wall_seconds": 15.907780000008643
+    },
+    {
+      "opp_name": "opportunist",
+      "seed": 6979,
+      "hero_seat": 0,
+      "reward": -1,
+      "steps": 275,
+      "wall_seconds": 15.708080199954566
+    },
+    {
+      "opp_name": "opportunist",
+      "seed": 6980,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 283,
+      "wall_seconds": 17.379356099991128
+    },
+    {
+      "opp_name": "opportunist",
+      "seed": 6981,
+      "hero_seat": 0,
+      "reward": -1,
+      "steps": 499,
+      "wall_seconds": 36.03432689997135
+    },
+    {
+      "opp_name": "opportunist",
+      "seed": 6982,
+      "hero_seat": 1,
+      "reward": -1,
+      "steps": 499,
+      "wall_seconds": 36.806100100046024
+    },
+    {
+      "opp_name": "opportunist",
+      "seed": 6983,
+      "hero_seat": 0,
+      "reward": -1,
+      "steps": 499,
+      "wall_seconds": 30.199475200031884
+    },
+    {
+      "opp_name": "defender",
+      "seed": 7976,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 171,
+      "wall_seconds": 10.376919300004374
+    },
+    {
+      "opp_name": "defender",
+      "seed": 7977,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 274,
+      "wall_seconds": 15.017344899999443
+    },
+    {
+      "opp_name": "defender",
+      "seed": 7978,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 145,
+      "wall_seconds": 7.602536599966697
+    },
+    {
+      "opp_name": "defender",
+      "seed": 7979,
+      "hero_seat": 1,
+      "reward": 1,
+      "steps": 170,
+      "wall_seconds": 9.129631599993445
+    },
+    {
+      "opp_name": "defender",
+      "seed": 7980,
+      "hero_seat": 0,
+      "reward": 1,
+      "steps": 167,
+      "wall_seconds": 8.298068400006741
+    }
+  ]
+}

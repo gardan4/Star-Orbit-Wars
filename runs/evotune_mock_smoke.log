@@ -1,0 +1,7 @@
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+
+=== Best of run: cid=b5a272a333bf score=1.000 gen=0 ===
+Source written to: runs\evotune_20260424_153758_best.py
+Summary written to: runs\evotune_20260424_153758_summary.json
+Full log: runs\evotune_20260424_153758.jsonl

@@ -787,3 +787,132 @@ def test_gumbel_root_search_decoupled_deduplicates_opp_wires(monkeypatch):
     res = search.search(obs, my_player=0)
     assert res is not None
     assert len(dec_calls) == 0
+
+
+# ---- sim_move_variant dispatch (W4 Exp3 A/B infrastructure) ------------
+
+def test_gumbel_root_search_sim_move_variant_exp3_dispatches_to_exp3(monkeypatch):
+    """With ``sim_move_variant="exp3"`` and a valid opp builder, search
+    MUST call ``decoupled_exp3_root`` and MUST NOT call
+    ``decoupled_ucb_root``. Mirrors the ucb-default test above and is
+    the core W4 wiring gate: a regression here silently unships the
+    A/B."""
+    import orbitwars.mcts.sim_move as sim_move_mod
+
+    real_exp3 = sim_move_mod.decoupled_exp3_root
+    exp3_calls = []
+    ucb_calls = []
+
+    def spy_exp3(*args, **kwargs):
+        exp3_calls.append((args, kwargs))
+        return real_exp3(*args, **kwargs)
+
+    def spy_ucb(*args, **kwargs):
+        ucb_calls.append(1)
+        raise AssertionError("ucb path should not fire when variant=exp3")
+
+    monkeypatch.setattr(sim_move_mod, "decoupled_exp3_root", spy_exp3)
+    monkeypatch.setattr(sim_move_mod, "decoupled_ucb_root", spy_ucb)
+
+    def opp_builder(obs_, opp_player):
+        return [[], [[1, 0.0, 5]]]
+
+    obs = _mk_obs()
+    search = GumbelRootSearch(
+        gumbel_cfg=GumbelConfig(
+            num_candidates=3, total_sims=6, rollout_depth=1,
+            hard_deadline_ms=2000.0,
+            use_decoupled_sim_move=True,
+            sim_move_variant="exp3",
+            exp3_eta=0.5,
+            num_opp_candidates=2,
+        ),
+        rng_seed=0,
+        opp_candidate_builder=opp_builder,
+    )
+    res = search.search(obs, my_player=0)
+    assert res is not None
+    assert len(exp3_calls) == 1, (
+        f"decoupled_exp3_root should have fired once; got {len(exp3_calls)}"
+    )
+    assert len(ucb_calls) == 0
+    # eta is propagated through the config, not lost.
+    _, kwargs = exp3_calls[0]
+    assert kwargs.get("eta") == 0.5
+
+
+def test_gumbel_root_search_sim_move_variant_ucb_is_default(monkeypatch):
+    """With no explicit variant, UCB is used. Guards against
+    default-drift from the W3 shipped configuration."""
+    import orbitwars.mcts.sim_move as sim_move_mod
+
+    real_ucb = sim_move_mod.decoupled_ucb_root
+    ucb_calls = []
+    exp3_calls = []
+
+    def spy_ucb(*args, **kwargs):
+        ucb_calls.append(1)
+        return real_ucb(*args, **kwargs)
+
+    def spy_exp3(*args, **kwargs):
+        exp3_calls.append(1)
+        raise AssertionError("exp3 path should not fire by default")
+
+    monkeypatch.setattr(sim_move_mod, "decoupled_ucb_root", spy_ucb)
+    monkeypatch.setattr(sim_move_mod, "decoupled_exp3_root", spy_exp3)
+
+    def opp_builder(obs_, opp_player):
+        return [[], [[1, 0.0, 5]]]
+
+    obs = _mk_obs()
+    cfg = GumbelConfig(
+        num_candidates=3, total_sims=6, rollout_depth=1,
+        hard_deadline_ms=2000.0,
+        use_decoupled_sim_move=True,
+        num_opp_candidates=2,
+    )
+    # Explicitly assert the default hasn't drifted.
+    assert cfg.sim_move_variant == "ucb"
+    search = GumbelRootSearch(
+        gumbel_cfg=cfg, rng_seed=0, opp_candidate_builder=opp_builder,
+    )
+    res = search.search(obs, my_player=0)
+    assert res is not None
+    assert len(ucb_calls) == 1
+    assert len(exp3_calls) == 0
+
+
+def test_gumbel_root_search_unknown_variant_warns_and_falls_back(monkeypatch, capsys):
+    """A typo in sim_move_variant must not crash mid-game — fall back
+    to UCB and log once. This is a play-time safety net, not a happy
+    path; callers should be warned."""
+    import orbitwars.mcts.sim_move as sim_move_mod
+
+    real_ucb = sim_move_mod.decoupled_ucb_root
+    ucb_calls = []
+
+    def spy_ucb(*args, **kwargs):
+        ucb_calls.append(1)
+        return real_ucb(*args, **kwargs)
+
+    monkeypatch.setattr(sim_move_mod, "decoupled_ucb_root", spy_ucb)
+
+    def opp_builder(obs_, opp_player):
+        return [[], [[1, 0.0, 5]]]
+
+    obs = _mk_obs()
+    cfg = GumbelConfig(
+        num_candidates=3, total_sims=6, rollout_depth=1,
+        hard_deadline_ms=2000.0,
+        use_decoupled_sim_move=True,
+        sim_move_variant="regret_matching_plus",  # typo / unknown
+        num_opp_candidates=2,
+    )
+    search = GumbelRootSearch(
+        gumbel_cfg=cfg, rng_seed=0, opp_candidate_builder=opp_builder,
+    )
+    res = search.search(obs, my_player=0)
+    assert res is not None
+    assert len(ucb_calls) == 1
+    captured = capsys.readouterr()
+    assert "unknown sim_move_variant" in captured.out

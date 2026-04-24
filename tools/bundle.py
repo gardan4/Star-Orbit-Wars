@@ -131,7 +131,11 @@ from __future__ import annotations
 """
 
 
-def bundle_bot(bot_name: str, out_path: Path) -> None:
+def bundle_bot(
+    bot_name: str,
+    out_path: Path,
+    weights_override: Dict[str, float] | None = None,
+) -> None:
     if bot_name not in BOT_RECIPES:
         raise SystemExit(f"Unknown bot '{bot_name}'. Known: {list(BOT_RECIPES)}")
     modules, agent_factory = BOT_RECIPES[bot_name]
@@ -147,6 +151,23 @@ def bundle_bot(bot_name: str, out_path: Path) -> None:
         parts.append(f"# --- inlined: orbitwars/{mod.replace('.', '/')}.py ---\n")
         parts.append(src.rstrip() + "\n")
         parts.append("\n")
+
+    # Optional weights override — emitted BEFORE the agent factory so
+    # the dict is patched in place before HeuristicAgent reads it. We
+    # update-in-place rather than reassign so any earlier reference
+    # (e.g. archetype weight builders in opponent/archetypes.py) still
+    # points at the live dict.
+    if weights_override:
+        parts.append("\n# --- tuned weights override ---\n")
+        parts.append("# Applied by tools/bundle.py --weights-json at build time.\n")
+        # Emit as a literal dict so the bundle stays standalone (no JSON
+        # loading at Kaggle boot — one less moving piece).
+        items = ",\n    ".join(
+            f"{k!r}: {float(v)!r}" for k, v in sorted(weights_override.items())
+        )
+        parts.append(
+            f"HEURISTIC_WEIGHTS.update({{\n    {items},\n}})\n"
+        )
 
     # Agent entry point
     parts.append("\n# --- agent entry point ---\n")
@@ -193,12 +214,56 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bot", required=True, choices=list(BOT_RECIPES))
     ap.add_argument("--out", required=True, help="Output .py path")
+    ap.add_argument(
+        "--weights-json",
+        default=None,
+        help=(
+            "Path to a JSON file with tuned heuristic weights. Accepts "
+            "either a top-level dict of {weight_name: value} OR one of the "
+            "TuRBO output shapes ({'best_weights': {...}} / "
+            "{'best_point': {...}} / {'best': {...}}). Emits a "
+            "HEURISTIC_WEIGHTS.update({...}) line after the heuristic "
+            "module so the bundled agent uses the tuned values."
+        ),
+    )
     ap.add_argument("--smoke-test", action="store_true",
                     help="Run a single game against 'random' to verify the bundle works")
     args = ap.parse_args()
 
+    weights_override: Dict[str, float] | None = None
+    if args.weights_json:
+        import json
+        raw = json.loads(Path(args.weights_json).read_text(encoding="utf-8"))
+        unwrapped = False
+        for key in ("best_weights", "best_point", "best", "weights"):
+            if isinstance(raw, dict) and key in raw and isinstance(raw[key], dict):
+                raw = raw[key]
+                unwrapped = True
+                break
+        # TuRBO runner shape: {best_index, trials: [{trial, weights, ...}]}.
+        # Pull the best trial's weights dict.
+        if (
+            not unwrapped
+            and isinstance(raw, dict)
+            and "best_index" in raw
+            and isinstance(raw.get("trials"), list)
+            and raw["best_index"] is not None
+        ):
+            best_i = int(raw["best_index"])
+            for tr in raw["trials"]:
+                if int(tr.get("trial", -1)) == best_i and isinstance(tr.get("weights"), dict):
+                    raw = tr["weights"]
+                    unwrapped = True
+                    break
+        if not isinstance(raw, dict):
+            raise SystemExit(
+                f"--weights-json: couldn't find a weights dict in {args.weights_json!r}"
+            )
+        weights_override = {k: float(v) for k, v in raw.items()}
+        print(f"weights override: {len(weights_override)} keys from {args.weights_json}")
+
     out = Path(args.out)
-    bundle_bot(args.bot, out)
+    bundle_bot(args.bot, out, weights_override=weights_override)
     print(f"Bundled {args.bot} -> {out} ({out.stat().st_size} bytes)")
 
     if args.smoke_test:
