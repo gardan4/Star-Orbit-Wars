@@ -1,0 +1,985 @@
+{
+  "strategy": "AxTurbo",
+  "n_trials": 60,
+  "started_at": 1777111235.4704669,
+  "finished_at": 1777112861.0101156,
+  "best_index": 13,
+  "best_win_rate": 0.9333333333333333,
+  "trials": [
+    {
+      "trial": 0,
+      "weights": {
+        "w_production": 32.21553236246109,
+        "w_ships_cost": 0.4844324290752411,
+        "w_distance_cost": 0.0059285335242748255,
+        "w_travel_cost": 1.9200958013534546,
+        "mult_neutral": 3.861677825450897,
+        "mult_enemy": 3.1023060381412506,
+        "mult_comet": 7.4564783573150635,
+        "mult_reinforce_ally": 0.23460912704467773,
+        "ships_safety_margin": 2.4360836148262024,
+        "min_launch_size": 41.52226686477661,
+        "max_launch_fraction": 0.6795961707830429,
+        "expand_cooldown_turns": 0.20066428184509277,
+        "keep_reserve_ships": 1.7041808366775513,
+        "agg_early_game": 0.9411785125732421,
+        "early_game_cutoff_turn": 234.8227322101593,
+        "sun_avoidance_epsilon": 0.0057257253676652915,
+        "comet_max_time_mismatch": 7.522779881954193,
+        "expand_bias": 0.7563326358795166
+      },
+      "win_rate": 0.5555555555555556,
+      "hard_win_rate": 0.5555555555555556,
+      "n_games": 45,
+      "fitness_wall_seconds": 137.73339369997848,
+      "by_opponent": {
+        "starter": [
+          0.8,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.0,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          0.2,
+          5
+        ],
+        "harasser": [
+          0.2,
+          5
+        ],
+        "comet_camper": [
+          0.0,
+          5
+        ],
+        "opportunist": [
+          0.8,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 1,
+      "weights": {
+        "w_production": 17.56231175735593,
+        "w_ships_cost": 0.007210693322122097,
+        "w_distance_cost": 0.29735595686361194,
+        "w_travel_cost": 0.6728757340461016,
+        "mult_neutral": 1.1589018614031374,
+        "mult_enemy": 6.128897740505636,
+        "mult_comet": 1.8177429661154747,
+        "mult_reinforce_ally": 0.3402391201816499,
+        "ships_safety_margin": 0.32523900736123323,
+        "min_launch_size": 18.354844450950623,
+        "max_launch_fraction": 0.7709773215465248,
+        "expand_cooldown_turns": 7.753283604979515,
+        "keep_reserve_ships": 1.252013853751123,
+        "agg_early_game": 1.895139452069998,
+        "early_game_cutoff_turn": 75.18137684091926,
+        "sun_avoidance_epsilon": 0.034627097658813,
+        "comet_max_time_mismatch": 5.32173069100827,
+        "expand_bias": 1.1548968441784382
+      },
+      "win_rate": 0.8444444444444444,
+      "hard_win_rate": 0.8444444444444444,
+      "n_games": 45,
+      "fitness_wall_seconds": 58.17386660003103,
+      "by_opponent": {
+        "starter": [
+          1.0,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.8,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          0.6,
+          5
+        ],
+        "harasser": [
+          1.0,
+          5
+        ],
+        "comet_camper": [
+          0.4,
+          5
+        ],
+        "opportunist": [
+          0.8,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 2,
+      "weights": {
+        "w_production": 9.350768765434623,
+        "w_ships_cost": 0.27321326034143567,
+        "w_distance_cost": 0.08840177357196807,
+        "w_travel_cost": 2.938990417867899,
+        "mult_neutral": 1.9175295494496822,
+        "mult_enemy": 7.866393756121397,
+        "mult_comet": 9.555662262253463,
+        "mult_reinforce_ally": 0.4643058371730149,
+        "ships_safety_margin": 1.079058950766921,
+        "min_launch_size": 23.825029097497463,
+        "max_launch_fraction": 0.9227517512626946,
+        "expand_cooldown_turns": 4.415313683450222,
+        "keep_reserve_ships": 2.7177677722647786,
+        "agg_early_game": 0.7432200504466892,
+        "early_game_cutoff_turn": 56.25358885154128,
+        "sun_avoidance_epsilon": 0.02240455122664571,
+        "comet_max_time_mismatch": 1.5489146951586008,
+        "expand_bias": 0.1347256600856781
+      },
+      "win_rate": 0.7333333333333333,
+      "hard_win_rate": 0.7333333333333333,
+      "n_games": 45,
+      "fitness_wall_seconds": 130.39676909998525,
+      "by_opponent": {
+        "starter": [
+          0.8,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.8,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          1.0,
+          5
+        ],
+        "harasser": [
+          0.4,
+          5
+        ],
+        "comet_camper": [
+          0.0,
+          5
+        ],
+        "opportunist": [
+          0.6,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 3,
+      "weights": {
+        "w_production": 22.94388871639967,
+        "w_ships_cost": 0.2193909389898181,
+        "w_distance_cost": 0.21078565595671533,
+        "w_travel_cost": 1.1305466126650572,
+        "mult_neutral": 2.7216254505328834,
+        "mult_enemy": 4.704652884043753,
+        "mult_comet": 3.9432815611362457,
+        "mult_reinforce_ally": 0.11636362131685019,
+        "ships_safety_margin": 1.596204360947013,
+        "min_launch_size": 35.74000272899866,
+        "max_launch_fraction": 0.518031348939985,
+        "expand_cooldown_turns": 3.6009589806199074,
+        "keep_reserve_ships": 0.3317993385717273,
+        "agg_early_game": 1.9549265233799817,
+        "early_game_cutoff_turn": 215.94817014411092,
+        "sun_avoidance_epsilon": 0.04349110275506973,
+        "comet_max_time_mismatch": 8.206153756938875,
+        "expand_bias": 1.7666809782385826
+      },
+      "win_rate": 0.6888888888888889,
+      "hard_win_rate": 0.6888888888888889,
+      "n_games": 45,
+      "fitness_wall_seconds": 94.75165130000096,
+      "by_opponent": {
+        "starter": [
+          0.8,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.0,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          0.6,
+          5
+        ],
+        "harasser": [
+          0.6,
+          5
+        ],
+        "comet_camper": [
+          0.4,
+          5
+        ],
+        "opportunist": [
+          0.8,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 4,
+      "weights": {
+        "w_production": 30.377286095172167,
+        "w_ships_cost": 0.3547195643186569,
+        "w_distance_cost": 0.24950012918561695,
+        "w_travel_cost": 1.1048350548371673,
+        "mult_neutral": 2.2543962975032628,
+        "mult_enemy": 1.9919733125716448,
+        "mult_comet": 7.752765885554254,
+        "mult_reinforce_ally": 0.3816657941788435,
+        "ships_safety_margin": 1.1446132091805339,
+        "min_launch_size": 12.45472889393568,
+        "max_launch_fraction": 0.9556788047775626,
+        "expand_cooldown_turns": 2.388143427670002,
+        "keep_reserve_ships": 2.597543162293732,
+        "agg_early_game": 1.4783531760796906,
+        "early_game_cutoff_turn": 168.7028305605054,
+        "sun_avoidance_epsilon": 0.045805975515395406,
+        "comet_max_time_mismatch": 9.505576979368925,
+        "expand_bias": 1.604867471382022
+      },
+      "win_rate": 0.6666666666666666,
+      "hard_win_rate": 0.6666666666666666,
+      "n_games": 45,
+      "fitness_wall_seconds": 194.8262742999941,
+      "by_opponent": {
+        "starter": [
+          0.8,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.4,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          0.8,
+          5
+        ],
+        "harasser": [
+          0.4,
+          5
+        ],
+        "comet_camper": [
+          0.0,
+          5
+        ],
+        "opportunist": [
+          0.6,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 5,
+      "weights": {
+        "w_production": 10.118625359609723,
+        "w_ships_cost": 0.15267432061955333,
+        "w_distance_cost": 0.05197161370888352,
+        "w_travel_cost": 2.3081099102273583,
+        "mult_neutral": 1.4503054032102227,
+        "mult_enemy": 7.401825926266611,
+        "mult_comet": 4.407975647598505,
+        "mult_reinforce_ally": 0.04154060548171401,
+        "ships_safety_margin": 2.1275739250704646,
+        "min_launch_size": 48.039143569767475,
+        "max_launch_fraction": 0.6094300206750631,
+        "expand_cooldown_turns": 5.565747492015362,
+        "keep_reserve_ships": 0.4461816502735019,
+        "agg_early_game": 1.349505295418203,
+        "early_game_cutoff_turn": 9.02656875550747,
+        "sun_avoidance_epsilon": 0.0137912318110466,
+        "comet_max_time_mismatch": 2.7769310930743814,
+        "expand_bias": 0.487805237993598
+      },
+      "win_rate": 0.5555555555555556,
+      "hard_win_rate": 0.5555555555555556,
+      "n_games": 45,
+      "fitness_wall_seconds": 122.07245720003266,
+      "by_opponent": {
+        "starter": [
+          0.8,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.0,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          0.0,
+          5
+        ],
+        "harasser": [
+          0.4,
+          5
+        ],
+        "comet_camper": [
+          0.0,
+          5
+        ],
+        "opportunist": [
+          0.8,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 6,
+      "weights": {
+        "w_production": 18.2962554320693,
+        "w_ships_cost": 0.3876405172049999,
+        "w_distance_cost": 0.18109389524906874,
+        "w_travel_cost": 0.08594052772969007,
+        "mult_neutral": 0.747644645627588,
+        "mult_enemy": 9.040395502001047,
+        "mult_comet": 5.673437057994306,
+        "mult_reinforce_ally": 0.16954337479546666,
+        "ships_safety_margin": 2.8400167040526867,
+        "min_launch_size": 34.756573513150215,
+        "max_launch_fraction": 0.7085597151890397,
+        "expand_cooldown_turns": 6.227815464138985,
+        "keep_reserve_ships": 2.0060517797246575,
+        "agg_early_game": 2.3630729407072066,
+        "early_game_cutoff_turn": 140.1338640600443,
+        "sun_avoidance_epsilon": 0.02604983923956752,
+        "comet_max_time_mismatch": 3.5306692346930504,
+        "expand_bias": 1.4735563714057207
+      },
+      "win_rate": 0.7111111111111111,
+      "hard_win_rate": 0.7111111111111111,
+      "n_games": 45,
+      "fitness_wall_seconds": 62.975065600010566,
+      "by_opponent": {
+        "starter": [
+          0.8,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.6,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          0.6,
+          5
+        ],
+        "harasser": [
+          0.6,
+          5
+        ],
+        "comet_camper": [
+          0.0,
+          5
+        ],
+        "opportunist": [
+          0.8,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 7,
+      "weights": {
+        "w_production": 39.68230723403394,
+        "w_ships_cost": 0.12071445537731051,
+        "w_distance_cost": 0.11510892072692513,
+        "w_travel_cost": 1.8504390316084027,
+        "mult_neutral": 3.4504188429564238,
+        "mult_enemy": 3.763563440181315,
+        "mult_comet": 2.267111446708441,
+        "mult_reinforce_ally": 0.2517327731475234,
+        "ships_safety_margin": 0.4508468471467495,
+        "min_launch_size": 25.424607545137405,
+        "max_launch_fraction": 0.8662251085042953,
+        "expand_cooldown_turns": 1.7885065376758575,
+        "keep_reserve_ships": 0.9442777996882796,
+        "agg_early_game": 0.3263455852866173,
+        "early_game_cutoff_turn": 299.79354087263346,
+        "sun_avoidance_epsilon": 0.008101430349051952,
+        "comet_max_time_mismatch": 5.66250026691705,
+        "expand_bias": 0.6211343053728342
+      },
+      "win_rate": 0.8,
+      "hard_win_rate": 0.8,
+      "n_games": 45,
+      "fitness_wall_seconds": 117.51641359995119,
+      "by_opponent": {
+        "starter": [
+          0.8,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.6,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          1.0,
+          5
+        ],
+        "harasser": [
+          0.8,
+          5
+        ],
+        "comet_camper": [
+          0.2,
+          5
+        ],
+        "opportunist": [
+          0.8,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 8,
+      "weights": {
+        "w_production": 35.665645487606525,
+        "w_ships_cost": 0.3104989677667618,
+        "w_distance_cost": 0.1528790345415473,
+        "w_travel_cost": 2.529036839492619,
+        "mult_neutral": 1.070320064201951,
+        "mult_enemy": 4.996357321739197,
+        "mult_comet": 8.67101486120373,
+        "mult_reinforce_ally": 0.41539958864450455,
+        "ships_safety_margin": 1.3618998499587178,
+        "min_launch_size": 38.98142382502556,
+        "max_launch_fraction": 0.8357619550079107,
+        "expand_cooldown_turns": 0.9222055524587631,
+        "keep_reserve_ships": 0.6222164556384087,
+        "agg_early_game": 2.2851549468934538,
+        "early_game_cutoff_turn": 51.65547179058194,
+        "sun_avoidance_epsilon": 0.04993271152488887,
+        "comet_max_time_mismatch": 2.0197447119280696,
+        "expand_bias": 1.943151293322444
+      },
+      "win_rate": 0.8444444444444444,
+      "hard_win_rate": 0.8444444444444444,
+      "n_games": 45,
+      "fitness_wall_seconds": 96.93840609991457,
+      "by_opponent": {
+        "starter": [
+          1.0,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.6,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          0.8,
+          5
+        ],
+        "harasser": [
+          0.8,
+          5
+        ],
+        "comet_camper": [
+          0.4,
+          5
+        ],
+        "opportunist": [
+          1.0,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 9,
+      "weights": {
+        "w_production": 22.03941292129457,
+        "w_ships_cost": 0.19786933390423656,
+        "w_distance_cost": 0.14387316489592195,
+        "w_travel_cost": 0.9080980299040675,
+        "mult_neutral": 3.732043595518917,
+        "mult_enemy": 8.717267979867756,
+        "mult_comet": 5.318535031750798,
+        "mult_reinforce_ally": 0.004899885039776564,
+        "ships_safety_margin": 1.876046639867127,
+        "min_launch_size": 20.897018685936928,
+        "max_launch_fraction": 0.7395129492506385,
+        "expand_cooldown_turns": 7.123476266860962,
+        "keep_reserve_ships": 2.4214911852031946,
+        "agg_early_game": 0.48900072947144513,
+        "early_game_cutoff_turn": 192.56342193111777,
+        "sun_avoidance_epsilon": 0.01635547527112067,
+        "comet_max_time_mismatch": 8.818559331819415,
+        "expand_bias": 0.09097344242036343
+      },
+      "win_rate": 0.9111111111111111,
+      "hard_win_rate": 0.9111111111111111,
+      "n_games": 45,
+      "fitness_wall_seconds": 77.92009070003405,
+      "by_opponent": {
+        "starter": [
+          1.0,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.8,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          1.0,
+          5
+        ],
+        "harasser": [
+          1.0,
+          5
+        ],
+        "comet_camper": [
+          0.4,
+          5
+        ],
+        "opportunist": [
+          1.0,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 10,
+      "weights": {
+        "w_production": 12.733857724815607,
+        "w_ships_cost": 0.4631091468036175,
+        "w_distance_cost": 0.2391557229682803,
+        "w_travel_cost": 1.6742127249017358,
+        "mult_neutral": 3.069972892291844,
+        "mult_enemy": 5.822945391759276,
+        "mult_comet": 6.58221220318228,
+        "mult_reinforce_ally": 0.12701845401898026,
+        "ships_safety_margin": 2.7159258853644133,
+        "min_launch_size": 16.367078609764576,
+        "max_launch_fraction": 0.5789647102355957,
+        "expand_cooldown_turns": 4.707441963255405,
+        "keep_reserve_ships": 0.7924079038202763,
+        "agg_early_game": 1.6744952408596874,
+        "early_game_cutoff_turn": 248.974387999624,
+        "sun_avoidance_epsilon": 0.028174617281183603,
+        "comet_max_time_mismatch": 7.014731532894075,
+        "expand_bias": 1.0725131798535585
+      },
+      "win_rate": 0.7777777777777778,
+      "hard_win_rate": 0.7777777777777778,
+      "n_games": 45,
+      "fitness_wall_seconds": 131.68548210000154,
+      "by_opponent": {
+        "starter": [
+          1.0,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.4,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          0.8,
+          5
+        ],
+        "harasser": [
+          0.8,
+          5
+        ],
+        "comet_camper": [
+          0.2,
+          5
+        ],
+        "opportunist": [
+          0.8,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 11,
+      "weights": {
+        "w_production": 27.488549472764134,
+        "w_ships_cost": 0.04426759434863925,
+        "w_distance_cost": 0.0616933942772448,
+        "w_travel_cost": 0.23948755022138357,
+        "mult_neutral": 2.2248980891890824,
+        "mult_enemy": 2.230523425154388,
+        "mult_comet": 3.185773516073823,
+        "mult_reinforce_ally": 0.2952112415805459,
+        "ships_safety_margin": 0.6080797892063856,
+        "min_launch_size": 43.19905411452055,
+        "max_launch_fraction": 0.9866303587332368,
+        "expand_cooldown_turns": 3.275686703622341,
+        "keep_reserve_ships": 2.157927392050624,
+        "agg_early_game": 1.2362204981967808,
+        "early_game_cutoff_turn": 108.04640175774693,
+        "sun_avoidance_epsilon": 0.01178872478194535,
+        "comet_max_time_mismatch": 4.6718364004045725,
+        "expand_bias": 0.9556949529796839
+      },
+      "win_rate": 0.8666666666666667,
+      "hard_win_rate": 0.8666666666666667,
+      "n_games": 45,
+      "fitness_wall_seconds": 68.92516079999041,
+      "by_opponent": {
+        "starter": [
+          1.0,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.4,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          1.0,
+          5
+        ],
+        "harasser": [
+          0.8,
+          5
+        ],
+        "comet_camper": [
+          0.6,
+          5
+        ],
+        "opportunist": [
+          1.0,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 12,
+      "weights": {
+        "w_production": 26.720157777890563,
+        "w_ships_cost": 0.41287190141156316,
+        "w_distance_cost": 0.09794237092137337,
+        "w_travel_cost": 0.4959398936480284,
+        "mult_neutral": 1.7580978120677173,
+        "mult_enemy": 4.035421676933765,
+        "mult_comet": 7.099626717157662,
+        "mult_reinforce_ally": 0.21844757348299026,
+        "ships_safety_margin": 2.560288737528026,
+        "min_launch_size": 29.912673868238926,
+        "max_launch_fraction": 0.5494556906633079,
+        "expand_cooldown_turns": 2.7347152158617973,
+        "keep_reserve_ships": 1.428077269345522,
+        "agg_early_game": 0.6221974393352867,
+        "early_game_cutoff_turn": 125.97746271640062,
+        "sun_avoidance_epsilon": 0.0016493374016135931,
+        "comet_max_time_mismatch": 4.002475307323039,
+        "expand_bias": 0.6648827157914639
+      },
+      "win_rate": 0.7333333333333333,
+      "hard_win_rate": 0.7333333333333333,
+      "n_games": 45,
+      "fitness_wall_seconds": 129.31026489997748,
+      "by_opponent": {
+        "starter": [
+          1.0,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.2,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          1.0,
+          5
+        ],
+        "harasser": [
+          0.4,
+          5
+        ],
+        "comet_camper": [
+          0.0,
+          5
+        ],
+        "opportunist": [
+          1.0,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 13,
+      "weights": {
+        "w_production": 5.300995446741581,
+        "w_ships_cost": 0.07975327130407095,
+        "w_distance_cost": 0.20054933382198215,
+        "w_travel_cost": 2.072933379560709,
+        "mult_neutral": 2.6031742841005325,
+        "mult_enemy": 9.875955385155976,
+        "mult_comet": 1.4707795660942793,
+        "mult_reinforce_ally": 0.36319833574816585,
+        "ships_safety_margin": 0.16825794707983732,
+        "min_launch_size": 30.58008696883917,
+        "max_launch_fraction": 0.8908370980061591,
+        "expand_cooldown_turns": 5.311031706631184,
+        "keep_reserve_ships": 1.528111768886447,
+        "agg_early_game": 2.143230197392404,
+        "early_game_cutoff_turn": 266.923750564456,
+        "sun_avoidance_epsilon": 0.03211321425624192,
+        "comet_max_time_mismatch": 6.2739635817706585,
+        "expand_bias": 1.2970822490751743
+      },
+      "win_rate": 0.9333333333333333,
+      "hard_win_rate": 0.9333333333333333,
+      "n_games": 45,
+      "fitness_wall_seconds": 71.51587559992913,
+      "by_opponent": {
+        "starter": [
+          1.0,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.8,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          1.0,
+          5
+        ],
+        "harasser": [
+          1.0,
+          5
+        ],
+        "comet_camper": [
+          0.6,
+          5
+        ],
+        "opportunist": [
+          1.0,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    },
+    {
+      "trial": 14,
+      "weights": {
+        "w_production": 14.572104187682271,
+        "w_ships_cost": 0.31352945463731885,
+        "w_distance_cost": 0.035098533332347866,
+        "w_travel_cost": 1.3507640082389116,
+        "mult_neutral": 3.320360789541155,
+        "mult_enemy": 7.146344168111682,
+        "mult_comet": 9.208287914283574,
+        "mult_reinforce_ally": 0.48925438756123185,
+        "ships_safety_margin": 0.8620244152843952,
+        "min_launch_size": 47.29741245508194,
+        "max_launch_fraction": 0.8024038127623498,
+        "expand_cooldown_turns": 6.894913226366043,
+        "keep_reserve_ships": 0.1799122765660286,
+        "agg_early_game": 1.094484506547451,
+        "early_game_cutoff_turn": 173.29655773937702,
+        "sun_avoidance_epsilon": 0.020232453150674703,
+        "comet_max_time_mismatch": 8.996282224543393,
+        "expand_bias": 0.28844673931598663
+      },
+      "win_rate": 0.7111111111111111,
+      "hard_win_rate": 0.7111111111111111,
+      "n_games": 45,
+      "fitness_wall_seconds": 130.71538569999393,
+      "by_opponent": {
+        "starter": [
+          0.8,
+          5
+        ],
+        "random": [
+          1.0,
+          5
+        ],
+        "rusher": [
+          0.4,
+          5
+        ],
+        "turtler": [
+          1.0,
+          5
+        ],
+        "economy": [
+          0.6,
+          5
+        ],
+        "harasser": [
+          0.4,
+          5
+        ],
+        "comet_camper": [
+          0.2,
+          5
+        ],
+        "opportunist": [
+          1.0,
+          5
+        ],
+        "defender": [
+          1.0,
+          5
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+C:\Users\Marc\Desktop\Orbit Wars\src\orbitwars\tune\turbo_runner.py:196: DeprecationWarning: The `AxClient` class is deprecated and will be removed in Ax 1.4.0. Please migrate to the modern Ax API / `Client` class, found under ax/api. For example usage, check out the tutorials at https://ax.dev 
+  self.client = AxClient(random_seed=seed)
+[WARNING 04-25 05:27:37] ax.service.ax_client: Random seed set to 2. Note that this setting only affects the Sobol quasi-random generator and BoTorch-powered Bayesian optimization models. For the latter models, setting random seed to the same number for two optimizations will make the generated trials similar, but not exactly the same, and over time the trials will diverge more.
+[INFO 04-25 05:27:37] ax.generation_strategy.dispatch_utils: Using Generators.BOTORCH_MODULAR since there is at least one ordered parameter and there are no unordered categorical parameters.
+[INFO 04-25 05:27:37] ax.generation_strategy.dispatch_utils: Using Bayesian Optimization generation strategy: GenerationStrategy(name='GenerationStep_0_Sobol+GenerationStep_1_BoTorch', nodes=[GenerationNode(name='GenerationStep_0_Sobol', generator_specs=[GeneratorSpec(generator_enum=Sobol, generator_key_override=None)], transition_criteria=[MinTrials(transition_to='GenerationStep_1_BoTorch'), MinTrials(transition_to='GenerationStep_1_BoTorch')], pausing_criteria=[MaxTrialsAwaitingData(threshold=36)]), GenerationNode(name='GenerationStep_1_BoTorch', generator_specs=[GeneratorSpec(generator_enum=BoTorch, generator_key_override=None)], transition_criteria=None, pausing_criteria=[MaxGenerationParallelism(threshold=3)])]). Iterations after 36 will take longer to generate due to model-fitting.
+[INFO 04-25 05:27:37] ax.service.ax_client: Generated new trial 0 with parameters {'w_production': 32.215532, 'w_ships_cost': 0.484432, 'w_distance_cost': 0.005929, 'w_travel_cost': 1.920096, 'mult_neutral': 3.861678, 'mult_enemy': 3.102306, 'mult_comet': 7.456478, 'mult_reinforce_ally': 0.234609, 'ships_safety_margin': 2.436084, 'min_launch_size': 41.522267, 'max_launch_fraction': 0.679596, 'expand_cooldown_turns': 0.200664, 'keep_reserve_ships': 1.704181, 'agg_early_game': 0.941179, 'early_game_cutoff_turn': 234.822732, 'sun_avoidance_epsilon': 0.005726, 'comet_max_time_mismatch': 7.52278, 'expand_bias': 0.756333} using model Sobol.
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+[INFO 04-25 05:29:44] ax.service.ax_client: Completed trial 0 with data: {'win_rate': 0.555556}.
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+[t=  0] win=0.556 hard=0.556 n=45 127.5s best_so_far=0.556
+[INFO 04-25 05:29:44] ax.service.ax_client: Generated new trial 1 with parameters {'w_production': 17.562312, 'w_ships_cost': 0.007211, 'w_distance_cost': 0.297356, 'w_travel_cost': 0.672876, 'mult_neutral': 1.158902, 'mult_enemy': 6.128898, 'mult_comet': 1.817743, 'mult_reinforce_ally': 0.340239, 'ships_safety_margin': 0.325239, 'min_launch_size': 18.354844, 'max_launch_fraction': 0.770977, 'expand_cooldown_turns': 7.753284, 'keep_reserve_ships': 1.252014, 'agg_early_game': 1.895139, 'early_game_cutoff_turn': 75.181377, 'sun_avoidance_epsilon': 0.034627, 'comet_max_time_mismatch': 5.321731, 'expand_bias': 1.154897} using model Sobol.
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+[INFO 04-25 05:30:42] ax.service.ax_client: Completed trial 1 with data: {'win_rate': 0.844444}.
+[t=  1] win=0.844 hard=0.844 n=45  57.4s best_so_far=0.844
+[INFO 04-25 05:30:42] ax.service.ax_client: Generated new trial 2 with parameters {'w_production': 9.350769, 'w_ships_cost': 0.273213, 'w_distance_cost': 0.088402, 'w_travel_cost': 2.93899, 'mult_neutral': 1.91753, 'mult_enemy': 7.866394, 'mult_comet': 9.555662, 'mult_reinforce_ally': 0.464306, 'ships_safety_margin': 1.079059, 'min_launch_size': 23.825029, 'max_launch_fraction': 0.922752, 'expand_cooldown_turns': 4.415314, 'keep_reserve_ships': 2.717768, 'agg_early_game': 0.74322, 'early_game_cutoff_turn': 56.253589, 'sun_avoidance_epsilon': 0.022405, 'comet_max_time_mismatch': 1.548915, 'expand_bias': 0.134726} using model Sobol.
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+[INFO 04-25 05:32:51] ax.service.ax_client: Completed trial 2 with data: {'win_rate': 0.733333}.
+[t=  2] win=0.733 hard=0.733 n=45 129.5s best_so_far=0.844
+[INFO 04-25 05:32:51] ax.service.ax_client: Generated new trial 3 with parameters {'w_production': 22.943889, 'w_ships_cost': 0.219391, 'w_distance_cost': 0.210786, 'w_travel_cost': 1.130547, 'mult_neutral': 2.721625, 'mult_enemy': 4.704653, 'mult_comet': 3.943282, 'mult_reinforce_ally': 0.116364, 'ships_safety_margin': 1.596204, 'min_launch_size': 35.740003, 'max_launch_fraction': 0.518031, 'expand_cooldown_turns': 3.600959, 'keep_reserve_ships': 0.331799, 'agg_early_game': 1.954927, 'early_game_cutoff_turn': 215.94817, 'sun_avoidance_epsilon': 0.043491, 'comet_max_time_mismatch': 8.206154, 'expand_bias': 1.766681} using model Sobol.
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+Loading environment open_spiel_env failed: No module named 'pokerkit'
+Loading environment werewolf failed: No module named 'pydantic'
+[INFO 04-25 05:34:22] ax.service.ax_client: Completed trial 3 with data: {'win_rate': 0.688889}.
+[t=  3] win=0.689 hard=0.689 n=45  90.5s best_so_far=0.844
+[INFO 04-25 05:34:22] ax.service.ax_client: Generated new trial 4 with parameters {'w_production': 30.377286, 'w_ships_cost': 0.35472, 'w_distance_cost': 0.2495, 'w_travel_cost': 1.104835, 'mult_neutral': 2.254396, 'mult_enemy': 1.991973, 'mult_comet': 7.752766, 'mult_reinforce_ally': 0.381666, 'ships_safety_margin': 1.144613, 'min_launch_size': 12.454729, 'max_launch_fraction': 0.955679, 'expand_cooldown_turns': 2.388143, 'keep_reserve_ships': 2.597543, 'agg_early_game': 1.478353, 'early_game_cutoff_turn': 168.702831, 'sun_avoidance_epsilon': 0.045806, 'comet_max_time_mismatch': 9.505577, 'expand_bias': 1.604867} using model Sobol.

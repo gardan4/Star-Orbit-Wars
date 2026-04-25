@@ -602,6 +602,15 @@ class GumbelRootSearch:
     # Typically populated by MCTSAgent from the Bayesian posterior's
     # top-K archetypes when the posterior has concentrated.
     opp_candidate_builder: Optional[Callable[[Any, int], List[List[List]]]] = None
+    # Path C neural prior bridge. When set, called after
+    # ``generate_per_planet_moves`` to overwrite the heuristic prior on
+    # each PlanetMove with a NN-derived prior. Signature:
+    #   ``(obs, my_player, moves_by_planet, available_by_planet)
+    #     -> Dict[planet_id, List[PlanetMove]]``
+    # The returned dict has the same keys as the input but with new
+    # PlanetMove objects (PlanetMove is frozen) carrying the new prior.
+    # Built via ``orbitwars.nn.nn_prior.make_nn_prior_fn``.
+    move_prior_fn: Optional[Callable[[Any, int, Dict[int, List[PlanetMove]], Dict[int, int]], Dict[int, List[PlanetMove]]]] = None
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.rng_seed)
@@ -688,6 +697,34 @@ class GumbelRootSearch:
         # "hold" choice).
         if not per_planet:
             return None
+
+        # Path C: optionally rewrite priors with the NN bridge. This runs
+        # ONCE at the root — Gumbel sampling at the root reads these new
+        # priors directly. Inner-node statistics still come from rollouts
+        # so a low-quality NN cannot poison the search beyond its prior
+        # weight. Errors here fall back to the heuristic priors that the
+        # generator already produced (defensive: the NN path is optional
+        # and we never want it to forfeit a turn).
+        if self.move_prior_fn is not None:
+            try:
+                # Each PlanetMove shares its source planet's ship count;
+                # extract once per planet from the parsed obs. Comet/orbit
+                # planets that we own and that show up in per_planet must
+                # be in po.planet_by_id.
+                available_by_planet: Dict[int, int] = {}
+                for pid in per_planet.keys():
+                    pdata = po.planet_by_id.get(int(pid))
+                    if pdata is not None and len(pdata) > 5:
+                        available_by_planet[int(pid)] = int(pdata[5])
+                    else:
+                        available_by_planet[int(pid)] = 0
+                per_planet = self.move_prior_fn(
+                    obs, my_player, per_planet, available_by_planet,
+                )
+            except Exception:
+                # Keep heuristic priors as the fallback. The search will
+                # behave exactly like a no-NN-prior MCTSAgent.
+                pass
 
         # Build the anchor joint (heuristic's pick) if provided. We'll
         # insert it as candidate 0 and keep it protected from SH pruning

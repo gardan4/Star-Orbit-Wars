@@ -1,0 +1,63 @@
+{
+  "args": {
+    "games": 2,
+    "step_timeout": 1.0,
+    "total_sims": 32,
+    "num_candidates": 4,
+    "rollout_depth": 15,
+    "hard_deadline_ms": 150.0,
+    "exp3_eta": 0.3,
+    "seed_base": 1000,
+    "out": "runs/ab_exp3_vs_ucb_smoke.json"
+  },
+  "wall_total_s": 389.29227830003947,
+  "games": [
+    {
+      "game_idx": 0,
+      "seed": 1000,
+      "exp3_seat": 0,
+      "reward_exp3": 1,
+      "reward_ucb": -1,
+      "steps": 499,
+      "wall_s": 165.1935810999712,
+      "p50_exp3_ms": 170.4258999088779,
+      "p95_exp3_ms": 186.149200075306,
+      "max_exp3_ms": 243.15210001077503,
+      "p50_ucb_ms": 170.74410000350326,
+      "p95_ucb_ms": 204.54330008942634,
+      "max_ucb_ms": 242.7075000014156
+    },
+    {
+      "game_idx": 1,
+      "seed": 1001,
+      "exp3_seat": 1,
+      "reward_exp3": 1,
+      "reward_ucb": -1,
+      "steps": 499,
+      "wall_s": 224.0791282999562,
+      "p50_exp3_ms": 180.67820009309798,
+      "p95_exp3_ms": 723.5538999084383,
+      "max_exp3_ms": 1055.5267001036555,
+      "p50_ucb_ms": 179.6679999679327,
+      "p95_ucb_ms": 727.7393999975175,
+      "max_ucb_ms": 1053.0942999757826
+    }
+  ],
+  "summary": {
+    "wins": 2,
+    "losses": 0,
+    "draws": 0,
+    "n_games": 2,
+    "win_rate": 1.0,
+    "elo_delta": Infinity,
+    "seat0_wr": 1.0,
+    "seat0_n": 1,
+    "seat1_wr": 1.0,
+    "seat1_n": 1,
+    "gate_055_pass": true,
+    "turn_time_p50_median_exp3_ms": 175.55205000098795,
+    "turn_time_p50_median_ucb_ms": 175.20604998571798,
+    "turn_time_max_max_exp3_ms": 1055.5267001036555,
+    "turn_time_max_max_ucb_ms": 1053.0942999757826
+  }
+}

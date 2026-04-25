@@ -31,3 +31,14 @@ label histogram:
 majority-class baseline: 0.137  random-guess baseline: 0.125
 tensors: x=(60393, 12, 50, 50)  labels=(60393,)  device=cuda:0  train=54,354 val=6,039
 model params: 460,617
+  epoch  1/15 * lr=3.00e-04  tr_loss=1.6400 tr_acc=0.376  va_loss=1.3226 va_acc=0.507  best_va=0.507
+  epoch  2/15 * lr=2.97e-04  tr_loss=1.2709 tr_acc=0.528  va_loss=1.2382 va_acc=0.532  best_va=0.532
+  epoch  3/15 * lr=2.87e-04  tr_loss=1.1981 tr_acc=0.553  va_loss=1.2177 va_acc=0.535  best_va=0.535
+  epoch  4/15 * lr=2.72e-04  tr_loss=1.1496 tr_acc=0.568  va_loss=1.1868 va_acc=0.549  best_va=0.549
+  epoch  5/15 * lr=2.51e-04  tr_loss=1.1072 tr_acc=0.583  va_loss=1.1720 va_acc=0.558  best_va=0.558
+  epoch  6/15 * lr=2.26e-04  tr_loss=1.0713 tr_acc=0.595  va_loss=1.1544 va_acc=0.564  best_va=0.564
+  epoch  7/15   lr=1.97e-04  tr_loss=1.0314 tr_acc=0.611  va_loss=1.1736 va_acc=0.552  best_va=0.564
+  epoch  8/15   lr=1.67e-04  tr_loss=0.9874 tr_acc=0.627  va_loss=1.1600 va_acc=0.563  best_va=0.564
+  epoch  9/15 * lr=1.36e-04  tr_loss=0.9374 tr_acc=0.647  va_loss=1.1462 va_acc=0.566  best_va=0.566
+  epoch 10/15 * lr=1.06e-04  tr_loss=0.8757 tr_acc=0.669  va_loss=1.1542 va_acc=0.568  best_va=0.568
+  epoch 11/15   lr=7.73e-05  tr_loss=0.8087 tr_acc=0.700  va_loss=1.1884 va_acc=0.565  best_va=0.568

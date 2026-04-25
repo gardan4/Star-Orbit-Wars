@@ -135,10 +135,35 @@ def bundle_bot(
     bot_name: str,
     out_path: Path,
     weights_override: Dict[str, float] | None = None,
+    sim_move_variant: str | None = None,
+    exp3_eta: float | None = None,
+    rollout_policy: str | None = None,
+    anchor_margin: float | None = None,
+    use_opponent_model: bool | None = None,
+    nn_checkpoint: Path | None = None,
+    nn_temperature: float | None = None,
+    nn_hold_neutral_prob: float | None = None,
 ) -> None:
     if bot_name not in BOT_RECIPES:
         raise SystemExit(f"Unknown bot '{bot_name}'. Known: {list(BOT_RECIPES)}")
     modules, agent_factory = BOT_RECIPES[bot_name]
+    # If --nn-checkpoint is set, splice the NN modules into the inline
+    # list AFTER bots.heuristic (which defines PlanetMove via mcts.actions
+    # transitively) but BEFORE bots.mcts_bot (which constructs the agent).
+    # The ConvPolicy import path nn.conv_policy → no orbitwars sibling
+    # imports inside it (only torch), so order with respect to other
+    # orbitwars modules doesn't matter beyond "before mcts_bot".
+    if nn_checkpoint is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--nn-checkpoint only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        modules = list(modules)
+        # Insert just before bots.mcts_bot (which is the last entry).
+        insert_at = modules.index("bots.mcts_bot")
+        modules.insert(insert_at, "nn.conv_policy")
+        modules.insert(insert_at + 1, "nn.nn_prior")
+
     parts: List[str] = [HEADER.format(timestamp=time.strftime("%Y-%m-%d %H:%M:%S"), bot_name=bot_name)]
     seen_future: List[str] = []
 
@@ -168,6 +193,142 @@ def bundle_bot(
         parts.append(
             f"HEURISTIC_WEIGHTS.update({{\n    {items},\n}})\n"
         )
+
+    # Optional GumbelConfig overrides for the mcts_bot recipe. Each knob
+    # below maps to a single attribute on a `_bundle_cfg = GumbelConfig()`
+    # instance that we emit into the bundle, then we rewrite the agent
+    # factory to use that cfg (and optionally flip `use_opponent_model`).
+    # Knobs supported:
+    #   * --sim-move-variant / --exp3-eta (W4 A/B: exp3 decoupled root)
+    #   * --rollout-policy (W4 perf: fast vs heuristic rollouts)
+    #   * --anchor-margin (relaxes anchor-lock for MCTS overrides)
+    #   * --use-opponent-model=false (disables Bayes observe path)
+    cfg_setters: List[str] = []  # each "_bundle_cfg.KEY = VAL" line
+    factory_kwargs: List[str] = []  # extra MCTSAgent() kwargs beyond rng_seed
+
+    # Validation + emission per knob.
+    if sim_move_variant is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--sim-move-variant only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        if sim_move_variant not in ("ucb", "exp3"):
+            raise SystemExit(
+                f"--sim-move-variant must be 'ucb' or 'exp3' (got {sim_move_variant!r})"
+            )
+        cfg_setters.append(f"_bundle_cfg.sim_move_variant = {sim_move_variant!r}")
+        eta_val = float(exp3_eta) if exp3_eta is not None else 0.3
+        cfg_setters.append(f"_bundle_cfg.exp3_eta = {eta_val!r}")
+
+    if rollout_policy is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--rollout-policy only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        if rollout_policy not in ("heuristic", "fast"):
+            raise SystemExit(
+                f"--rollout-policy must be 'heuristic' or 'fast' (got {rollout_policy!r})"
+            )
+        cfg_setters.append(f"_bundle_cfg.rollout_policy = {rollout_policy!r}")
+
+    if anchor_margin is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--anchor-margin only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        cfg_setters.append(
+            f"_bundle_cfg.anchor_improvement_margin = {float(anchor_margin)!r}"
+        )
+
+    if use_opponent_model is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--use-opponent-model only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        # Note: use_opponent_model is an MCTSAgent constructor arg, NOT a
+        # GumbelConfig attribute. It goes into factory_kwargs, not cfg_setters.
+        factory_kwargs.append(f"use_opponent_model={bool(use_opponent_model)!r}")
+
+    # NN-prior wiring. The .pt checkpoint is base64-inlined into the
+    # bundled .py so the submission is single-file (no separate Kaggle
+    # Dataset upload step). At ~1.8 MB fp32 the encoded text is ~2.4 MB,
+    # comfortably under Kaggle's per-file caps. We emit a small bootstrap
+    # block that decodes, runs torch.load on a BytesIO, constructs the
+    # ConvPolicy, and builds a `_bundle_move_prior_fn` that's threaded
+    # into the agent factory below.
+    nn_bootstrap_lines: List[str] = []
+    if nn_checkpoint is not None:
+        ckpt_path = Path(nn_checkpoint)
+        if not ckpt_path.exists():
+            raise SystemExit(f"--nn-checkpoint: file not found at {ckpt_path}")
+        import base64 as _b64
+        ckpt_bytes = ckpt_path.read_bytes()
+        encoded = _b64.b64encode(ckpt_bytes).decode("ascii")
+        # Wrap the long line every 76 chars (RFC 2045 friendliness; keeps
+        # the .py file diff-readable and editor-friendly).
+        wrapped = "\n".join(
+            encoded[i : i + 76] for i in range(0, len(encoded), 76)
+        )
+        temp = float(nn_temperature) if nn_temperature is not None else 1.0
+        hold_p = float(nn_hold_neutral_prob) if nn_hold_neutral_prob is not None else 0.05
+        nn_bootstrap_lines = [
+            "\n# --- NN prior bootstrap (--nn-checkpoint) ---",
+            "import base64 as _bundle_b64",
+            "import io as _bundle_io",
+            "import torch as _bundle_torch",
+            "_BUNDLE_BC_CKPT_B64 = (",
+            *(f"    {line!r}" for line in wrapped.split("\n")),
+            ")",
+            "_bundle_ckpt_bytes = _bundle_b64.b64decode(\"\".join(_BUNDLE_BC_CKPT_B64))",
+            "_bundle_ckpt = _bundle_torch.load(",
+            "    _bundle_io.BytesIO(_bundle_ckpt_bytes),",
+            "    map_location=\"cpu\", weights_only=False,",
+            ")",
+            "if 'model_state' in _bundle_ckpt and 'cfg' in _bundle_ckpt:",
+            "    _bundle_cfg_nn = ConvPolicyCfg(**_bundle_ckpt['cfg'])",
+            "    _bundle_model = ConvPolicy(_bundle_cfg_nn)",
+            "    _bundle_model.load_state_dict(_bundle_ckpt['model_state'])",
+            "elif 'model_state_dict' in _bundle_ckpt:",
+            "    _bundle_cfg_nn = ConvPolicyCfg()",
+            "    _bundle_model = ConvPolicy(_bundle_cfg_nn)",
+            "    _bundle_model.load_state_dict(_bundle_ckpt['model_state_dict'])",
+            "else:",
+            "    raise RuntimeError('bundle: NN checkpoint has unrecognized keys')",
+            "_bundle_model.eval()",
+            "_bundle_move_prior_fn = make_nn_prior_fn(",
+            "    _bundle_model, _bundle_cfg_nn,",
+            f"    hold_neutral_prob={hold_p!r}, temperature={temp!r},",
+            ")",
+            "del _bundle_ckpt_bytes, _bundle_ckpt  # free ~2 MB before play starts",
+        ]
+        factory_kwargs.append("move_prior_fn=_bundle_move_prior_fn")
+
+    if nn_bootstrap_lines:
+        # Emit the NN bootstrap BEFORE the GumbelConfig / factory block so
+        # `_bundle_move_prior_fn` is in scope when the factory references it.
+        parts.append("\n".join(nn_bootstrap_lines) + "\n")
+
+    if cfg_setters or factory_kwargs:
+        parts.append("\n# --- GumbelConfig / MCTSAgent overrides ---\n")
+        parts.append("# Applied by tools/bundle.py at build time.\n")
+        if cfg_setters:
+            parts.append("_bundle_cfg = GumbelConfig()\n")
+            for line in cfg_setters:
+                parts.append(line + "\n")
+        # Rewrite the factory to thread the cfg (if any) and extra kwargs.
+        new_kwargs: List[str] = []
+        if cfg_setters:
+            new_kwargs.append("gumbel_cfg=_bundle_cfg")
+        new_kwargs.append("rng_seed=0")
+        new_kwargs.extend(factory_kwargs)
+        replacement = f"MCTSAgent({', '.join(new_kwargs)})"
+        new_factory = agent_factory.replace("MCTSAgent(rng_seed=0)", replacement)
+        if new_factory == agent_factory:
+            raise SystemExit(
+                "bundle.py: couldn't find 'MCTSAgent(rng_seed=0)' in "
+                f"agent factory {agent_factory!r} to inject overrides"
+            )
+        agent_factory = new_factory
 
     # Agent entry point
     parts.append("\n# --- agent entry point ---\n")
@@ -228,6 +389,99 @@ def main() -> int:
     )
     ap.add_argument("--smoke-test", action="store_true",
                     help="Run a single game against 'random' to verify the bundle works")
+    ap.add_argument(
+        "--sim-move-variant",
+        default=None,
+        choices=["ucb", "exp3"],
+        help=(
+            "Override GumbelConfig.sim_move_variant at bundle time. Only "
+            "applies to bot=mcts_bot. Default behavior (when flag is "
+            "omitted) matches the source tree default ('ucb'). Use 'exp3' "
+            "to ship the Exp3 decoupled-root variant; requires the W4 "
+            "A/B gate to have passed."
+        ),
+    )
+    ap.add_argument(
+        "--exp3-eta",
+        type=float,
+        default=None,
+        help=(
+            "Learning rate for Exp3 softmax. Only used when "
+            "--sim-move-variant=exp3. Defaults to 0.3 (the sim_move.py "
+            "module default)."
+        ),
+    )
+    ap.add_argument(
+        "--rollout-policy",
+        default=None,
+        choices=["heuristic", "fast"],
+        help=(
+            "Override GumbelConfig.rollout_policy at bundle time. "
+            "'fast' uses FastRolloutAgent inside rollouts (~13× more "
+            "sims/turn) but is only useful if combined with a relaxed "
+            "--anchor-margin — under the shipped margin=2.0 the wire "
+            "action is margin-locked and rollout count is irrelevant."
+        ),
+    )
+    ap.add_argument(
+        "--anchor-margin",
+        type=float,
+        default=None,
+        help=(
+            "Override GumbelConfig.anchor_improvement_margin. Default "
+            "2.0 (effectively 'always play the heuristic'). Lower "
+            "values (0.5, 0.0) let MCTS override the heuristic when "
+            "the search Q-value exceeds the anchor by at least that "
+            "margin. Only safe to lower alongside --rollout-policy=fast "
+            "(need sim budget above the rollout noise floor)."
+        ),
+    )
+    ap.add_argument(
+        "--use-opponent-model",
+        default=None,
+        choices=["true", "false"],
+        help=(
+            "Override MCTSAgent use_opponent_model. Default True. "
+            "Setting 'false' disables the Bayesian archetype posterior "
+            "(saves ~27 ms/turn observe cost; use for clean MCTS-only "
+            "experiments where opp_policy_override is a confound)."
+        ),
+    )
+    ap.add_argument(
+        "--nn-checkpoint",
+        default=None,
+        help=(
+            "Path to a BC-warmstart .pt checkpoint produced by "
+            "tools/bc_warmstart.py. When set, the conv_policy + nn_prior "
+            "modules are inlined into the bundle, the checkpoint is "
+            "base64-encoded into the .py file, and the agent is wired "
+            "with a ConvPolicy-derived move_prior_fn that overwrites the "
+            "heuristic priors at the MCTS root. Only applies to "
+            "bot=mcts_bot. Bundle size grows by ~1.4× the checkpoint "
+            "size (~2.4 MB for the default ConvPolicyCfg)."
+        ),
+    )
+    ap.add_argument(
+        "--nn-temperature",
+        type=float,
+        default=None,
+        help=(
+            "Softmax temperature for NN prior. Default 1.0. >1 flattens "
+            "(more exploration), <1 sharpens (more confidence in NN). "
+            "Only used when --nn-checkpoint is set."
+        ),
+    )
+    ap.add_argument(
+        "--nn-hold-neutral-prob",
+        type=float,
+        default=None,
+        help=(
+            "Mass reserved for the HOLD action in the per-planet NN "
+            "prior. Default 0.05. Increase if the NN over-launches; "
+            "decrease if it under-launches. Only used when "
+            "--nn-checkpoint is set."
+        ),
+    )
     args = ap.parse_args()
 
     weights_override: Dict[str, float] | None = None
@@ -263,8 +517,42 @@ def main() -> int:
         print(f"weights override: {len(weights_override)} keys from {args.weights_json}")
 
     out = Path(args.out)
-    bundle_bot(args.bot, out, weights_override=weights_override)
+    use_opp_model: bool | None = None
+    if args.use_opponent_model is not None:
+        use_opp_model = args.use_opponent_model == "true"
+    bundle_bot(
+        args.bot, out,
+        weights_override=weights_override,
+        sim_move_variant=args.sim_move_variant,
+        exp3_eta=args.exp3_eta,
+        rollout_policy=args.rollout_policy,
+        anchor_margin=args.anchor_margin,
+        use_opponent_model=use_opp_model,
+        nn_checkpoint=Path(args.nn_checkpoint) if args.nn_checkpoint else None,
+        nn_temperature=args.nn_temperature,
+        nn_hold_neutral_prob=args.nn_hold_neutral_prob,
+    )
     print(f"Bundled {args.bot} -> {out} ({out.stat().st_size} bytes)")
+    if args.sim_move_variant:
+        eta = args.exp3_eta if args.exp3_eta is not None else 0.3
+        print(f"  sim_move_variant={args.sim_move_variant!r} exp3_eta={eta}")
+    if args.rollout_policy:
+        print(f"  rollout_policy={args.rollout_policy!r}")
+    if args.anchor_margin is not None:
+        print(f"  anchor_improvement_margin={args.anchor_margin}")
+    if use_opp_model is not None:
+        print(f"  use_opponent_model={use_opp_model}")
+    if args.nn_checkpoint is not None:
+        ck = Path(args.nn_checkpoint)
+        sz = ck.stat().st_size if ck.exists() else 0
+        print(
+            f"  nn_checkpoint={args.nn_checkpoint!r} "
+            f"({sz / 1024:.0f} KB raw -> ~{sz * 4 / 3 / 1024:.0f} KB base64)"
+        )
+        if args.nn_temperature is not None:
+            print(f"  nn_temperature={args.nn_temperature}")
+        if args.nn_hold_neutral_prob is not None:
+            print(f"  nn_hold_neutral_prob={args.nn_hold_neutral_prob}")
 
     if args.smoke_test:
         _smoke_test(out)

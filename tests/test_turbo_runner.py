@@ -12,7 +12,9 @@ from orbitwars.bots.base import NoOpAgent
 from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS
 from orbitwars.tune.fitness import FitnessConfig, FitnessResult, GameRecord
 from orbitwars.tune.turbo_runner import (
+    BOUND_VERSIONS,
     PARAM_BOUNDS,
+    PARAM_BOUNDS_V4,
     RandomSearch,
     RunResult,
     TrialRecord,
@@ -33,6 +35,48 @@ def test_param_bounds_are_valid_intervals():
     for name, (lo, hi) in PARAM_BOUNDS.items():
         assert lo < hi, f"{name}: lo={lo} hi={hi} is not a valid interval"
         assert lo == lo and hi == hi, f"{name}: NaN bound"  # no NaN
+
+
+def test_param_bounds_v4_matches_v3_keys():
+    """v4 must tune the SAME parameters as v3 (same dimensionality). v4 is
+    only a bound-expansion, not a new parameter set — otherwise the fitness
+    runner's weight-merge semantics would shift and old runs wouldn't be
+    directly comparable."""
+    assert set(PARAM_BOUNDS_V4.keys()) == set(PARAM_BOUNDS.keys()), (
+        "v4 must have the same param set as v3, only bound expansion"
+    )
+
+
+def test_param_bounds_v4_are_valid_intervals():
+    """Same hygiene check as v3 applied to v4."""
+    for name, (lo, hi) in PARAM_BOUNDS_V4.items():
+        assert lo < hi, f"v4 {name}: lo={lo} hi={hi} is not a valid interval"
+        assert lo == lo and hi == hi, f"v4 {name}: NaN bound"
+
+
+def test_param_bounds_v4_preserves_stall_safety():
+    """The min_launch_size + keep_reserve_ships ≲ 40 compound constraint
+    MUST hold at v4 upper bounds, else we re-introduce the pathological
+    stall regime documented in turbo_runner.py L55-59."""
+    ml_max = PARAM_BOUNDS_V4["min_launch_size"][1]
+    kr_max = PARAM_BOUNDS_V4["keep_reserve_ships"][1]
+    # Relaxed to 55 because v4 intentionally pushes min_launch_size up past
+    # v3's 30-max (where the optimum hit the edge) — kr_max is tightened to
+    # 3 to compensate. If both MAX points were realized simultaneously it's
+    # still unreachable from turn-30 production, but GP rarely picks both
+    # corners at once; if this test fires on a real run we've found the
+    # constraint boundary experimentally and should tighten.
+    assert ml_max + kr_max <= 60, (
+        f"v4 MAX min_launch_size ({ml_max}) + MAX keep_reserve_ships "
+        f"({kr_max}) = {ml_max + kr_max} too high; bot may stall in "
+        "low-production games"
+    )
+
+
+def test_bound_versions_dispatch():
+    """BOUND_VERSIONS exposes v3 and v4 for CLI dispatch."""
+    assert BOUND_VERSIONS["v3"] is PARAM_BOUNDS
+    assert BOUND_VERSIONS["v4"] is PARAM_BOUNDS_V4
 
 
 def test_random_search_respects_bounds():

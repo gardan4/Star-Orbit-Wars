@@ -39,7 +39,7 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -212,11 +212,18 @@ def train(
     lr: float,
     weight_decay: float,
     verbose: bool = True,
+    eager_save_path: Optional[Path] = None,
+    eager_save_cfg: Optional[dict] = None,
 ) -> dict:
     """Train with AdamW + cosine LR decay; return curve dict.
 
     Keeps the best-val model weights on CPU so the caller can save the
     actually-best checkpoint rather than just the last-epoch state.
+
+    If ``eager_save_path`` is given, the model state_dict is saved at
+    every val-acc improvement so a mid-run crash still leaves a usable
+    checkpoint on disk. Provenance is filled in by the caller after
+    training completes.
     """
     device = next(model.parameters()).device
     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -269,6 +276,27 @@ def train(
             best_val_acc = va_acc
             # CPU copy so we don't waste GPU RAM tracking it.
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            if eager_save_path is not None:
+                eager_save_path.parent.mkdir(parents=True, exist_ok=True)
+                # Sidecar-only state_dict; full provenance is written after
+                # the loop. This is the crash-safety fallback. We include
+                # cfg so the loader can reconstruct the model with the
+                # right backbone — without it, partial checkpoints with
+                # non-default --backbone-channels / --n-blocks fail to
+                # load. Save in BOTH the partial-format key
+                # ('model_state_dict') AND the full-format keys
+                # ('model_state' + 'cfg') so the loader's full-format
+                # branch wins, ensuring the cfg is honored.
+                eager_dict: dict = {
+                    "model_state_dict": best_state,  # legacy key
+                    "best_val_acc": float(best_val_acc),
+                    "epoch": int(epoch + 1),
+                    "_partial": True,
+                }
+                if eager_save_cfg is not None:
+                    eager_dict["model_state"] = best_state  # full-format key
+                    eager_dict["cfg"] = eager_save_cfg
+                torch.save(eager_dict, eager_save_path)
 
         if verbose:
             mark = " *" if is_best else "  "
@@ -373,12 +401,19 @@ def main() -> int:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model params: {n_params:,}", flush=True)
 
-    # Train.
+    # Train. Pass the final out_path as eager-save target so partial
+    # checkpoints land on disk at every val-acc improvement (crash-safety).
+    # Also pass cfg so the partial checkpoint carries enough info for
+    # nn_prior.load_conv_policy to reconstruct the model with the right
+    # backbone (otherwise non-default --backbone-channels / --n-blocks
+    # checkpoints can't be loaded).
     t0 = time.perf_counter()
     curve = train(
         model, x, gy, gx, labels, train_idx, val_idx,
         epochs=args.epochs, batch_size=args.batch_size,
         lr=args.lr, weight_decay=args.weight_decay,
+        eager_save_path=Path(args.out),
+        eager_save_cfg=asdict(cfg),
     )
     dt_train = time.perf_counter() - t0
     print(

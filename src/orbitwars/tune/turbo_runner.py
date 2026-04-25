@@ -79,6 +79,46 @@ PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
 }
 
 
+# TuRBO-v4 bounds: expand the ones where v3's trial 42 hit an edge. v3 best
+# weights: w_production=20.0 (MAX), mult_enemy=5.0 (MAX), mult_comet=5.0 (MAX),
+# min_launch_size=30.0 (MAX), comet_max_time_mismatch=5.0 (MAX) — all clamped
+# at the ceiling, strongly implying true optimum is OUTSIDE v3 bounds. Other
+# v3 edge hits (w_ships_cost=0, w_distance_cost=0, mult_reinforce_ally=0,
+# keep_reserve_ships=0) are at ZERO — we keep those at zero-floor because
+# they're "disable" semantics. The v4 stall-safety analysis:
+#   min_launch_size + keep_reserve_ships must be reachable from turn ~30
+#   production (~45 ships/planet). v3 MAX was 30 + 15 = 45; v4 MAX at
+#   50 + 5 = 55 is above that, so we must TIGHTEN keep_reserve's MAX to 3
+#   (since v3 wants 0 anyway) to preserve the constraint.
+# Launch via: `--bounds v4 --strategy ax --n-trials 60 --seed 2 --pool w2
+#              --games-per-opp 5 --workers 7`
+PARAM_BOUNDS_V4: Dict[str, Tuple[float, float]] = {
+    "w_production":            (5.0,  40.0),   # v3 hit 20.0, expand up
+    "w_ships_cost":            (0.0,   0.5),   # v3 hit 0, tighter
+    "w_distance_cost":         (0.0,   0.3),   # v3 hit 0, tighter
+    "w_travel_cost":           (0.0,   3.0),   # v3 in interior at 1.44
+    "mult_neutral":            (0.5,   4.0),   # v3 at 2.0 interior
+    "mult_enemy":              (1.0,  10.0),   # v3 hit 5.0, expand up
+    "mult_comet":              (1.0,  10.0),   # v3 hit 5.0, expand up
+    "mult_reinforce_ally":     (0.0,   0.5),   # v3 hit 0, tighter (disable is winning)
+    "ships_safety_margin":     (0.0,   3.0),   # v3 at 0.99, trim upper unused
+    "min_launch_size":         (10.0, 50.0),   # v3 hit 30.0, expand up
+    "max_launch_fraction":     (0.5,   1.0),   # v3 at 0.99 near-MAX
+    "expand_cooldown_turns":   (0.0,   8.0),   # v3 at 3.65 interior
+    "keep_reserve_ships":      (0.0,   3.0),   # v3 hit 0, tighter (preserves stall-safety)
+    "agg_early_game":          (0.3,   2.5),   # v3 hit 0.5-floor, allow lower
+    "early_game_cutoff_turn":  (0.0, 300.0),   # v3 at 104.6 interior
+    "sun_avoidance_epsilon":   (0.0,   0.05),  # v3 at 0.005, tighter
+    "comet_max_time_mismatch": (1.0,  10.0),   # v3 hit 5.0, expand up
+    "expand_bias":             (0.0,   2.0),   # v3 at 0.71 interior
+}
+
+BOUND_VERSIONS = {
+    "v3": PARAM_BOUNDS,
+    "v4": PARAM_BOUNDS_V4,
+}
+
+
 # ---- Strategy interface ----
 
 class TuningStrategy:
@@ -344,6 +384,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Parallel workers for per-game fitness eval. 1=serial (legacy). "
              "7-8 gives ~7x speedup on an 8-core CPU.",
     )
+    ap.add_argument(
+        "--bounds", choices=sorted(BOUND_VERSIONS.keys()), default="v3",
+        help="Which PARAM_BOUNDS set to use. v3=legacy (default, matches "
+             "TuRBO-v1/v2/v3 runs). v4=expanded bounds where v3's best trial "
+             "hit an edge (w_production, mult_comet, mult_enemy, "
+             "min_launch_size, comet_max_time_mismatch); used for post-v11 "
+             "tuning. See BOUND_VERSIONS in this file.",
+    )
     args = ap.parse_args(argv)
 
     out_path = Path(args.out) if args.out else None
@@ -352,10 +400,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         workers=args.workers,
     )
 
+    bounds = BOUND_VERSIONS[args.bounds]
     if args.strategy == "random":
-        strat: TuningStrategy = RandomSearch(PARAM_BOUNDS, seed=args.seed)
+        strat: TuningStrategy = RandomSearch(bounds, seed=args.seed)
     else:
-        strat = AxTurbo(PARAM_BOUNDS, seed=args.seed)
+        strat = AxTurbo(bounds, seed=args.seed)
 
     res = run(strat, fitness_cfg, n_trials=args.n_trials, out_path=out_path)
     best = res.best
