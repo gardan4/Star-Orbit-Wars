@@ -172,6 +172,15 @@ class GumbelConfig:
     # 150 ms is ~2\u00d7 the natural median for the heavy-state regime and
     # leaves room for n_sim \u2265 2 under the 300 ms default deadline.
     per_rollout_budget_ms: float = 150.0
+    # Macro-action library at root (Plan §6.4). When True, ``GumbelRootSearch``
+    # injects up to 4 pre-expanded "obvious" joint actions (HOLD-all,
+    # mass-attack-nearest, reinforce-weakest, retreat-to-largest) as
+    # additional candidates alongside the heuristic anchor and the
+    # Gumbel samples. Insurance against a bad NN prior; documented +Elo
+    # trick from microRTS literature. Macros are NOT protected from SH
+    # pruning — only the heuristic anchor stays protected. Default off
+    # so the v12 baseline path is bit-identical.
+    use_macros: bool = False
 
 
 # ---------------------------- Gumbel top-k --------------------------------
@@ -413,6 +422,12 @@ class SearchResult:
     q_values: List[float] = field(default_factory=list)
     visits: List[int] = field(default_factory=list)
     aborted: bool = False
+    # All joint candidates Sequential Halving evaluated this turn,
+    # parallel-indexed with q_values and visits. Carried for external
+    # tooling (tools/collect_mcts_demos.py) that wants the full visit
+    # distribution per planet, not just the winner. The act() hot path
+    # does not consume this — pure observability.
+    candidates: List[JointAction] = field(default_factory=list)
 
     @property
     def n_candidates(self) -> int:
@@ -462,6 +477,7 @@ def sequential_halving(
             q_values=[q_sum[0]],
             visits=list(visits),
             aborted=False,
+            candidates=list(candidates),
         )
 
     active = list(range(k))
@@ -515,6 +531,7 @@ def sequential_halving(
         q_values=q_avg,
         visits=list(visits),
         aborted=aborted,
+        candidates=list(candidates),
     )
 
 
@@ -734,20 +751,44 @@ class GumbelRootSearch:
         if anchor_joint is not None:
             anchor_key = tuple(tuple(m) for m in anchor_joint.to_wire())
 
-        # Sample Gumbel candidates. We leave one slot for the anchor so
-        # the total effective candidate count stays ~num_candidates.
-        sample_budget = self.gumbel_cfg.num_candidates - (1 if anchor_joint else 0)
+        # Optional macro candidates (Plan §6.4). Built once per turn,
+        # appended after the heuristic anchor and BEFORE Gumbel samples.
+        # Macros are not protected from SH pruning — they have to "earn"
+        # their visits through positive rollouts. The macro module also
+        # de-dupes against itself; we de-dupe against the anchor here.
+        macro_joints: List[JointAction] = []
+        macro_keys: set = set()
+        if self.gumbel_cfg.use_macros:
+            try:
+                from orbitwars.mcts.macros import build_macro_anchors
+                for mj in build_macro_anchors(po, per_planet):
+                    mk = tuple(tuple(m) for m in mj.to_wire())
+                    if mk == anchor_key or mk in macro_keys:
+                        continue
+                    macro_keys.add(mk)
+                    macro_joints.append(mj)
+            except Exception:
+                # Defensive: a buggy macro must NEVER forfeit a turn.
+                macro_joints = []
+                macro_keys = set()
+
+        # Sample Gumbel candidates. We leave slots for the anchor +
+        # macros so the total effective candidate count stays
+        # ~num_candidates.
+        reserved = (1 if anchor_joint else 0) + len(macro_joints)
+        sample_budget = self.gumbel_cfg.num_candidates - reserved
         sample_budget = max(sample_budget, 1)
         sampled = enumerate_joints(per_planet, sample_budget, self._rng)
 
         # Compose the final candidate list: anchor first (if any), then
-        # Gumbel samples that don't duplicate it.
+        # macros, then Gumbel samples that don't duplicate either.
         joints: List[JointAction] = []
         if anchor_joint is not None:
             joints.append(anchor_joint)
+        joints.extend(macro_joints)
         for j in sampled:
             key = tuple(tuple(m) for m in j.to_wire())
-            if key == anchor_key:
+            if key == anchor_key or key in macro_keys:
                 continue
             joints.append(j)
 
@@ -757,6 +798,7 @@ class GumbelRootSearch:
             return SearchResult(
                 best_joint=joints[0], n_rollouts=0, duration_ms=0.0,
                 q_values=[0.0], visits=[0], aborted=False,
+                candidates=list(joints),
             )
 
         # Build base state from obs once; rollouts deepcopy it per sim.

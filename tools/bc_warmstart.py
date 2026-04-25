@@ -125,7 +125,20 @@ def _load_or_collect_demos(
         x = data["x"]
         gy = data["gy"]
         gx = data["gx"]
-        labels = data["labels"]
+        # Support both formats:
+        #   * legacy heuristic-target: integer `labels` (one-hot training)
+        #   * MCTS-teacher: float `visit_dist` (soft-target training)
+        # We hand back a uniform array shape so the caller can decide which
+        # objective to use; train() inspects the dtype/dim to switch losses.
+        if "labels" in data.files:
+            labels = data["labels"]
+        elif "visit_dist" in data.files:
+            labels = data["visit_dist"].astype(np.float32)
+        else:
+            raise RuntimeError(
+                f"cache at {cache_path} has neither 'labels' nor "
+                f"'visit_dist' — keys: {list(data.files)}"
+            )
         shape_ok = (
             x.shape[1] == cfg.n_channels
             and x.shape[2] == cfg.grid_h
@@ -179,23 +192,48 @@ def _eval(
     labels: torch.Tensor,
     batch_size: int,
 ) -> Tuple[float, float]:
-    """Return (loss, acc) — no grad, eval mode."""
+    """Return (loss, acc) — no grad, eval mode.
+
+    Handles two label formats:
+      * 1D int labels → cross-entropy + argmax-accuracy.
+      * 2D float distributions → KL(soft_target || softmax(logits)) and
+        argmax-agreement accuracy (`pred_argmax == target_argmax`).
+    """
     model.eval()
     n = x.shape[0]
     total_loss = 0.0
     total_correct = 0
+    device = next(model.parameters()).device
+    is_pinned = (x.device.type == "cpu" and device.type == "cuda")
+    soft = labels.dim() == 2  # (N, 8) → soft targets
     with torch.no_grad():
         for start in range(0, n, batch_size):
             x_b = x[start : start + batch_size]
             gy_b = gy[start : start + batch_size]
             gx_b = gx[start : start + batch_size]
             y_b = labels[start : start + batch_size]
+            if is_pinned:
+                x_b = x_b.to(device, non_blocking=True)
+                gy_b = gy_b.to(device, non_blocking=True)
+                gx_b = gx_b.to(device, non_blocking=True)
+                y_b = y_b.to(device, non_blocking=True)
             logits, _ = model(x_b)
             b = x_b.shape[0]
             per_cell = logits[torch.arange(b, device=logits.device), :, gy_b, gx_b]
-            loss = F.cross_entropy(per_cell, y_b, reduction="sum")
-            total_loss += loss.item()
-            total_correct += (per_cell.argmax(dim=-1) == y_b).sum().item()
+            if soft:
+                log_probs = F.log_softmax(per_cell, dim=-1)
+                # PyTorch's KL: sum over channels of target * (log_target - log_pred).
+                # Use cross-entropy form (drop the entropy of target — constant
+                # in y_b) so the gradient signal is identical: -sum target * log_pred.
+                loss = -(y_b * log_probs).sum()
+                total_loss += loss.item()
+                pred_argmax = per_cell.argmax(dim=-1)
+                tgt_argmax = y_b.argmax(dim=-1)
+                total_correct += (pred_argmax == tgt_argmax).sum().item()
+            else:
+                loss = F.cross_entropy(per_cell, y_b, reduction="sum")
+                total_loss += loss.item()
+                total_correct += (per_cell.argmax(dim=-1) == y_b).sum().item()
     return total_loss / max(1, n), total_correct / max(1, n)
 
 
@@ -239,10 +277,21 @@ def train(
     best_val_acc = -math.inf
     best_state = None
 
+    # Detect whether tensors live on CPU (GPU training pattern: transfer
+    # per batch) or already on the same device as the model (CPU
+    # training: slice in place).
+    is_pinned = (x_tr.device.type == "cpu" and device.type == "cuda")  # name kept for compat
+    # Detect label format: 1D int = cross-entropy, 2D float = soft KL.
+    soft = y_tr.dim() == 2
+
     n_tr = x_tr.shape[0]
+    # Permutation index lives on CPU when transferring per-batch (we need
+    # to slice CPU tensors with it); on GPU when tensors already live on
+    # the target device.
+    perm_device = "cpu" if is_pinned else device
     for epoch in range(epochs):
         model.train()
-        perm = torch.randperm(n_tr, device=device)
+        perm = torch.randperm(n_tr, device=perm_device)
         total_loss = 0.0
         total_correct = 0
         for start in range(0, n_tr, batch_size):
@@ -251,15 +300,29 @@ def train(
             gy_b = gy_tr[idx]
             gx_b = gx_tr[idx]
             y_b = y_tr[idx]
+            if is_pinned:
+                x_b = x_b.to(device, non_blocking=True)
+                gy_b = gy_b.to(device, non_blocking=True)
+                gx_b = gx_b.to(device, non_blocking=True)
+                y_b = y_b.to(device, non_blocking=True)
             logits, _value = model(x_b)
             b = x_b.shape[0]
             per_cell = logits[torch.arange(b, device=device), :, gy_b, gx_b]
-            loss = F.cross_entropy(per_cell, y_b)
+            if soft:
+                # Cross-entropy form of KL — constant target-entropy term
+                # drops out, so the gradient is the same as KL_div.
+                log_probs = F.log_softmax(per_cell, dim=-1)
+                loss = -(y_b * log_probs).sum(dim=-1).mean()
+                pred_argmax = per_cell.argmax(dim=-1)
+                tgt_argmax = y_b.argmax(dim=-1)
+                total_correct += (pred_argmax == tgt_argmax).sum().item()
+            else:
+                loss = F.cross_entropy(per_cell, y_b)
+                total_correct += (per_cell.argmax(dim=-1) == y_b).sum().item()
             opt.zero_grad()
             loss.backward()
             opt.step()
             total_loss += loss.item() * b
-            total_correct += (per_cell.argmax(dim=-1) == y_b).sum().item()
 
         tr_loss = total_loss / max(1, n_tr)
         tr_acc = total_correct / max(1, n_tr)
@@ -337,6 +400,8 @@ def main() -> int:
                     help="Default = ConvPolicyCfg default")
     ap.add_argument("--n-blocks", type=int, default=None,
                     help="Default = ConvPolicyCfg default")
+    ap.add_argument("--augment-4fold", action="store_true",
+                    help="Apply 4-fold rotational augmentation (4× demos for free)")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -366,11 +431,42 @@ def main() -> int:
         cache_path, args.games, cfg, regen=args.regen,
     )
     demo_hash = _demos_hash(x_np, labels_np)
+    n_raw = len(labels_np)
+
+    # Optional 4-fold rotational augmentation (Plan §"Shared infra"). The
+    # board has C4 symmetry around the sun, so each demo can be rotated
+    # 0/90/180/270 degrees to give 4× the training signal at zero new
+    # game-collection cost. The augment also rotates the action label
+    # (angle bucket → (bucket + k) mod 4) and the angle-vector channels
+    # (fleet_angle_cos/sin per cell). Off by default for bit-identity with
+    # the BC v2 baseline; pass --augment-4fold to enable.
+    if args.augment_4fold:
+        from orbitwars.nn.bc_augment import augment_4fold
+        x_np, gy_np, gx_np, labels_np = augment_4fold(
+            x_np, gy_np, gx_np, labels_np,
+        )
+        print(
+            f"4-fold augmentation: {n_raw:,} demos -> {len(labels_np):,} (4×)",
+            flush=True,
+        )
     n = len(labels_np)
 
-    # Class distribution sanity.
-    counts = np.bincount(labels_np, minlength=len(ACTION_LOOKUP))
-    print("label histogram:", flush=True)
+    # Class distribution sanity. For soft-target labels (2D), reduce to
+    # argmax so the histogram is comparable across formats.
+    if labels_np.ndim == 2:
+        print("label format: SOFT (visit-distribution targets)", flush=True)
+        argmax_labels = labels_np.argmax(axis=1)
+        counts = np.bincount(argmax_labels, minlength=len(ACTION_LOOKUP))
+        # Also report mean target entropy as a quality signal.
+        eps = 1e-12
+        ent = float(np.mean(
+            -(labels_np * np.log(labels_np + eps)).sum(axis=1)
+        ))
+        print(f"target mean entropy: {ent:.3f} (uniform = {np.log(8):.3f})", flush=True)
+    else:
+        print("label format: HARD (one-hot integer labels)", flush=True)
+        counts = np.bincount(labels_np, minlength=len(ACTION_LOOKUP))
+    print("label histogram (argmax):", flush=True)
     for i, (ab, fr) in enumerate(ACTION_LOOKUP):
         print(
             f"  {i}: bucket={ab} frac={fr:<4}  "
@@ -385,14 +481,26 @@ def main() -> int:
     )
 
     # Move to device and split.
-    x = torch.from_numpy(x_np).to(device)
-    gy = torch.from_numpy(gy_np).to(device)
-    gx = torch.from_numpy(gx_np).to(device)
-    labels = torch.from_numpy(labels_np).to(device)
+    # IMPORTANT: a 122k-demo run at 12 channels x 50x50 fp32 needs
+    # 122_725 * 12 * 50 * 50 * 4 / 1e9 = ~1.5 GB just for the input
+    # tensor — plus activations during training, that's 4-5 GB on its
+    # own. With our 8 GB RTX 3070 we have to KEEP DEMOS PINNED ON CPU
+    # and transfer per-batch. Pinning the host allocator makes the
+    # cudaMemcpy ~2x faster and avoids the OOM that otherwise drops us
+    # into shared-memory swap (which is what made prior GPU runs hang).
+    # On Windows, the pinned-host-memory pool is small and `pin_memory()`
+    # OOMs even when the GPU has plenty of free space. Plain CPU tensors
+    # + per-batch `.to(device)` transfer is a touch slower but reliable.
+    on_gpu = device.type == "cuda"
+    x = torch.from_numpy(x_np)
+    gy = torch.from_numpy(gy_np)
+    gx = torch.from_numpy(gx_np)
+    labels = torch.from_numpy(labels_np)
     train_idx, val_idx = _train_val_split(n, args.val_frac, args.seed)
     print(
         f"tensors: x={tuple(x.shape)}  labels={tuple(labels.shape)}  "
-        f"device={x.device}  train={len(train_idx):,} val={len(val_idx):,}",
+        f"device=cpu(pinned={on_gpu}) "
+        f"train={len(train_idx):,} val={len(val_idx):,}",
         flush=True,
     )
 

@@ -143,6 +143,8 @@ def bundle_bot(
     nn_checkpoint: Path | None = None,
     nn_temperature: float | None = None,
     nn_hold_neutral_prob: float | None = None,
+    use_macros: bool | None = None,
+    nn_dataset_path: str | None = None,
 ) -> None:
     if bot_name not in BOT_RECIPES:
         raise SystemExit(f"Unknown bot '{bot_name}'. Known: {list(BOT_RECIPES)}")
@@ -153,16 +155,35 @@ def bundle_bot(
     # The ConvPolicy import path nn.conv_policy → no orbitwars sibling
     # imports inside it (only torch), so order with respect to other
     # orbitwars modules doesn't matter beyond "before mcts_bot".
-    if nn_checkpoint is not None:
+    if nn_checkpoint is not None and nn_dataset_path is not None:
+        raise SystemExit(
+            "Use either --nn-checkpoint (base64-inline) or "
+            "--nn-dataset-path (read from Kaggle Dataset at runtime), not both."
+        )
+
+    if nn_checkpoint is not None or nn_dataset_path is not None:
         if bot_name != "mcts_bot":
             raise SystemExit(
-                f"--nn-checkpoint only applies to bot=mcts_bot (got {bot_name!r})"
+                f"--nn-checkpoint / --nn-dataset-path only apply to "
+                f"bot=mcts_bot (got {bot_name!r})"
             )
         modules = list(modules)
         # Insert just before bots.mcts_bot (which is the last entry).
         insert_at = modules.index("bots.mcts_bot")
         modules.insert(insert_at, "nn.conv_policy")
         modules.insert(insert_at + 1, "nn.nn_prior")
+
+    if use_macros:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--use-macros only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        modules = list(modules)
+        # mcts.macros has no orbitwars siblings except the modules already
+        # in the recipe. Insert before bots.mcts_bot.
+        insert_at = modules.index("bots.mcts_bot")
+        if "mcts.macros" not in modules:
+            modules.insert(insert_at, "mcts.macros")
 
     parts: List[str] = [HEADER.format(timestamp=time.strftime("%Y-%m-%d %H:%M:%S"), bot_name=bot_name)]
     seen_future: List[str] = []
@@ -249,6 +270,13 @@ def bundle_bot(
         # GumbelConfig attribute. It goes into factory_kwargs, not cfg_setters.
         factory_kwargs.append(f"use_opponent_model={bool(use_opponent_model)!r}")
 
+    if use_macros is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--use-macros only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        cfg_setters.append(f"_bundle_cfg.use_macros = {bool(use_macros)!r}")
+
     # NN-prior wiring. The .pt checkpoint is base64-inlined into the
     # bundled .py so the submission is single-file (no separate Kaggle
     # Dataset upload step). At ~1.8 MB fp32 the encoded text is ~2.4 MB,
@@ -257,33 +285,56 @@ def bundle_bot(
     # ConvPolicy, and builds a `_bundle_move_prior_fn` that's threaded
     # into the agent factory below.
     nn_bootstrap_lines: List[str] = []
-    if nn_checkpoint is not None:
-        ckpt_path = Path(nn_checkpoint)
-        if not ckpt_path.exists():
-            raise SystemExit(f"--nn-checkpoint: file not found at {ckpt_path}")
-        import base64 as _b64
-        ckpt_bytes = ckpt_path.read_bytes()
-        encoded = _b64.b64encode(ckpt_bytes).decode("ascii")
-        # Wrap the long line every 76 chars (RFC 2045 friendliness; keeps
-        # the .py file diff-readable and editor-friendly).
-        wrapped = "\n".join(
-            encoded[i : i + 76] for i in range(0, len(encoded), 76)
-        )
+    if nn_checkpoint is not None or nn_dataset_path is not None:
         temp = float(nn_temperature) if nn_temperature is not None else 1.0
         hold_p = float(nn_hold_neutral_prob) if nn_hold_neutral_prob is not None else 0.05
+
+        load_lines: List[str] = []
+        header_comment: str = ""
+        if nn_checkpoint is not None:
+            ckpt_path = Path(nn_checkpoint)
+            if not ckpt_path.exists():
+                raise SystemExit(f"--nn-checkpoint: file not found at {ckpt_path}")
+            import base64 as _b64
+            ckpt_bytes = ckpt_path.read_bytes()
+            encoded = _b64.b64encode(ckpt_bytes).decode("ascii")
+            wrapped = "\n".join(
+                encoded[i : i + 76] for i in range(0, len(encoded), 76)
+            )
+            header_comment = "--nn-checkpoint (base64 inline)"
+            load_lines = [
+                "import base64 as _bundle_b64",
+                "import io as _bundle_io",
+                "import torch as _bundle_torch",
+                "_BUNDLE_BC_CKPT_B64 = (",
+                *(f"    {line!r}" for line in wrapped.split("\n")),
+                ")",
+                "_bundle_ckpt_bytes = _bundle_b64.b64decode(\"\".join(_BUNDLE_BC_CKPT_B64))",
+                "_bundle_ckpt = _bundle_torch.load(",
+                "    _bundle_io.BytesIO(_bundle_ckpt_bytes),",
+                "    map_location=\"cpu\", weights_only=False,",
+                ")",
+            ]
+        else:
+            # Kaggle Dataset path: bundle reads the .pt at runtime from
+            # /kaggle/input/<slug>/<file>.  This adds zero bytes to the
+            # bundled .py and bypasses Kaggle's ~1-2 MB notebook-size cap.
+            # Caller must also set kernel-metadata.json's `dataset_sources`
+            # (see tools/build_kaggle_notebook.py --dataset-source).
+            assert nn_dataset_path is not None
+            ds_path = nn_dataset_path
+            header_comment = f"--nn-dataset-path {ds_path}"
+            load_lines = [
+                "import torch as _bundle_torch",
+                f"_BUNDLE_BC_CKPT_PATH = {ds_path!r}",
+                "_bundle_ckpt = _bundle_torch.load(",
+                "    _BUNDLE_BC_CKPT_PATH, map_location=\"cpu\", weights_only=False,",
+                ")",
+            ]
+
         nn_bootstrap_lines = [
-            "\n# --- NN prior bootstrap (--nn-checkpoint) ---",
-            "import base64 as _bundle_b64",
-            "import io as _bundle_io",
-            "import torch as _bundle_torch",
-            "_BUNDLE_BC_CKPT_B64 = (",
-            *(f"    {line!r}" for line in wrapped.split("\n")),
-            ")",
-            "_bundle_ckpt_bytes = _bundle_b64.b64decode(\"\".join(_BUNDLE_BC_CKPT_B64))",
-            "_bundle_ckpt = _bundle_torch.load(",
-            "    _bundle_io.BytesIO(_bundle_ckpt_bytes),",
-            "    map_location=\"cpu\", weights_only=False,",
-            ")",
+            f"\n# --- NN prior bootstrap ({header_comment}) ---",
+            *load_lines,
             "if 'model_state' in _bundle_ckpt and 'cfg' in _bundle_ckpt:",
             "    _bundle_cfg_nn = ConvPolicyCfg(**_bundle_ckpt['cfg'])",
             "    _bundle_model = ConvPolicy(_bundle_cfg_nn)",
@@ -299,7 +350,7 @@ def bundle_bot(
             "    _bundle_model, _bundle_cfg_nn,",
             f"    hold_neutral_prob={hold_p!r}, temperature={temp!r},",
             ")",
-            "del _bundle_ckpt_bytes, _bundle_ckpt  # free ~2 MB before play starts",
+            "del _bundle_ckpt  # free RAM after model is built",
         ]
         factory_kwargs.append("move_prior_fn=_bundle_move_prior_fn")
 
@@ -458,7 +509,22 @@ def main() -> int:
             "with a ConvPolicy-derived move_prior_fn that overwrites the "
             "heuristic priors at the MCTS root. Only applies to "
             "bot=mcts_bot. Bundle size grows by ~1.4× the checkpoint "
-            "size (~2.4 MB for the default ConvPolicyCfg)."
+            "size (~2.4 MB for the default ConvPolicyCfg). For larger "
+            "checkpoints that exceed Kaggle's notebook size limit, use "
+            "--nn-dataset-path instead."
+        ),
+    )
+    ap.add_argument(
+        "--nn-dataset-path",
+        default=None,
+        help=(
+            "Runtime path to the BC checkpoint inside a mounted Kaggle "
+            "Dataset (e.g. '/kaggle/input/orbit-wars-bc-v2/bc_warmstart_v2.pt'). "
+            "Bundle reads it via torch.load at startup instead of "
+            "base64-decoding inline. Adds zero bytes to the .py, but the "
+            "Kaggle Notebook MUST list the dataset slug under "
+            "kernel-metadata.json's `dataset_sources` (use "
+            "tools/build_kaggle_notebook.py --dataset-source)."
         ),
     )
     ap.add_argument(
@@ -469,6 +535,18 @@ def main() -> int:
             "Softmax temperature for NN prior. Default 1.0. >1 flattens "
             "(more exploration), <1 sharpens (more confidence in NN). "
             "Only used when --nn-checkpoint is set."
+        ),
+    )
+    ap.add_argument(
+        "--use-macros",
+        default=None,
+        choices=["true", "false"],
+        help=(
+            "Inject the 4-macro library (HOLD-all, mass-attack-nearest, "
+            "reinforce-weakest, retreat-to-largest) as additional root "
+            "candidates alongside the heuristic anchor. Plan §6.4. "
+            "Only applies to bot=mcts_bot. Off by default for "
+            "bit-identity with the v12 baseline."
         ),
     )
     ap.add_argument(
@@ -520,6 +598,9 @@ def main() -> int:
     use_opp_model: bool | None = None
     if args.use_opponent_model is not None:
         use_opp_model = args.use_opponent_model == "true"
+    use_macros_flag: bool | None = None
+    if args.use_macros is not None:
+        use_macros_flag = args.use_macros == "true"
     bundle_bot(
         args.bot, out,
         weights_override=weights_override,
@@ -531,6 +612,8 @@ def main() -> int:
         nn_checkpoint=Path(args.nn_checkpoint) if args.nn_checkpoint else None,
         nn_temperature=args.nn_temperature,
         nn_hold_neutral_prob=args.nn_hold_neutral_prob,
+        use_macros=use_macros_flag,
+        nn_dataset_path=args.nn_dataset_path,
     )
     print(f"Bundled {args.bot} -> {out} ({out.stat().st_size} bytes)")
     if args.sim_move_variant:

@@ -8,6 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+.venv-gpu
 
 # Secrets
 .env
@@ -21,3 +22,54 @@ logs/
 # Claude Code local files
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# ---------------------------------------------------------------------------
+# Training artifacts under runs/ — too big or too noisy to track. JSON
+# files in runs/ ARE worth tracking (small, record TuRBO bests / smoke
+# results), so we don't ignore the whole dir.
+# ---------------------------------------------------------------------------
+
+# Demo caches (100+ MB each).
+runs/*.npz
+
+# Model checkpoints (~1-2 MB each, regeneratable).
+runs/*.pt
+
+# Verbose training / smoke / poll logs (regenerate by re-running).
+runs/*.log
+
+# Kaggle kernel output dumps (binary HTML / generated code).
+runs/*_kernel_output/
+
+# One-off bundle .py files dropped into runs/ for ad-hoc smokes.
+runs/v*.py
+runs/_*.py
+runs/_*.npz
+runs/_*.pt
+runs/v12_fake_smoke/
+runs/v*_smoke/
+
+# ---------------------------------------------------------------------------
+# Submission build artifacts — most are regeneratable from source.
+# We keep submissions/README.md committed; the rest is auto-built and
+# the bundle .py files are large (650 KB - 3 MB).
+# ---------------------------------------------------------------------------
+
+# Kaggle notebook wrappers (built from submissions/v*.py via build_kaggle_notebook).
+submissions/kaggle_notebook*/
+
+# Kaggle Dataset staging dirs (checkpoints duplicated from runs/).
+submissions/*_dataset/
+
+# Local-only bundles built for H2H smokes / experiments.
+submissions/v*_inline.py
+submissions/v*_small.py
+submissions/v11_1.py
+submissions/heuristic_v*.py
+
+# Auto-built ship bundles. Each is the .py output of tools/bundle.py and
+# can be reproduced from source + a TuRBO weights JSON + a BC checkpoint.
+# We keep version metadata in submissions/README.md instead.
+submissions/v*.py
+submissions/mcts_v*.py
+submissions/noop*.py

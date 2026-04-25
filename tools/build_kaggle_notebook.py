@@ -97,12 +97,18 @@ def build_notebook(bundle_path: Path, title: str) -> dict:
     }
 
 
-def build_metadata(slug: str, title: str, notebook_file: str) -> dict:
+def build_metadata(
+    slug: str, title: str, notebook_file: str,
+    dataset_sources: list | None = None,
+) -> dict:
     # Canonical kernel-metadata.json for a competition-bound notebook.
     # - is_private: true so the kernel stays unlisted while we iterate.
     # - enable_internet: false — Kaggle submission kernels run offline;
     #   our bundle has no remote-fetch dependencies.
     # - competition_sources links the kernel to the comp for submission.
+    # - dataset_sources mounts each `<owner>/<dataset>` slug at
+    #   `/kaggle/input/<dataset>/`. Used by the v17+ ship path to read a
+    #   BC checkpoint that's too big to base64-inline (~>1 MB).
     # See https://github.com/Kaggle/kaggle-api for schema.
     return {
         "id": slug,
@@ -114,7 +120,7 @@ def build_metadata(slug: str, title: str, notebook_file: str) -> dict:
         "enable_gpu": False,
         "enable_tpu": False,
         "enable_internet": False,
-        "dataset_sources": [],
+        "dataset_sources": list(dataset_sources or []),
         "competition_sources": ["orbit-wars"],
         "kernel_sources": [],
     }
@@ -150,6 +156,14 @@ def main() -> int:
         "--out", default="submissions/kaggle_notebook",
         help="Output directory for notebook + metadata",
     )
+    ap.add_argument(
+        "--dataset-source", action="append", default=[],
+        help=(
+            "Kaggle Dataset slug (e.g. gardan4/orbit-wars-bc-v2) to mount "
+            "at /kaggle/input/<dataset-name>/. Repeat for multiple. "
+            "Required when the bundle uses --nn-dataset-path."
+        ),
+    )
     args = ap.parse_args()
 
     bundle = Path(args.bundle)
@@ -163,7 +177,10 @@ def main() -> int:
     md_path = out_dir / "kernel-metadata.json"
 
     nb = build_notebook(bundle, args.title)
-    md = build_metadata(args.slug, args.title, nb_filename)
+    md = build_metadata(
+        args.slug, args.title, nb_filename,
+        dataset_sources=args.dataset_source,
+    )
 
     nb_path.write_text(json.dumps(nb, indent=1), encoding="utf-8")
     md_path.write_text(json.dumps(md, indent=2), encoding="utf-8")

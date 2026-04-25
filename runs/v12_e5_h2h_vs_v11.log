@@ -1,5 +1,0 @@
-Loading environment open_spiel_env failed: No module named 'pokerkit'
-Loading environment werewolf failed: No module named 'pydantic'
-Round-robin: 2 bundles, 20 games/pair, timeout=1.0s
-
-=== v12_e5 vs v11 (20 games) ===

@@ -171,6 +171,37 @@ def test_sequential_halving_single_candidate_short_circuits():
     assert res.q_values[0] == pytest.approx(0.5)
 
 
+def test_sequential_halving_exposes_full_candidate_list():
+    """Result should carry every candidate evaluated (not just the
+    winner) so external tooling — distillation BC, ablations,
+    diagnostics — can read the full visit distribution. Parallel-indexed
+    with `visits` and `q_values`."""
+    joints = _mk_distinct_joints(4)
+    values = [0.0, 0.5, 0.9, 0.1]
+
+    def rollout_fn(j: JointAction) -> float:
+        return values[joints.index(j)]
+
+    cfg = GumbelConfig(num_candidates=4, total_sims=32, rollout_depth=1)
+    res = sequential_halving(joints, rollout_fn, cfg)
+    # candidates field present + parallel-indexed.
+    assert hasattr(res, "candidates")
+    assert len(res.candidates) == 4
+    assert len(res.visits) == 4
+    assert len(res.q_values) == 4
+    # Same identity as the input joints.
+    for i, j in enumerate(joints):
+        assert res.candidates[i] is j
+    # Single-candidate path also populates the list.
+    j1 = _mk_distinct_joints(1)[0]
+    res1 = sequential_halving(
+        [j1], lambda _: 0.5,
+        GumbelConfig(num_candidates=1, total_sims=10, rollout_depth=1),
+    )
+    assert len(res1.candidates) == 1
+    assert res1.candidates[0] is j1
+
+
 def test_sequential_halving_respects_deadline():
     """A rollout that sleeps long enough to blow the budget should
     cause the loop to abort cleanly."""

@@ -91,6 +91,12 @@ class MCTSAgent(Agent):
         # Posterior is created lazily on turn 0 so per-match state
         # resets come free with the existing turn-0 reset path below.
         self.opp_posterior: Optional[ArchetypePosterior] = None
+        # External-observability handle: the most recent SearchResult
+        # produced by act() (or None if act() returned a fallback). Used
+        # by tools/collect_mcts_demos.py to read per-candidate visits
+        # for AlphaZero-style distillation BC. Pure observability — the
+        # act() hot path does not consume this.
+        self.last_search_result: Optional[Any] = None
 
         # Posterior telemetry — cheap counters so smokes can reason about
         # WHY a run did or didn't see a use-model delta (vs. a null result
@@ -357,6 +363,8 @@ class MCTSAgent(Agent):
                 "last_top_name": None,
                 "last_top_prob": 0.0,
             }
+            # Clear stale search result from the previous match.
+            self.last_search_result = None
 
         # Stage the heuristic action as our floor. If search wins, we
         # overwrite; if it doesn't, we return this. The fallback here is
@@ -503,8 +511,14 @@ class MCTSAgent(Agent):
                     pass
 
         if result is None:
+            self.last_search_result = None
             return heuristic_move
 
+        # Stash the SearchResult so external tooling (e.g.
+        # `tools/collect_mcts_demos.py`) can read the per-candidate
+        # visit counts without re-running search. The attribute is
+        # NOT used by the act() hot path itself — pure observability.
+        self.last_search_result = result
         action = result.best_joint.to_wire()
         deadline.stage(action)
         return action

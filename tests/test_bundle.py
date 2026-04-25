@@ -285,7 +285,8 @@ def test_bundle_nn_checkpoint_inlines_modules_and_factory(tmp_path):
     assert "# --- inlined: orbitwars/nn/conv_policy.py ---" in src
     assert "# --- inlined: orbitwars/nn/nn_prior.py ---" in src
     # NN bootstrap + checkpoint base64.
-    assert "# --- NN prior bootstrap (--nn-checkpoint) ---" in src
+    assert "# --- NN prior bootstrap" in src
+    assert "(--nn-checkpoint" in src  # mode marker in the comment
     assert "_BUNDLE_BC_CKPT_B64 = (" in src
     assert "_bundle_move_prior_fn = make_nn_prior_fn(" in src
     # Factory rewritten to thread move_prior_fn.
@@ -298,7 +299,7 @@ def test_bundle_nn_checkpoint_rejects_non_mcts_bot(tmp_path):
     ck = tmp_path / "fake_bc.pt"
     _make_fake_bc_checkpoint(ck)
     out = tmp_path / "h.py"
-    with pytest.raises(SystemExit, match="nn-checkpoint only applies"):
+    with pytest.raises(SystemExit, match="only apply to bot=mcts_bot"):
         bundle_bot("heuristic", out, nn_checkpoint=ck)
 
 
@@ -361,6 +362,115 @@ def test_bundle_nn_checkpoint_with_weights_and_variant_coexist(tmp_path):
     # Factory has BOTH gumbel_cfg AND move_prior_fn kwargs.
     assert "gumbel_cfg=_bundle_cfg" in src
     assert "move_prior_fn=_bundle_move_prior_fn" in src
+
+
+def test_bundle_use_macros_injects_cfg_and_inlines_module(tmp_path):
+    """--use-macros should inline the macros module and emit the
+    GumbelConfig setter."""
+    out = tmp_path / "macros.py"
+    bundle_bot("mcts_bot", out, use_macros=True)
+    src = out.read_text(encoding="utf-8")
+    assert "# --- inlined: orbitwars/mcts/macros.py ---" in src
+    assert "_bundle_cfg.use_macros = True" in src
+    assert "from orbitwars.mcts.macros import build_macro_anchors" not in src, (
+        "bundled file should not contain orbitwars-package imports — they "
+        "should have been stripped in favor of the inlined module"
+    )
+
+
+def test_bundle_use_macros_false_explicit_emits_setter(tmp_path):
+    """--use-macros=false should still emit a setter (so the bundle's
+    behavior is locked, not relying on dataclass defaults)."""
+    out = tmp_path / "macros_off.py"
+    bundle_bot("mcts_bot", out, use_macros=False)
+    src = out.read_text(encoding="utf-8")
+    # When use_macros=False, the modules list does NOT include macros
+    # but a `_bundle_cfg.use_macros = False` setter is emitted.
+    assert "_bundle_cfg.use_macros = False" in src
+    assert "# --- inlined: orbitwars/mcts/macros.py ---" not in src
+
+
+def test_bundle_use_macros_requires_mcts_bot(tmp_path):
+    out = tmp_path / "h.py"
+    with pytest.raises(SystemExit, match="use-macros only applies"):
+        bundle_bot("heuristic", out, use_macros=True)
+
+
+def test_bundle_macros_with_nn_and_weights_coexist(tmp_path):
+    """The full v14 candidate stack: TuRBO weights + exp3 + NN prior +
+    macros all in one bundle."""
+    pytest.importorskip("torch")
+    ck = tmp_path / "fake_bc.pt"
+    _make_fake_bc_checkpoint(ck)
+    out = tmp_path / "v14.py"
+    bundle_bot(
+        "mcts_bot", out,
+        weights_override={"w_production": 20.0},
+        sim_move_variant="exp3",
+        exp3_eta=0.3,
+        rollout_policy="fast",
+        anchor_margin=0.5,
+        nn_checkpoint=ck,
+        use_macros=True,
+    )
+    src = out.read_text(encoding="utf-8")
+    assert "HEURISTIC_WEIGHTS.update({" in src
+    assert "_bundle_cfg.sim_move_variant = 'exp3'" in src
+    assert "_bundle_cfg.rollout_policy = 'fast'" in src
+    assert "_bundle_cfg.anchor_improvement_margin = 0.5" in src
+    assert "_bundle_cfg.use_macros = True" in src
+    assert "# --- inlined: orbitwars/mcts/macros.py ---" in src
+    assert "_bundle_move_prior_fn = make_nn_prior_fn(" in src
+    assert "move_prior_fn=_bundle_move_prior_fn" in src
+    # End-to-end importable.
+    m = _import_bundle(out, "bundle_v14_test")
+    assert callable(m.agent)
+    assert m._bundle_cfg.use_macros is True
+
+
+def test_bundle_nn_dataset_path_emits_runtime_load(tmp_path):
+    """--nn-dataset-path should emit a runtime torch.load(path) — no
+    base64 inlining — and add ZERO bytes to the bundle beyond the
+    nn_prior + conv_policy module sources."""
+    pytest.importorskip("torch")
+    out = tmp_path / "v17.py"
+    bundle_bot(
+        "mcts_bot", out,
+        nn_dataset_path="/kaggle/input/orbit-wars-bc-v2/bc_warmstart_v2.pt",
+    )
+    src = out.read_text(encoding="utf-8")
+    assert "_BUNDLE_BC_CKPT_PATH = '/kaggle/input/orbit-wars-bc-v2/" in src
+    assert "_BUNDLE_BC_CKPT_B64" not in src, (
+        "dataset path should not embed base64 — that's the inline-checkpoint "
+        "code path"
+    )
+    # Both branches of the load decoder still emitted (so partial+full
+    # checkpoint formats both work at runtime).
+    assert "if 'model_state' in _bundle_ckpt and 'cfg' in _bundle_ckpt:" in src
+    assert "elif 'model_state_dict' in _bundle_ckpt:" in src
+    # Bundle stays small — no inline checkpoint.
+    assert out.stat().st_size < 500_000, (
+        f"bundle should be <500 KB without inline ckpt, got {out.stat().st_size}"
+    )
+
+
+def test_bundle_nn_dataset_and_checkpoint_mutually_exclusive(tmp_path):
+    pytest.importorskip("torch")
+    ck = tmp_path / "fake.pt"
+    _make_fake_bc_checkpoint(ck)
+    out = tmp_path / "broken.py"
+    with pytest.raises(SystemExit, match="Use either --nn-checkpoint"):
+        bundle_bot(
+            "mcts_bot", out,
+            nn_checkpoint=ck,
+            nn_dataset_path="/kaggle/input/x/y.pt",
+        )
+
+
+def test_bundle_nn_dataset_path_requires_mcts_bot(tmp_path):
+    out = tmp_path / "h.py"
+    with pytest.raises(SystemExit, match="only apply to bot=mcts_bot"):
+        bundle_bot("heuristic", out, nn_dataset_path="/kaggle/x/y.pt")
 
 
 def test_bundle_nn_checkpoint_importable_and_agent_callable(tmp_path):
