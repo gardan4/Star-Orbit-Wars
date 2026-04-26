@@ -356,6 +356,9 @@ def _build_fitness_cfg(
         opps = w1_pool()
     elif pool_name == "w2":
         opps = w2_pool()
+    elif pool_name == "w3":
+        from orbitwars.tune.fitness import w3_pool
+        opps = w3_pool()
     else:
         raise ValueError(f"unknown pool: {pool_name}")
     return FitnessConfig(
@@ -372,8 +375,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--strategy", choices=["random", "ax"], default="random")
     ap.add_argument("--n-trials", type=int, default=20)
     ap.add_argument(
-        "--pool", choices=["starter", "w1", "w2"], default="starter",
-        help="w2 = starter + random + 7 archetypes (richer signal than starter-only)",
+        "--pool", choices=["starter", "w1", "w2", "w3"], default="starter",
+        help=("w2 = starter + random + 7 archetypes (richer signal than "
+              "starter-only). w3 = w2 + heur_default + heur_v2 + heur_v3 "
+              "(de-saturates the top end so TuRBO has gradient when weights "
+              "already crush archetypes)."),
     )
     ap.add_argument("--games-per-opp", type=int, default=10)
     ap.add_argument("--step-timeout", type=float, default=5.0)

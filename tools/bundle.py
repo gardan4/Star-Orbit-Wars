@@ -145,6 +145,8 @@ def bundle_bot(
     nn_hold_neutral_prob: float | None = None,
     use_macros: bool | None = None,
     nn_dataset_path: str | None = None,
+    total_sims: int | None = None,
+    hard_deadline_ms: float | None = None,
 ) -> None:
     if bot_name not in BOT_RECIPES:
         raise SystemExit(f"Unknown bot '{bot_name}'. Known: {list(BOT_RECIPES)}")
@@ -246,9 +248,16 @@ def bundle_bot(
             raise SystemExit(
                 f"--rollout-policy only applies to bot=mcts_bot (got {bot_name!r})"
             )
-        if rollout_policy not in ("heuristic", "fast"):
+        if rollout_policy not in ("heuristic", "fast", "nn_value"):
             raise SystemExit(
-                f"--rollout-policy must be 'heuristic' or 'fast' (got {rollout_policy!r})"
+                f"--rollout-policy must be 'heuristic'|'fast'|'nn_value' "
+                f"(got {rollout_policy!r})"
+            )
+        if rollout_policy == "nn_value" and nn_checkpoint is None and nn_dataset_path is None:
+            raise SystemExit(
+                "--rollout-policy=nn_value requires --nn-checkpoint or "
+                "--nn-dataset-path so the value head can be loaded; "
+                "without one the search has no value_fn to call."
             )
         cfg_setters.append(f"_bundle_cfg.rollout_policy = {rollout_policy!r}")
 
@@ -276,6 +285,20 @@ def bundle_bot(
                 f"--use-macros only applies to bot=mcts_bot (got {bot_name!r})"
             )
         cfg_setters.append(f"_bundle_cfg.use_macros = {bool(use_macros)!r}")
+
+    if total_sims is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--total-sims only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        cfg_setters.append(f"_bundle_cfg.total_sims = {int(total_sims)!r}")
+
+    if hard_deadline_ms is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--hard-deadline-ms only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        cfg_setters.append(f"_bundle_cfg.hard_deadline_ms = {float(hard_deadline_ms)!r}")
 
     # NN-prior wiring. The .pt checkpoint is base64-inlined into the
     # bundled .py so the submission is single-file (no separate Kaggle
@@ -335,14 +358,29 @@ def bundle_bot(
         nn_bootstrap_lines = [
             f"\n# --- NN prior bootstrap ({header_comment}) ---",
             *load_lines,
+            "# Decode any quantized weights back to fp32 so the fp32",
+            "# ConvPolicy module accepts the state_dict cleanly. fp16 halves",
+            "# bundle size; int8_per_tensor_symmetric quarters it. Inference",
+            "# precision is fp32 either way.",
+            "def _bundle_upcast(sd, scales=None):",
+            "    out = {}",
+            "    for k, v in sd.items():",
+            "        if v.dtype == torch.int8 and scales is not None and k in scales:",
+            "            out[k] = v.float() * float(scales[k])",
+            "        elif hasattr(v, 'is_floating_point') and v.is_floating_point():",
+            "            out[k] = v.float()",
+            "        else:",
+            "            out[k] = v",
+            "    return out",
+            "_bundle_scales = _bundle_ckpt.get('_quant_scales')",
             "if 'model_state' in _bundle_ckpt and 'cfg' in _bundle_ckpt:",
             "    _bundle_cfg_nn = ConvPolicyCfg(**_bundle_ckpt['cfg'])",
             "    _bundle_model = ConvPolicy(_bundle_cfg_nn)",
-            "    _bundle_model.load_state_dict(_bundle_ckpt['model_state'])",
+            "    _bundle_model.load_state_dict(_bundle_upcast(_bundle_ckpt['model_state'], _bundle_scales))",
             "elif 'model_state_dict' in _bundle_ckpt:",
             "    _bundle_cfg_nn = ConvPolicyCfg()",
             "    _bundle_model = ConvPolicy(_bundle_cfg_nn)",
-            "    _bundle_model.load_state_dict(_bundle_ckpt['model_state_dict'])",
+            "    _bundle_model.load_state_dict(_bundle_upcast(_bundle_ckpt['model_state_dict']))",
             "else:",
             "    raise RuntimeError('bundle: NN checkpoint has unrecognized keys')",
             "_bundle_model.eval()",
@@ -350,9 +388,16 @@ def bundle_bot(
             "    _bundle_model, _bundle_cfg_nn,",
             f"    hold_neutral_prob={hold_p!r}, temperature={temp!r},",
             ")",
+            "# Build value_fn from the same model. The value head is only",
+            "# used when GumbelConfig.rollout_policy='nn_value'; building",
+            "# the closure unconditionally costs ~0 bytes (just a closure)",
+            "# and lets the same bundle support both rollout modes.",
+            "from orbitwars.nn.nn_value import make_nn_value_fn",
+            "_bundle_value_fn = make_nn_value_fn(_bundle_model, _bundle_cfg_nn)",
             "del _bundle_ckpt  # free RAM after model is built",
         ]
         factory_kwargs.append("move_prior_fn=_bundle_move_prior_fn")
+        factory_kwargs.append("value_fn=_bundle_value_fn")
 
     if nn_bootstrap_lines:
         # Emit the NN bootstrap BEFORE the GumbelConfig / factory block so
@@ -465,9 +510,11 @@ def main() -> int:
     ap.add_argument(
         "--rollout-policy",
         default=None,
-        choices=["heuristic", "fast"],
+        choices=["heuristic", "fast", "nn_value"],
         help=(
             "Override GumbelConfig.rollout_policy at bundle time. "
+            "nn_value: skip rollouts, query NN value head 1 ply ahead "
+            "(requires --nn-checkpoint or --nn-dataset-path). "
             "'fast' uses FastRolloutAgent inside rollouts (~13× more "
             "sims/turn) but is only useful if combined with a relaxed "
             "--anchor-margin — under the shipped margin=2.0 the wire "
@@ -550,6 +597,24 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--total-sims",
+        type=int, default=None,
+        help=(
+            "Override GumbelConfig.total_sims (default 32). Higher = more "
+            "rollouts at the root. Pair with --hard-deadline-ms when "
+            "raising significantly to avoid Kaggle timeouts."
+        ),
+    )
+    ap.add_argument(
+        "--hard-deadline-ms",
+        type=float, default=None,
+        help=(
+            "Override GumbelConfig.hard_deadline_ms (default 300ms). "
+            "Kaggle's actTimeout is 1000ms; we leave ~150ms headroom for "
+            "the outer loop. 850ms is the practical cap."
+        ),
+    )
+    ap.add_argument(
         "--nn-hold-neutral-prob",
         type=float,
         default=None,
@@ -614,6 +679,8 @@ def main() -> int:
         nn_hold_neutral_prob=args.nn_hold_neutral_prob,
         use_macros=use_macros_flag,
         nn_dataset_path=args.nn_dataset_path,
+        total_sims=args.total_sims,
+        hard_deadline_ms=args.hard_deadline_ms,
     )
     print(f"Bundled {args.bot} -> {out} ({out.stat().st_size} bytes)")
     if args.sim_move_variant:

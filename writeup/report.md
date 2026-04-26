@@ -419,16 +419,43 @@ ladder opponents it ERROR'd, presumably because
 the agent's runtime sandbox. So this path doesn't ship a new bot —
 it just fails the submission.
 
-**The fix**: train a smaller BC backbone whose checkpoint fits in the
-inline-base64 bundle (`--backbone-channels 32 --n-blocks 3` →
-64k params → 261 KB raw → 350 KB base64 → ~700 KB bundle). v15n and
-v16s already use this recipe; v19 (BC v3 small variant) followed the
-same path successfully.
+**Fix attempt 1 (small backbone)**: train a smaller BC backbone whose
+checkpoint fits in the inline-base64 bundle
+(`--backbone-channels 32 --n-blocks 3` → 64k params → 261 KB raw →
+350 KB base64 → ~700 KB bundle). v15n, v16s, v19 followed this recipe.
 
-The Kaggle Dataset path is shipped infrastructure but its only use
-case is for *kernel-build-time* operations (e.g. preprocessing) —
-not for agent-time data the bundled .py needs at runtime. Documented
-the workflow here for future reference:
+**Fix attempt 2 (int8 quantization, the WIN)**: keep the default 460k
+backbone (~1.78 MB raw), but quantize each weight tensor to int8 with
+per-tensor symmetric scaling at save time:
+
+```python
+scale = float(v.abs().max() / 127.0)
+q = (v / scale).round().clamp(-128, 127).to(torch.int8)
+```
+
+The bundle bootstrap dequantizes back to fp32 at load:
+`tensor.float() * scale`. This:
+
+* Cuts checkpoint size from 1.78 MB → 469 KB (4× reduction).
+* Bundle goes from rejected-3-MB to **accepted at 950 KB**.
+* Inference precision is fp32 either way (search-time forward passes
+  are the same speed and accuracy as the original).
+* Verified with end-to-end smoke (rewards=[1,-1] vs random in 103
+  steps).
+
+Empirical Kaggle threshold: bundle size around **1 MB** is the soft
+limit. 658 KB and 950 KB pushed cleanly; 1.65 MB and 3.0 MB returned
+"Notebook not found" / 400 errors at fresh slugs.
+
+So the size-limit issue we documented in earlier sections is now
+**solved**: any BC backbone we'd realistically train fits in the
+inline path with int8 quantization. The Kaggle Dataset path has been
+removed from active rotation and stays in the codebase only as
+documented infrastructure (caveats: kernel-build-time only).
+
+The Kaggle Dataset path is documented here for future reference if
+ever needed at *kernel-build-time* (e.g. preprocessing, not agent
+runtime):
 
 ```powershell
 # One-time per checkpoint: upload to Kaggle Dataset.
@@ -561,6 +588,69 @@ EvoTune, or — what shipped — a learned prior in Path C).
 ## 10. Final tournament + leaderboard trajectory
 
 *(W6. Plot of leaderboard rank over time.)*
+
+---
+
+## 10.1 Public-leaderboard reality check (2026-04-25 evening)
+
+After shipping v15 to settle at 879.9 (~tied with the frozen v11 at
+896.1), we pulled the public leaderboard to see how that ranks
+against the field:
+
+| Rank | Bot | Elo |
+|---|---|---|
+| 1 | kovi | **2560.0** |
+| 2 | Shun_PI | 1600.8 |
+| 3 | Erfan Eshratifar | 1469.2 |
+| 4 | Orbital Occle | 1439.1 |
+| 5 | HY2017 | 1381.7 |
+| 10 | glass_256 | 1302.1 |
+| ~30+ | (us, v15 frozen) | ~880 |
+
+The v11 → v15 line we'd been optimizing was at the **bottom of the
+field**, not near the ceiling. The actual ceiling has #1 at 2560 — a
+huge **+1680 Elo above our best**. Even tier 2 (1300-1600) is +400-700
+Elo away.
+
+This radically reshapes the strategy:
+
+* **+50 Elo per H2H ablation step** (the rate we've been moving) is
+  too slow to bridge the gap. We'd take 12 ship-cycles just to clear
+  tier 3 and reach the field's median.
+* **+50 Elo per H2H step doesn't even reliably translate to ladder**
+  (cf. v15→v16 macro regression: +52 H2H, **−137** ladder). So even
+  the slow incremental path is shakier than the H2H numbers suggest.
+* **kovi at 2560 is +1000 Elo above #2** — an extreme outlier
+  consistent with either an exotic exploit or a fundamentally
+  different algorithm class. Not the realistic target. Tier 2-3 is.
+
+### What changes about W5 priorities
+
+The original plan ranked W5 priorities as: Path C (PPO from BC)
+> EvoTune > BOKR > extra TuRBO trials. After the leaderboard reality
+check, the relative weights shift. Quick triage:
+
+1. **Path C PPO from BC** stays #1 — biggest theoretical ceiling lift.
+   Self-play RL beating heuristic-bounded BC is the standard recipe
+   for getting RTS bots to top tier.
+2. **Game-specific math improvements** climb into the priority stack.
+   Better intercept routing, comet-pre-positioning math, and
+   sun-tangent routing are likely sources of the gap between us and
+   tier 2. We've been treating these as "good enough" — they may not
+   be.
+3. **TuRBO with a ladder-mimicking pool** stays in the stack but with
+   reduced expected return. The H2H ↔ ladder gap means our archetype
+   pool is teaching the wrong signal; we'd need to mine games against
+   actual ladder bots and tune against those.
+4. **EvoTune** stays as a writeup novelty but with reduced expected
+   ladder return.
+5. **BOKR continuous-angle widening** is cheap to try but probably
+   small return relative to (1)-(2).
+
+For now, infrastructure built tonight (MCTS-as-teacher, soft-target
+training, int8 quantization, 4-fold augmentation, Kaggle Dataset
+path) is the W5 backbone. Tomorrow's data on v19 vs v20i tells us
+whether BC capacity is the next lever; if not, we pivot to PPO.
 
 ---
 

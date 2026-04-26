@@ -1,6 +1,223 @@
 # Orbit Wars — Repo Status & Architecture
 
-*Last updated: 2026-04-25 Day 3 evening — **3 NN-prior bots shipped today (v12 frozen, v15+v16 active settling), 5 ablations all +51.8 Elo H2H, BC v2 default cfg trained to va_acc=0.600, Kaggle Dataset shipping path unblocks BC v2 big model (v17 ready), MCTS-teacher demo collector + 4-fold augmentation infrastructure built. v15 climbed 745.8 → 865.5 (now -31 below frozen v11=896.1) — H2H signal is translating to ladder. 99 tests pass across changed modules.** Earlier today (W4 live; **v11 LADDER FLOOR HOLDING AT 880.8 AFTER FULL OVERNIGHT SETTLE (+30 Elo over v9 at 850.7, +90 over v8 at 790.7).** Peaked 926.0 at 23:48 UTC; 6.5h gap (PC restart) and v11 still came back UP from 875.5 → 880.8 = the +30 Elo signal is durable. **NN prior bridge SHIPPED**: `src/orbitwars/nn/nn_prior.py` (15 unit tests) + `move_prior_fn` plumbed through `GumbelRootSearch` + `MCTSAgent` (3 integration tests, defensive fallback on NN failure). **`tools/bundle.py --nn-checkpoint` SHIPPED** with base64-inline checkpoint embedding (~2.4 MB encoded for 1.8 MB raw); 7 new bundle tests, full v12 ship pipeline orchestrated by `tools/build_v12.py`. **End-to-end smoke PASS** with random-init fake checkpoint: bundle 2.9 MB, import+bootstrap 0.37s, full game vs random WIN +1 in 175 steps. **CRITICAL: NN-prior-active validation passed** — `tools/smoke_v12_diff_vs_baseline.py` runs v12-with-NN vs v12-without-NN at the same seed and confirms action sequences diverge at turn 16, 95/154 turns differ (61.7% divergence). This is the test that v10 *failed* (byte-identical to v8). v10's compute-bound finding ("more sims + lower margin doesn't help without a learned prior") is now confirmed: the prior makes margin=0.5 + fast rollouts a real lever. Both random-init configs still won +1 vs random. `tools/diag_nn_prior.py` compares heuristic vs random vs BC priors on a fixed obs (KL divergences) — runs the moment the real checkpoint lands. **BC warmstart relaunched with `python -u` + GPU isolation** (the previous run shared GPU with concurrent v12 smoke runs, hitting 7.7GB/8GB pressure; cleaned up to 758 MB before restart); same seed 0, 15 epochs, eager-save patch in place. **TuRBO-v4 60-trial relaunched** (first cycle reached best=0.933 at trial 13 before being killed alongside the BC restart; same seed 2, BoTorch trust-region kicks in around trial 20). v4 plausibly doesn't saturate at 1.000 like v3 did — bound expansion may be revealing genuine optima beyond v3's edge. **2-hour settle complete.** TuRBO-v3 trial-42 weights + exp3 eta=0.3; H2H vs v9 17W-3L = 85% wr Elo+151, the strongest H2H signal in the v5→v11 lineage. **Key observation: ladder delta (+32 Elo) is MUCH smaller than H2H predicted (~+200). v3 archetype-pool overfitting is real but not catastrophic — weights still generalize positively.** Extended overnight poll running for 10h to confirm final settle band.** Also noted during submission: ladder is still volatile — v9 moved 934.4 → 864.3, v8 moved 769.5 → 790.7 between 21:36 and 22:53 UTC, so even the "settled" v9 floor is still being re-computed. **TuRBO-v4 bounds config staged** in `src/orbitwars/tune/turbo_runner.py::PARAM_BOUNDS_V4` (5 v3 edge-hits expanded: w_production 20→40, mult_enemy 5→10, mult_comet 5→10, min_launch_size 30→50, comet_max_time_mismatch 5→10; stall-safety preserved by tightening keep_reserve_ships 15→3). Launchable via `--bounds v4 --strategy ax --n-trials 60 --seed 2 --pool w2 --games-per-opp 5 --workers 7`. **NOT launched yet** — decision gated on v11 ladder settle: if v11 wins the ladder clearly we launch v4; if v11 regresses (v3 weights may overfit archetype pool) we pivot off TuRBO to BC-warmstart-PPO. 4 new tests (v4-keys-match-v3, v4-valid-intervals, v4-stall-safety, bounds-dispatch) pass; 29/29 turbo+bundle tests green. **TuRBO-v3 COMPLETE: 60-trial fresh Sobol init + BoTorch, trial 42 hit win_rate=1.000 (45/45: 5/5 vs EACH of 9 archetypes).** Trust-region narrowed around trial 42 gave 18 follow-up trials oscillating 0.756-0.978 → this is a stable optimum, not a single lucky trial. Weights are MUCH more aggressive than v2: `mult_comet=5.0`, `mult_enemy=5.0`, `mult_reinforce_ally=0.0` (disables reinforce), `keep_reserve_ships=0.0` (disables reserve), `w_production=20.0` (maxed), `min_launch_size=30.0` (maxed). Multiple weights at search-bound edges = TRUE optimum may be outside; worth a follow-on TuRBO run with wider bounds. **v11 bundled = v3 weights + sim_move_variant=exp3 (232,710 bytes); smoke test WIN vs random rewards=[1,-1] steps=99**. v11 vs v9 H2H is running (20 games, ~19min wall). Still need the ladder defense confirmation — 45/45 vs our training pool is strong evidence of generalization but not proof it beats v9's exp3-on-v8-weights specifically. **v9 IS THE NEW LADDER FLOOR AT 934.4 AND CLIMBING — +165 Elo over v8 at 769.5, peaked at 981.9 (+212 Elo) at 21:26**, reversing the early-ladder -154 Elo signal. v9's marginal bundled H2H (+7 Elo, wr=0.550) was weak but not noise — the ladder saw +121 Elo of real signal once v9 played a full settle batch. Lesson: 20-game bundled H2H has SE ~0.112 and cannot detect gains under ~50 Elo; the ladder at N~50-100 replays per settle is ~2× more sensitive. Early-ladder scores in the first 30 min are near-useless — you need overnight settle before calling a ladder trend. **Do NOT make submission decisions on <6h ladder data.** Pre-v9-settle status below preserved. **v8 LIVE ON KAGGLE at 762.3, +113 Elo over v7 at 649.1** — confirmed ladder win for the TuRBO-v2 tuned bot. Submission trail: initial "COMPLETE" landing at 600.0 within ~5 min of push, then settled up to 762.3 over subsequent ladder games. v7 itself ticked up from 630.1 → 649.1 on the same day (ladder replays with fresh opponents). Local H2H (v8 18-2-0 vs v7, +175.8 locally) **predicted the ladder direction correctly for the first time in three submissions** — paired-seed compare_weights (61.7%) + TuRBO-v2 tuning (+0.233 wr vs defaults at N=90) both held on the public ladder. Next submission floor: v8 @ 762.3. **W3→W4 transition fully complete.** Pre-v8 status below preserved: v7 at 630.1 back ahead of v6 at 594.1 by +36 Elo after overnight settle, H1 noise-hypothesis confirmed. **NN torch forward passes live**, 13 forward-pass tests green. **TuRBO-v2 complete: 30 trials, best trial 22 win=0.800** (+0.133 over 0.667 defaults baseline, well above the 0.07 ship margin). **compare_weights ran at N=90 games/side, workers=7: turbo_v2 0.833 vs defaults 0.600, delta_wr=+0.233, 95% CI [+0.106, +0.361], paired: turbo_v2 wins on 61.7% of seeds. Worst per-opp regression: rusher -0.100 (exactly at the -0.10 boundary), all other 8 opps positive or tied. `tools/ship_gate.py` VERDICT: SHIP turbo_v2 (both gates PASS).** **v8 bundled: `submissions/v8.py` (229714 bytes) with HEURISTIC_WEIGHTS.update from trial-22 weights; smoke test `rewards=[1,-1] steps=114` vs random.** **v8 vs v7 bundled H2H (20 games, 1.0s timeout, alternating seats): v8 18-2-0 (90%), Elo delta +175.8 locally** — WAY above the 55% defense gate. Turn times: v8 p50=36ms / p95=66ms, v7 p50=46ms / p95=103ms, both comfortably under the 1s budget. **W4 Exp3 A/B infrastructure shipped** — `decoupled_exp3_root` now accepts `protected_my_idx` (anchor-lock contract matches UCB) + `rng` (deterministic tests); `GumbelSearchConfig.sim_move_variant: "ucb"|"exp3"` dispatches at the wiring point with a graceful warn-and-fallback on typo; 5 new tests green (2 sim_move + 3 gumbel_search dispatch), 47/47 pass in the touched modules. **Full regression suite green: 285 passed, 3 skipped, 4 warnings in 4683s + 8 new `tests/test_bundle.py` tests for `--sim-move-variant` + `--weights-json` + their interaction (293 total now)** — Exp3 wiring + v8 bundle clean across the full matrix, not just the touched modules. **Exp3 live-smoke passed**: MCTSAgent with `sim_move_variant="exp3"` completed a 500-turn real game vs HeuristicAgent (seat 1), winning +1 with p50=332ms / p95=389ms / max=579ms turn times — all well under the 1.0s step_timeout. **Exp3 2-game AB smoke PASS** (seed 1000-1001 at hard_deadline_ms=150): exp3 2W-0L-0D vs ucb at matched compute (p50 exp3=176ms, ucb=175ms — identical budget usage). **W4 Exp3 A/B gate: PASS.** 20-game head-to-head at production settings (total_sims=32, num_candidates=4, rollout_depth=15, hard_deadline_ms=300ms, eta=0.3) closed 103.3 min wall with exp3 **11W-8L-1D → wr=0.575, Elo +52.5** over ucb. Seat split is asymmetric — seat 0 wr=0.450 / seat 1 wr=0.700 — so seat-1 carries all the signal and seat-0 regresses slightly, but the point-estimate gate (≥0.55) is clean. Turn-time overhead negligible: p50 exp3=339ms / ucb=332ms (+2%), max-max exp3=1168ms / ucb=1176ms (both well under 1s Kaggle budget, opening-turn overage-bank usage is identical). **`tools/bundle.py` extended with `--sim-move-variant {ucb,exp3}` + `--exp3-eta`** flags so v9 is a 1-command bundle; 8 new tests in `tests/test_bundle.py` (default-no-inject, exp3-injects-cfg, default-eta, explicit-ucb, reject-unknown, require-mcts-bot, end-to-end-importable, weights+variant-coexist-and-ordered) all pass. **v9 bundled + defense H2H: marginally passes.** `submissions/v9.py` (232,861 bytes) built via `tools.bundle --weights-json runs/turbo_v2_20260424.json --sim-move-variant exp3 --exp3-eta 0.3`; smoke test `rewards=[1,-1] steps=137` vs random. v9 vs v8 bundled H2H (20 games, 1.0s step_timeout, alternating seats): v9 **8W-6T-6L = 0.550 wr, Elo delta +7** — *exactly on the 55% defense gate*. Turn times identical between versions (p50=37ms, p95=69ms for both), confirming compute parity. Note: the exp3 edge is much smaller here (+7 Elo) than in the A/B test (+52.5 Elo at default weights) — TuRBO-tuned weights appear to capture most of what exp3 gained at defaults, leaving a small residual. Both gates pass at point-estimate criterion → shipping v9. SE on 20 games at p=0.5 is ~0.112 so the true WR could plausibly sit in [0.33, 0.77]; if v9 doesn't beat v8 on the ladder within 24h we revert to v8 as the floor. **Shipping v9 = v8 TuRBO-v2 weights + `sim_move_variant="exp3"`.** **v9 SHIPPED, EARLY LADDER SIGNAL IS NEGATIVE.** Submitted at 18:17 UTC (kernel version 1 → submission "COMPLETE" within ~5 min at initial 600.0). Over the first ~20 min of ladder replay v9 wobbled 600.0 → 511.3 → 615.2, meanwhile v8 *rose* 752.9 → 769.5 on the same replay window. **v9 currently 615.2 vs v8 769.5: -154 Elo vs v8.** Final settle not yet known (v8 took several hours to settle). Likely mechanism: exp3 adds exploration noise that helped at DEFAULT weights (+52.5 Elo A/B) but **duplicates the exploration that TuRBO-tuned weights already encode**, so the marginal H2H gain (+7 Elo, wr=0.550 on exactly-55% gate) is noise around 0, not signal. Plan: **keep v8 as defended floor (769.5)**; let v9 fully settle overnight; if v9 stays below v8 by >50 Elo, revert next submission to weights-only-no-variant and redirect W4 effort to BC-warmstart NN prior + more TuRBO trials rather than sim-move bandit variants. The 0.55 point-estimate gate was too loose for a marginal change — future gates should require wr ≥ 0.60 over 20 games OR wr ≥ 0.55 over 60+ games to have enough power. **`.venv-gpu` online with CUDA 12.4 torch + RTX 3070**, BC-warmstart training on GPU. **EvoTune fitness bridge + runner CLI shipped** with 6 passing tests; mock-LLM smoke run end-to-end. **Overage-bank opening-turn deadline lift shipped + empirically validated** — all 3 live-game gates PASS. **Path D W4 audit: archetype-overrides-in-FastRolloutAgent + 0.99 posterior freeze already shipped** — no action needed. **v10 experiment = NEGATIVE RESULT, margin-lock is compute-bound, not margin-bound.** Built `v10_fast_m0p5_noopp.py` (232,896 bytes) with `rollout_policy='fast'` (13× more sims: 27 vs 2 at 300ms) + `anchor_improvement_margin=0.5` (4× looser override threshold) + `use_opponent_model=False`. Required extending `tools/bundle.py` with `--rollout-policy`, `--anchor-margin`, `--use-opponent-model` flags (+8 new tests, 16 bundle tests total pass in 0.57s). v10 vs v8 H2H (20 games, same seeds as v9 H2H): **8W-6T-6L = 0.550 wr, Elo +7 — game-by-game outcome sequence is BYTE-IDENTICAL to v9 vs v8.** Even with 13× more rollouts + looser margin, MCTS cannot build a Q-gap exceeding the anchor on enough turns to change wire actions. H3 margin-lock hypothesis is now **compute-bound, not margin-bound** — the fix is a learned prior (NN), not a threshold tweak. Do NOT ship v10. **BC-warmstart + PPO is now the highest-EV W4 lever** (TuRBO-v3 60-trial run is launched in background but the heuristic ceiling is anchor-locked, not weight-shaped).)*
+## URGENT FINDING (2026-04-26 morning) — `+51.8 Elo H2H` IS A FALSE POSITIVE
+
+**Six "+51.8 Elo H2H" wins reported in this STATUS doc on 2026-04-25 are all the
+same harness/seat-ordering artifact, not bot strength.**
+
+Today's reproduction: `v22 vs v22_clone` (literally `cp v22.py v22_clone.py` —
+identical bundle) produces **EXACTLY** 9W-4L-7T = +51.8 Elo. Same per-game step
+counts as `v_ppo_test vs v22`, `ppo_v3_dead vs v22`, `v_no_nn_diag vs v22`. The
+"first bundle in the round-robin list" always wins 9-4-7 regardless of content.
+
+**Mechanism**:
+1. `anchor_improvement_margin=0.0` + `rollout_policy='fast'` (heuristic-driven
+   rollouts) means MCTS Q-estimates are biased toward the heuristic action.
+   Anchor (heuristic pick) is anchor-locked from SH pruning. Search visits
+   non-anchor candidates but rollout returns under heuristic continuation are
+   not enough to overcome anchor's low-variance Q.
+2. The 8-channel `ACTION_LOOKUP` collapses to ~1-3 unique wire actions per
+   state (most channels map to "no matching heuristic move" → HOLD). NN logits
+   differ by mean abs 1.83 between BC and PPO checkpoints, but the heuristic
+   decoder picks the same wire action regardless of channel choice.
+3. Result: every NN-on bundle plays byte-identical wire actions to every other
+   NN-on bundle (and to no-NN). Only RNG state in the harness differs.
+4. Our seed sequence (42, 1042, 2042, ...) happens to favor whichever bundle
+   plays seat-0 in even seeds + seat-1 in odd seeds. The harness puts the
+   "first bundle in --bundles list" on those favored seats. Hence the
+   reproducible 9-4-7.
+
+**Falsified claims** (revisit with skepticism):
+- "BC v3 small (MCTS-distilled) +51.8 H2H" — fake, PPO showed same with completely different NN.
+- "Macros +51.8 H2H lift" — fake, same harness artifact (and macros HURT on ladder).
+- "v_ppo_test +51.8 vs v22" — fake; v25 ladder result will likely match v22, not exceed.
+- Any past "MCTS variant beats heuristic by ~50 Elo locally" claim — re-test required.
+
+**Real signals** (still trustworthy):
+- The actual Kaggle ladder (v22@943, v15@880, v8@762, etc.).
+- TuRBO win-rate against the archetype pool (different opponents, real diversity).
+- BC val_acc on held-out demos (model-quality metric, not gameplay).
+
+**Action**:
+- Killed PPO v4 (compute waste — NN doesn't reach the wire under current anchor-lock).
+- Don't trust any "+50 Elo H2H" gate from `diag_bundle_round_robin.py` for two
+  bundles that differ only in NN/MCTS config under anchor_margin=0.
+- Honest H2H requires either: (a) MUCH more games (200+ to average out seat
+  bias), (b) random per-game seat assignment, or (c) opponent variety — H2H
+  vs heuristic_v0/archetypes/older versions where the bundles' wire actions
+  *actually* diverge.
+- To make NN matter on the wire: lower anchor's protection OR use NN-driven
+  rollouts OR pure value-head Q (no rollouts, AlphaZero-style). All of these
+  are riskier than current anchor-locked play and need their own gates.
+
+## DOWNSTREAM FINDING (2026-04-26 morning) — `use_opponent_model=False` IS A REAL +70 ELO WIN
+
+After `tools/h2h_mirror.py` was built (mirror matches eliminate seat bias),
+re-ran v_no_nn_diag vs v22 → **+70.4 Elo (wr=0.600, SE=0.110, 20 games)**.
+
+Then disambiguated by building `v_no_oppmodel` (v22 config but
+`use_opponent_model=False`, NN STILL ON) and running mirror vs v22:
+**EXACTLY the same +70.4 Elo, byte-identical per-game outcomes** as
+v_no_nn_diag vs v22.
+
+Conclusion: the +70 Elo signal comes from disabling the Bayesian opponent
+model, NOT from removing the NN. The NN provides zero wire-action influence
+either way (consistent with the upstream finding above).
+
+**Mechanism (hypothesis)**: opp_model uses a Dirichlet posterior over archetypes
+to bias rollouts toward an exploitative opponent. If the posterior wrongly
+concentrates on a hard archetype (e.g. "rusher"), MCTS Q estimates become
+pessimistic → bot plays too conservatively → loses long games on ship-count
+tiebreaks. Indeed, both winning-mirror seeds (3042, 6042) end at step=499
+(max length) where ship totals decide.
+
+**Built `submissions/v26.py`** = `v22` config but `use_opponent_model=False`.
+Bundle is 658,616 bytes (matches v22 size since both still embed the BC NN —
+the NN is benign even though it provides no wire signal). Ready to ship.
+
+**Historical context**: `v10_fast_m0p5_noopp` (2026-04-25) had
+`use_opponent_model=False` and was DECIDED NOT TO SHIP based on byte-identical
+H2H vs v9. We now know that's a false negative — the harness was masking the
+real +70 Elo signal. **v10 was probably a real winner that we left on the
+table.** v26 is essentially v10's contribution applied to the v22 weight stack.
+
+**30-seed CI confirmation** (`runs/v26_vs_v22_mirror_30seeds.log`): v26 vs
+v22 at seed=100, 30 seeds × 2 mirrors = 60 games → **47W-13L = wr 0.783 ±
+0.053, Elo +223.3**. The 10-seed test was unlucky — its specific seed offsets
+landed in a "stalemate cluster" where mirrors mostly cancel; the 30-seed
+test reveals 17/30 seeds give v26 a dominant double-win. Effect is robust.
+
+**v25 LADDER LANDED (2026-04-26 ~02:45 UTC submission, ~5h settle)**: 795.6.
+**This is -141 Elo BELOW v22 at 936.9.** v25 = PPO 50-update fine-tune of
+BC v1 + v22 config — the PPO training that we now know didn't change wire
+actions in MOST games but does in some via NN-influenced search. The
+ladder result confirms: NN-on-wire is **actively harmful** in the
+configurations we tested. **v25 is the strongest direct evidence yet that
+the NN-prior path under anchor_margin=0 is value-destroying, not value-
+adding.** Combined with the local +223 Elo signal for `use_opponent_model
+=False` (with NN still embedded but benign), the next ship is unambiguous.
+
+**v26 SHIPPED (2026-04-26 08:15 UTC, status PENDING)**: same bundle as
+the +223-Elo mirror winner (`submissions/v26.py`, kernel
+`gardan4/orbit-wars-mcts-v26`, version 1, 760 KB notebook). Submission
+message records the local mirror result and the v25 falsification.
+Awaiting ladder settle (typically 4-12h to stabilize). If v26 settles
+above v22's 936.9, that's the strongest single-ship gain in this whole
+effort and validates both (a) the mirror-fair H2H methodology and
+(b) the opp_model regression hypothesis.
+
+## PHANTOM 2.0 (2026-04-26 ~11:30 UTC) — `tools/h2h_mirror.py` ALSO has a seed-dependent bias
+
+A follow-up control test ran `v22 vs v22_clone` (literally identical bundle
+via `cp v22.py v22_clone.py`) under mirror H2H at **seed=100, 5 seeds = 10
+games** → **8W-2L = wr 0.800, +240 Elo for the FIRST bundle in `--bundles`**.
+
+Earlier v22 vs v22_clone at seed=42 with 3 seeds gave 3-3 cancellation.
+But at seed=100, mirror does NOT cancel. The phantom is seed-dependent:
+
+| seed=42, 3 seeds | seed=100, 5 seeds |
+|---|---|
+| s 42 m0 LOSS m1 WIN — cancels | s 100 m0 WIN m1 LOSS — cancels |
+| s 1042 m0 LOSS m1 WIN — cancels | **s 1100 m0 WIN m1 WIN — first wins both** |
+| s 2042 m0 WIN m1 LOSS — cancels | s 2100 m0 WIN m1 LOSS — cancels |
+| | **s 3100 m0 WIN m1 WIN — first wins both** |
+| | **s 4100 m0 WIN m1 WIN — first wins both** |
+
+For seeds 1100/3100/4100, the FIRST bundle wins both halves of the mirror.
+This violates the mirror-fairness assumption that "if A=B byte-identical,
+swapping seats just swaps the outcome." The fact that v22 vs v22_clone
+(literally the same code) shows this means the mirror harness has another
+artifact for these seeds — either the env's internal random state isn't
+fully reset between calls, or kaggle_environments has shared module state
+that depends on factory call order.
+
+**Falsified results** (revisit with extreme skepticism):
+- "v_no_oppmodel beats v22 by +223 Elo" — same exact pattern as v22
+  vs v22_clone in the same seed range. PHANTOM.
+- "UCB beats EXP3 by +223 Elo" — same exact per-game outcomes as the
+  v_no_oppmodel result. PHANTOM.
+- "v26 should land ~150 Elo above v22 on ladder" — wrong; v26 is wire-
+  equivalent to v22 in most games.
+
+**Real signal**:
+- v25 ladder = 795.6 (-141 vs v22 at 936.9). PPO-on-wire genuinely harmful.
+- v26 ladder = 901.3 (early, settling) → likely lands near v22, not above.
+
+**Action**:
+- Don't run any more `tools/h2h_mirror.py` H2H tests until the seed-100
+  artifact is understood. The seed=42 control passed only by coincidence.
+- The honest H2H methodology probably requires either: (a) full RNG state
+  reset including numpy/torch globals between mirrors, (b) running each
+  game in a fresh subprocess, (c) trusting only the actual Kaggle ladder.
+- For now, **the actual Kaggle ladder is the only honest signal**. v26
+  result will tell us if `use_opponent_model=False` truly does anything.
+
+**The methodology lesson here is the same as the original phantom**: any
+"+50 to +250 Elo H2H signal" that shows the same per-game outcomes
+across multiple bundle pairs should be treated as a harness artifact
+until proven otherwise. The mirror-cancellation property only holds when
+ALL stochasticity sources (Python random, numpy random, torch RNG, env
+internal state) are fully reset between mirror halves.
+
+## PHANTOM 3.0 (2026-04-26 ~11:45 UTC) — Subprocess isolation does NOT fix it
+
+Built `tools/h2h_isolated.py` + `tools/_h2h_one_game.py` to run each
+game in a completely fresh Python subprocess (no shared state, no RNG
+drift, no kaggle_environments cached singletons). Re-ran v22 vs
+v22_clone at seed=100, 5 seeds = 10 games:
+**8W-2L = wr 0.800 = +240 Elo for first bundle**. SAME EXACT PATTERN.
+
+This rules out:
+- Shared module state in the parent Python process
+- numpy/torch global RNG drift between mirrors (fix didn't help)
+- kaggle_environments cached state across env.run() calls
+- Bundle import-time state leakage
+
+The non-determinism is inherent to **MCTS wall-clock-dependent decisions**.
+Even when `hard_deadline_ms` never binds (p95 turn times 50-75ms vs
+850ms deadline), the search's internal `time.perf_counter()` use for
+round-budget allocation in Sequential Halving cascades microsecond
+variations into different visit counts → different actions → different
+final ship counts in long games. Over 500 turns the variations compound.
+
+**Implication: local H2H is unreliable for any bundle that uses MCTS
+with wall-clock timing — the production config.** No amount of harness
+isolation can fix this without changing the bundle itself.
+
+## v26 LADDER (2026-04-26 ~11:45 UTC) — settling around 856-902, BELOW v22
+
+v26 = v22 config + `use_opponent_model=False`. Submitted ~08:15 UTC.
+Trajectory: 600 → 901 → 856 → 902 (bouncing in 856-902 range).
+v22 = 936.9. **v26 is consistently ~30-80 Elo BELOW v22.**
+
+Conclusion: `use_opponent_model=True` (the v22 default) is genuinely
+helpful on the ladder despite being silenced by anchor-locked play in
+local tests. The Bayesian archetype posterior probably helps in long-
+running games or against specific opponent types — exactly what would
+NOT show up in our seed=42/100 mirror tests.
+
+## CONSOLIDATED FINDING 2026-04-26
+
+After today's investigation, the honest picture is:
+- **v22 (936.9) is approximately optimal among tested configurations**.
+- **NN/PPO under anchor_margin=0 + heuristic-fast rollouts cannot reach
+  the wire**: confirmed by byte-identical wire actions across BC v1 small,
+  PPO 50-update, PPO 500-update collapsed checkpoints.
+- **Active harm from PPO experimental ship**: v25 ladder = 795.6, -141 Elo.
+- **opp_model is mildly helpful**: disabling it landed v26 at -50 Elo.
+- **All recent +50/+223 Elo local "wins"** (BC v3, macros, PPO, opp_model
+  disabled, UCB-vs-EXP3) **were phantom signals from harness order bias**.
+
+To genuinely improve beyond v22 we need to escape the anchor-lock trap:
+either (a) widen TuRBO bounds (`PARAM_BOUNDS_V4` is staged but not
+launched), (b) use NN to drive rollouts (so search Q reflects NN strategy,
+not heuristic), (c) AlphaZero-style pure value-head Q (no rollouts), or
+(d) redesign the action space so the heuristic decoder doesn't collapse
+NN preferences to identical wire actions.
+
+---
+
+*Last updated: 2026-04-25 Day 3 LATE evening — **5 NN-prior bots shipped today (v12/v15/v16 frozen, v19+v20i active settling, v18 ERROR). v15 frozen 879.9 (best). 6 H2H ablations all +51.8 Elo, N=60 confirmed signal real (+63 Elo). int8 quantization (4× compression) shipped — unblocks BIG BC ship path (~1MB Kaggle bundle limit empirical). MCTS-as-teacher (107k demos), soft-target BC training, 4-fold augmentation, macros library, Kaggle Dataset path all infrastructure shipped (136 tests across changed modules pass). BC v3 small (va_acc=0.421, MCTS-distilled) trained on teacher demos. **LEADERBOARD REALITY CHECK: #1 kovi at 2560 (outlier), tier 2 at 1300-1600, us at ~880. Gap to tier 2 is +400-700 Elo — +50 Elo H2H steps are too slow.** Strategy pivots: PPO from BC (Plan W5) becomes priority #1, game-specific math improvements #2, TuRBO with ladder-mimicking pool #3.** Earlier today (W4 live; **v11 LADDER FLOOR HOLDING AT 880.8 AFTER FULL OVERNIGHT SETTLE (+30 Elo over v9 at 850.7, +90 over v8 at 790.7).** Peaked 926.0 at 23:48 UTC; 6.5h gap (PC restart) and v11 still came back UP from 875.5 → 880.8 = the +30 Elo signal is durable. **NN prior bridge SHIPPED**: `src/orbitwars/nn/nn_prior.py` (15 unit tests) + `move_prior_fn` plumbed through `GumbelRootSearch` + `MCTSAgent` (3 integration tests, defensive fallback on NN failure). **`tools/bundle.py --nn-checkpoint` SHIPPED** with base64-inline checkpoint embedding (~2.4 MB encoded for 1.8 MB raw); 7 new bundle tests, full v12 ship pipeline orchestrated by `tools/build_v12.py`. **End-to-end smoke PASS** with random-init fake checkpoint: bundle 2.9 MB, import+bootstrap 0.37s, full game vs random WIN +1 in 175 steps. **CRITICAL: NN-prior-active validation passed** — `tools/smoke_v12_diff_vs_baseline.py` runs v12-with-NN vs v12-without-NN at the same seed and confirms action sequences diverge at turn 16, 95/154 turns differ (61.7% divergence). This is the test that v10 *failed* (byte-identical to v8). v10's compute-bound finding ("more sims + lower margin doesn't help without a learned prior") is now confirmed: the prior makes margin=0.5 + fast rollouts a real lever. Both random-init configs still won +1 vs random. `tools/diag_nn_prior.py` compares heuristic vs random vs BC priors on a fixed obs (KL divergences) — runs the moment the real checkpoint lands. **BC warmstart relaunched with `python -u` + GPU isolation** (the previous run shared GPU with concurrent v12 smoke runs, hitting 7.7GB/8GB pressure; cleaned up to 758 MB before restart); same seed 0, 15 epochs, eager-save patch in place. **TuRBO-v4 60-trial relaunched** (first cycle reached best=0.933 at trial 13 before being killed alongside the BC restart; same seed 2, BoTorch trust-region kicks in around trial 20). v4 plausibly doesn't saturate at 1.000 like v3 did — bound expansion may be revealing genuine optima beyond v3's edge. **2-hour settle complete.** TuRBO-v3 trial-42 weights + exp3 eta=0.3; H2H vs v9 17W-3L = 85% wr Elo+151, the strongest H2H signal in the v5→v11 lineage. **Key observation: ladder delta (+32 Elo) is MUCH smaller than H2H predicted (~+200). v3 archetype-pool overfitting is real but not catastrophic — weights still generalize positively.** Extended overnight poll running for 10h to confirm final settle band.** Also noted during submission: ladder is still volatile — v9 moved 934.4 → 864.3, v8 moved 769.5 → 790.7 between 21:36 and 22:53 UTC, so even the "settled" v9 floor is still being re-computed. **TuRBO-v4 bounds config staged** in `src/orbitwars/tune/turbo_runner.py::PARAM_BOUNDS_V4` (5 v3 edge-hits expanded: w_production 20→40, mult_enemy 5→10, mult_comet 5→10, min_launch_size 30→50, comet_max_time_mismatch 5→10; stall-safety preserved by tightening keep_reserve_ships 15→3). Launchable via `--bounds v4 --strategy ax --n-trials 60 --seed 2 --pool w2 --games-per-opp 5 --workers 7`. **NOT launched yet** — decision gated on v11 ladder settle: if v11 wins the ladder clearly we launch v4; if v11 regresses (v3 weights may overfit archetype pool) we pivot off TuRBO to BC-warmstart-PPO. 4 new tests (v4-keys-match-v3, v4-valid-intervals, v4-stall-safety, bounds-dispatch) pass; 29/29 turbo+bundle tests green. **TuRBO-v3 COMPLETE: 60-trial fresh Sobol init + BoTorch, trial 42 hit win_rate=1.000 (45/45: 5/5 vs EACH of 9 archetypes).** Trust-region narrowed around trial 42 gave 18 follow-up trials oscillating 0.756-0.978 → this is a stable optimum, not a single lucky trial. Weights are MUCH more aggressive than v2: `mult_comet=5.0`, `mult_enemy=5.0`, `mult_reinforce_ally=0.0` (disables reinforce), `keep_reserve_ships=0.0` (disables reserve), `w_production=20.0` (maxed), `min_launch_size=30.0` (maxed). Multiple weights at search-bound edges = TRUE optimum may be outside; worth a follow-on TuRBO run with wider bounds. **v11 bundled = v3 weights + sim_move_variant=exp3 (232,710 bytes); smoke test WIN vs random rewards=[1,-1] steps=99**. v11 vs v9 H2H is running (20 games, ~19min wall). Still need the ladder defense confirmation — 45/45 vs our training pool is strong evidence of generalization but not proof it beats v9's exp3-on-v8-weights specifically. **v9 IS THE NEW LADDER FLOOR AT 934.4 AND CLIMBING — +165 Elo over v8 at 769.5, peaked at 981.9 (+212 Elo) at 21:26**, reversing the early-ladder -154 Elo signal. v9's marginal bundled H2H (+7 Elo, wr=0.550) was weak but not noise — the ladder saw +121 Elo of real signal once v9 played a full settle batch. Lesson: 20-game bundled H2H has SE ~0.112 and cannot detect gains under ~50 Elo; the ladder at N~50-100 replays per settle is ~2× more sensitive. Early-ladder scores in the first 30 min are near-useless — you need overnight settle before calling a ladder trend. **Do NOT make submission decisions on <6h ladder data.** Pre-v9-settle status below preserved. **v8 LIVE ON KAGGLE at 762.3, +113 Elo over v7 at 649.1** — confirmed ladder win for the TuRBO-v2 tuned bot. Submission trail: initial "COMPLETE" landing at 600.0 within ~5 min of push, then settled up to 762.3 over subsequent ladder games. v7 itself ticked up from 630.1 → 649.1 on the same day (ladder replays with fresh opponents). Local H2H (v8 18-2-0 vs v7, +175.8 locally) **predicted the ladder direction correctly for the first time in three submissions** — paired-seed compare_weights (61.7%) + TuRBO-v2 tuning (+0.233 wr vs defaults at N=90) both held on the public ladder. Next submission floor: v8 @ 762.3. **W3→W4 transition fully complete.** Pre-v8 status below preserved: v7 at 630.1 back ahead of v6 at 594.1 by +36 Elo after overnight settle, H1 noise-hypothesis confirmed. **NN torch forward passes live**, 13 forward-pass tests green. **TuRBO-v2 complete: 30 trials, best trial 22 win=0.800** (+0.133 over 0.667 defaults baseline, well above the 0.07 ship margin). **compare_weights ran at N=90 games/side, workers=7: turbo_v2 0.833 vs defaults 0.600, delta_wr=+0.233, 95% CI [+0.106, +0.361], paired: turbo_v2 wins on 61.7% of seeds. Worst per-opp regression: rusher -0.100 (exactly at the -0.10 boundary), all other 8 opps positive or tied. `tools/ship_gate.py` VERDICT: SHIP turbo_v2 (both gates PASS).** **v8 bundled: `submissions/v8.py` (229714 bytes) with HEURISTIC_WEIGHTS.update from trial-22 weights; smoke test `rewards=[1,-1] steps=114` vs random.** **v8 vs v7 bundled H2H (20 games, 1.0s timeout, alternating seats): v8 18-2-0 (90%), Elo delta +175.8 locally** — WAY above the 55% defense gate. Turn times: v8 p50=36ms / p95=66ms, v7 p50=46ms / p95=103ms, both comfortably under the 1s budget. **W4 Exp3 A/B infrastructure shipped** — `decoupled_exp3_root` now accepts `protected_my_idx` (anchor-lock contract matches UCB) + `rng` (deterministic tests); `GumbelSearchConfig.sim_move_variant: "ucb"|"exp3"` dispatches at the wiring point with a graceful warn-and-fallback on typo; 5 new tests green (2 sim_move + 3 gumbel_search dispatch), 47/47 pass in the touched modules. **Full regression suite green: 285 passed, 3 skipped, 4 warnings in 4683s + 8 new `tests/test_bundle.py` tests for `--sim-move-variant` + `--weights-json` + their interaction (293 total now)** — Exp3 wiring + v8 bundle clean across the full matrix, not just the touched modules. **Exp3 live-smoke passed**: MCTSAgent with `sim_move_variant="exp3"` completed a 500-turn real game vs HeuristicAgent (seat 1), winning +1 with p50=332ms / p95=389ms / max=579ms turn times — all well under the 1.0s step_timeout. **Exp3 2-game AB smoke PASS** (seed 1000-1001 at hard_deadline_ms=150): exp3 2W-0L-0D vs ucb at matched compute (p50 exp3=176ms, ucb=175ms — identical budget usage). **W4 Exp3 A/B gate: PASS.** 20-game head-to-head at production settings (total_sims=32, num_candidates=4, rollout_depth=15, hard_deadline_ms=300ms, eta=0.3) closed 103.3 min wall with exp3 **11W-8L-1D → wr=0.575, Elo +52.5** over ucb. Seat split is asymmetric — seat 0 wr=0.450 / seat 1 wr=0.700 — so seat-1 carries all the signal and seat-0 regresses slightly, but the point-estimate gate (≥0.55) is clean. Turn-time overhead negligible: p50 exp3=339ms / ucb=332ms (+2%), max-max exp3=1168ms / ucb=1176ms (both well under 1s Kaggle budget, opening-turn overage-bank usage is identical). **`tools/bundle.py` extended with `--sim-move-variant {ucb,exp3}` + `--exp3-eta`** flags so v9 is a 1-command bundle; 8 new tests in `tests/test_bundle.py` (default-no-inject, exp3-injects-cfg, default-eta, explicit-ucb, reject-unknown, require-mcts-bot, end-to-end-importable, weights+variant-coexist-and-ordered) all pass. **v9 bundled + defense H2H: marginally passes.** `submissions/v9.py` (232,861 bytes) built via `tools.bundle --weights-json runs/turbo_v2_20260424.json --sim-move-variant exp3 --exp3-eta 0.3`; smoke test `rewards=[1,-1] steps=137` vs random. v9 vs v8 bundled H2H (20 games, 1.0s step_timeout, alternating seats): v9 **8W-6T-6L = 0.550 wr, Elo delta +7** — *exactly on the 55% defense gate*. Turn times identical between versions (p50=37ms, p95=69ms for both), confirming compute parity. Note: the exp3 edge is much smaller here (+7 Elo) than in the A/B test (+52.5 Elo at default weights) — TuRBO-tuned weights appear to capture most of what exp3 gained at defaults, leaving a small residual. Both gates pass at point-estimate criterion → shipping v9. SE on 20 games at p=0.5 is ~0.112 so the true WR could plausibly sit in [0.33, 0.77]; if v9 doesn't beat v8 on the ladder within 24h we revert to v8 as the floor. **Shipping v9 = v8 TuRBO-v2 weights + `sim_move_variant="exp3"`.** **v9 SHIPPED, EARLY LADDER SIGNAL IS NEGATIVE.** Submitted at 18:17 UTC (kernel version 1 → submission "COMPLETE" within ~5 min at initial 600.0). Over the first ~20 min of ladder replay v9 wobbled 600.0 → 511.3 → 615.2, meanwhile v8 *rose* 752.9 → 769.5 on the same replay window. **v9 currently 615.2 vs v8 769.5: -154 Elo vs v8.** Final settle not yet known (v8 took several hours to settle). Likely mechanism: exp3 adds exploration noise that helped at DEFAULT weights (+52.5 Elo A/B) but **duplicates the exploration that TuRBO-tuned weights already encode**, so the marginal H2H gain (+7 Elo, wr=0.550 on exactly-55% gate) is noise around 0, not signal. Plan: **keep v8 as defended floor (769.5)**; let v9 fully settle overnight; if v9 stays below v8 by >50 Elo, revert next submission to weights-only-no-variant and redirect W4 effort to BC-warmstart NN prior + more TuRBO trials rather than sim-move bandit variants. The 0.55 point-estimate gate was too loose for a marginal change — future gates should require wr ≥ 0.60 over 20 games OR wr ≥ 0.55 over 60+ games to have enough power. **`.venv-gpu` online with CUDA 12.4 torch + RTX 3070**, BC-warmstart training on GPU. **EvoTune fitness bridge + runner CLI shipped** with 6 passing tests; mock-LLM smoke run end-to-end. **Overage-bank opening-turn deadline lift shipped + empirically validated** — all 3 live-game gates PASS. **Path D W4 audit: archetype-overrides-in-FastRolloutAgent + 0.99 posterior freeze already shipped** — no action needed. **v10 experiment = NEGATIVE RESULT, margin-lock is compute-bound, not margin-bound.** Built `v10_fast_m0p5_noopp.py` (232,896 bytes) with `rollout_policy='fast'` (13× more sims: 27 vs 2 at 300ms) + `anchor_improvement_margin=0.5` (4× looser override threshold) + `use_opponent_model=False`. Required extending `tools/bundle.py` with `--rollout-policy`, `--anchor-margin`, `--use-opponent-model` flags (+8 new tests, 16 bundle tests total pass in 0.57s). v10 vs v8 H2H (20 games, same seeds as v9 H2H): **8W-6T-6L = 0.550 wr, Elo +7 — game-by-game outcome sequence is BYTE-IDENTICAL to v9 vs v8.** Even with 13× more rollouts + looser margin, MCTS cannot build a Q-gap exceeding the anchor on enough turns to change wire actions. H3 margin-lock hypothesis is now **compute-bound, not margin-bound** — the fix is a learned prior (NN), not a threshold tweak. Do NOT ship v10. **BC-warmstart + PPO is now the highest-EV W4 lever** (TuRBO-v3 60-trial run is launched in background but the heuristic ceiling is anchor-locked, not weight-shaped).)*
 
 **Kaggle submission trail** (public score, most recent first; full settle trajectory in brackets):
 - **v11** (TuRBO-v3 weights + `sim_move_variant='exp3'`, eta=0.3): **880.8 (full overnight settle, floor confirmed; peak 926.0 at 23:48)** — **+30 Elo over v9 (850.7), +90 over v8 (790.7). CURRENT LADDER LEADER.** [submitted 2026-04-24 22:53 UTC → initial 600.0 → early dip 562.2 → climb 748.2 → 829.6 → 894.4 → **924.0 (23:23) → 926.0 (23:48, PEAK)** → settle band 875-912, closing 875.5 at 00:49 UTC. 2-hour trajectory recorded in `runs/v11_ladder_poll_20260424.log`; overnight settle continuing in `runs/v11_ladder_poll_part2_20260425.log`. Notable: v9 dropped 864.3 → 843.1 (-21) during the same window, i.e. the ladder is net-transferring Elo from v9 to v11 — confirms they ARE playing each other and H2H direction holds on the ladder. **Delta is MUCH smaller than the 85% H2H predicted (+32 Elo actual vs ~+200 Elo from Elo-from-wr formula)** — archetype-pool overfitting is real but not catastrophic; v3 weights generalize positively. Local H2H vs v9 at same seeds: v11 **17W-3L = 85% wr Elo+151** (`runs/v11_vs_v9_bundled_h2h.log`). Turn times: v11 p50=33ms / p95=59ms, v9 p50=41ms / p95=85ms — v11 is FASTER too.]

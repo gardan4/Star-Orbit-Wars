@@ -412,6 +412,86 @@ def _rollout_value(
     return _score_from_engine(eng, my_player, num_agents)
 
 
+def _value_fn_eval(
+    base_state: GameState,
+    my_player: int,
+    my_action: List[List],
+    opp_agent_factory: Callable[[], Any],
+    value_fn: Callable[[Any, int], float],
+    num_agents: int = 2,
+    rng: Optional[random.Random] = None,
+    opp_turn0_action: Optional[List[List]] = None,
+    hard_stop_at: Optional[float] = None,
+) -> float:
+    """Apply 1 ply (my_action + opp's turn-0) then query value head.
+
+    The "AlphaZero-style" leaf evaluation: instead of rolling out
+    ``depth`` plies with the heuristic and scoring the terminal state,
+    apply only the candidate's first ply and ask the NN value head
+    "what is this resulting state worth from my_player's perspective?"
+
+    Why 1 ply instead of 0: applying the joint action is necessary to
+    actually evaluate the *candidate*. With 0 plies, every candidate
+    would query the value head on the same pre-action state and get
+    the same value — Q-aggregation would collapse to anchor wins on
+    tie-breaking. With 1 ply, the candidates produce different
+    post-action states, so the value head can distinguish "good
+    move" from "bad move" if it's been trained to.
+
+    Why not 2+ plies: that's just a partial rollout. The whole point
+    of value-head Q is to use the NN's own state-value estimate,
+    avoiding the rollout's heuristic bias. Adding more plies dilutes
+    the NN signal with heuristic continuation. (Future: configurable
+    extra plies as a post-NN bootstrap, like MuZero. Not needed for v1.)
+
+    Returns scalar in [-1, 1] from my_player's perspective. If
+    value_fn raises or returns non-finite, returns the heuristic
+    score of the post-step state — graceful fallback so a defective
+    value_fn never forfeits a turn.
+    """
+    eng = FastEngine(
+        copy.deepcopy(base_state),
+        num_agents=num_agents,
+        rng=rng,
+    )
+
+    # Turn 0: my root action + opp's turn-0 response. Same setup as
+    # _rollout_value, just without the depth>=2 continuation.
+    actions: List[Optional[List]] = [None] * num_agents
+    actions[my_player] = my_action
+    for i in range(num_agents):
+        if i == my_player:
+            continue
+        if opp_turn0_action is not None:
+            actions[i] = opp_turn0_action
+        else:
+            opp = opp_agent_factory()
+            try:
+                actions[i] = opp.act(
+                    eng.observation(i), Deadline(hard_stop_at=hard_stop_at),
+                )
+            except Exception:
+                actions[i] = []
+    eng.step(actions)
+
+    # Game ended on turn 0? Use terminal score directly — value_fn
+    # would just be predicting the known outcome.
+    if eng.done:
+        return _score_from_engine(eng, my_player, num_agents)
+
+    # Query the value head on the post-step state from my_player's view.
+    try:
+        post_obs = eng.observation(my_player)
+        v = float(value_fn(post_obs, my_player))
+        if v != v or v == float("inf") or v == float("-inf"):  # NaN/inf guard
+            return _score_from_engine(eng, my_player, num_agents)
+        # Clip to the same [-1, 1] convention _score_from_engine uses
+        # so anchor-margin and Q-comparisons stay scale-consistent.
+        return max(-1.0, min(1.0, v))
+    except Exception:
+        return _score_from_engine(eng, my_player, num_agents)
+
+
 # ---------------------------- Sequential Halving --------------------------
 
 @dataclass
@@ -628,6 +708,15 @@ class GumbelRootSearch:
     # PlanetMove objects (PlanetMove is frozen) carrying the new prior.
     # Built via ``orbitwars.nn.nn_prior.make_nn_prior_fn``.
     move_prior_fn: Optional[Callable[[Any, int, Dict[int, List[PlanetMove]], Dict[int, int]], Dict[int, List[PlanetMove]]]] = None
+    # Phase 1 of NN value-head Q (see ``docs/NN_VALUE_HEAD_DESIGN.md``).
+    # When set AND ``gumbel_cfg.rollout_policy == "nn_value"``, leaf
+    # evaluation applies the candidate's joint action for one ply and
+    # queries this function on the resulting state — instead of
+    # running a depth=15 heuristic rollout. Lets the NN drive Q
+    # estimates instead of the heuristic. Built via
+    # ``orbitwars.nn.nn_value.make_nn_value_fn``. Signature:
+    #   ``(obs, my_player) -> float in [-1, 1]``
+    value_fn: Optional[Callable[[Any, int], float]] = None
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.rng_seed)
@@ -828,7 +917,38 @@ class GumbelRootSearch:
         def _rollout_deadline_fired() -> bool:
             return time.perf_counter() > rollout_deadline_sec
 
+        # Choose leaf evaluator based on rollout_policy.
+        # "nn_value" (with value_fn supplied) skips rollouts entirely
+        # and queries the NN value head on the 1-ply-ahead state.
+        # See _value_fn_eval and docs/NN_VALUE_HEAD_DESIGN.md.
+        use_nn_value = (
+            self.gumbel_cfg.rollout_policy == "nn_value"
+            and self.value_fn is not None
+        )
+        if self.gumbel_cfg.rollout_policy == "nn_value" and self.value_fn is None:
+            # Configured for nn_value but no value_fn supplied — fall
+            # back to heuristic rollouts with a one-time warning. The
+            # search must NEVER forfeit a turn just because the NN
+            # plumbing is incomplete.
+            import warnings
+            warnings.warn(
+                "rollout_policy='nn_value' but no value_fn supplied; "
+                "falling back to heuristic rollouts.",
+                stacklevel=2,
+            )
+
         def rollout_fn(joint: JointAction) -> float:
+            if use_nn_value:
+                return _value_fn_eval(
+                    base_state=base_state,
+                    my_player=my_player,
+                    my_action=joint.to_wire(),
+                    opp_agent_factory=self._opp_factory,
+                    value_fn=self.value_fn,
+                    num_agents=num_agents,
+                    rng=self._rng,
+                    hard_stop_at=rollout_deadline_sec,
+                )
             return _rollout_value(
                 base_state=base_state,
                 my_player=my_player,
@@ -888,6 +1008,18 @@ class GumbelRootSearch:
             )
 
             def decoupled_rollout_fn(my_joint: JointAction, opp_wire: List[List]) -> float:
+                if use_nn_value:
+                    return _value_fn_eval(
+                        base_state=base_state,
+                        my_player=my_player,
+                        my_action=my_joint.to_wire(),
+                        opp_agent_factory=self._opp_factory,
+                        value_fn=self.value_fn,
+                        num_agents=num_agents,
+                        rng=self._rng,
+                        opp_turn0_action=opp_wire,
+                        hard_stop_at=rollout_deadline_sec,
+                    )
                 return _rollout_value(
                     base_state=base_state,
                     my_player=my_player,

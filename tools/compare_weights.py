@@ -47,6 +47,7 @@ from orbitwars.tune.fitness import (
     starter_pool,
     w1_pool,
     w2_pool,
+    w3_pool,
 )
 
 
@@ -54,6 +55,7 @@ POOL_FACTORIES = {
     "starter": starter_pool,
     "w1": w1_pool,
     "w2": w2_pool,
+    "w3": w3_pool,
 }
 
 

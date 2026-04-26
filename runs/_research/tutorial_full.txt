@@ -1,0 +1,1954 @@
+--- cell 0 (markdown) ---
+# Overview
+**If you found it helpful, please consider upvoting it.**
+
+* This notebook demonstrates training an agent using the PPO (Proximal Policy Optimization) reinforcement learning algorithm that outperforms [the Nearest Planet Sniper agent from the Getting Started tutorial](https://www.kaggle.com/code/bovard/getting-started#Agent-1:-Nearest-Planet-Sniper).
+* The current implementation makes several simplifying assumptions about the model, observations, and action spaces. To create a stronger agent, we recommend modifying the observation design, reward function, and aiming logic from this point forward.
+
+--- cell 1 (markdown) ---
+## Training Approach
+
+- The algorithm is PPO
+- Each owned planet within a turn is treated as an independent decision unit
+- The policy is called once for each owned planet
+- During training, multiple environments are run in parallel, rollouts are collected for a fixed number of steps, and PPO updates are applied
+- The opponent is always self-play, and it uses the same policy structure
+- The opponent weights are synchronized from the current learner every fixed number of updates
+
+--- cell 2 (markdown) ---
+## Action Design
+
+The action space is heavily simplified.
+"Whether to send or not" and "where to send" are represented as a single target selection.
+
+- `target_index = 0` means no-op
+- `target_index = 1..K-1` represents target candidates
+- The policy outputs a categorical distribution over the candidate targets
+
+In other words, this action space learns only:
+
+- for each owned planet
+- which candidate target to choose
+
+### Ship Count
+
+The number of ships is not learned.
+It uses the same fixed rule as the sniper baseline:
+
+- `ships = max(target.ships + 1, 20)`
+
+That value is sent as-is.
+However, if the source planet does not have enough ships, that candidate becomes invalid.
+
+### How Target Candidates Are Built
+
+For each owned source planet `src`, candidates are created from all other planets.
+
+- `index 0` is reserved for no-op
+- The remaining slots are filled with enemy, neutral, and friendly planets in distance order
+- If there are not enough, the rest are filled by nearest remaining planets
+
+The number of candidates is controlled by `env.candidate_count` in the config.
+
+--- cell 3 (markdown) ---
+## Observations
+
+Observations are scalar features rather than images.
+Each decision row is composed of the following three groups of features.
+
+### 1. self_features
+
+Features of the source planet `src` itself.
+Examples:
+
+- position
+- radius
+- current ship count
+- production
+- whether it is a rotating planet
+- number of owned planets
+- number of enemy planets
+- total owned ships
+- total enemy ships
+
+### 2. candidate_features
+
+Features for each candidate target.
+Examples:
+
+- neutral / friendly / enemy flags
+- target position
+- relative position from `src`
+- distance
+- target ship count
+- target production
+- whether the target is a rotating planet
+- whether the current direct shot would hit the sun
+- ship count of `src`
+
+### 3. global_features
+
+Global summary features of the board.
+Examples:
+
+- turn progress
+- number of friendly / enemy / neutral planets
+- total friendly / enemy ships
+- number of friendly / enemy fleets in flight
+
+--- cell 4 (markdown) ---
+## Policy Network
+
+The policy is a simple MLP-based PyTorch model.
+
+It has separate encoders for:
+
+- `self_features`
+- `candidate_features`
+- `global_features`
+
+`candidate_features` are encoded per candidate, and the `self / global / candidate` embeddings are concatenated to produce a score for each candidate.
+The outputs are:
+
+- `target_logits`
+  logits for each candidate target
+- `value`
+  an approximation of the state value for that decision row
+
+A categorical distribution is built from `target_logits`, and `target_index = 0` is treated as no-op.
+
+In short, this network is a simple structure that:
+
+- scores the candidate target set for each owned planet
+- and selects one of them
+
+--- cell 5 (markdown) ---
+---
+
+--- cell 6 (markdown) ---
+#　Training Script Implementation
+
+--- cell 7 (markdown) ---
+- `game_types.py`: Converts observation data into an easier-to-handle format.
+- `config.py`: Loads and manages training and environment settings.
+- `features.py`: Builds features and action candidates from observations.
+- `policy.py`: Predicts actions and values from features.
+- `ppo.py`: Handles action sampling and PPO updates.
+- `opponents.py`: Chooses actions for the opponent side.
+- `env.py`: Wraps interaction with the Kaggle environment.
+- `train.py`: Runs the full training loop.
+
+--- cell 8 (code) ---
+!mkdir -p src
+
+--- cell 9 (code) ---
+%%writefile default_cfg.yaml
+
+seed: 42
+run_name: orbit_wars_ppo
+device: auto
+save_dir: /kaggle/working/artifacts
+checkpoint_every: 50
+log_every: 1
+opponent: self
+self_play_update_interval: 50
+self_play_deterministic: false
+alternate_player_sides: true
+
+env:
+  candidate_count: 8
+  ship_bucket_count: 8
+
+model:
+  hidden_size: 128
+
+ppo:
+  rollout_steps: 64
+  num_envs: 2
+  total_updates: 100 # Note: For this public Notebook, total_updates is set to 100 to keep runtime short. For full training, increase it to 2000.
+  epochs: 4
+  minibatch_size: 256
+  gamma: 0.99
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  lr: 0.0003
+  max_grad_norm: 0.5
+
+
+--- cell 10 (code) ---
+%%writefile src/__init__.py
+
+from .config import TrainConfig, default_train_config_path, load_train_config
+
+__all__ = ["TrainConfig", "default_train_config_path", "load_train_config"]
+
+--- cell 11 (code) ---
+%%writefile src/config.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclass(slots=True)
+class EnvConfig:
+    board_size: float = 100.0
+    episode_steps: int = 500
+    candidate_count: int = 8
+    ship_bucket_count: int = 8
+    max_planets: int = 48
+    max_ships: float = 400.0
+    max_production: float = 5.0
+
+
+@dataclass(slots=True)
+class ModelConfig:
+    hidden_size: int = 128
+
+
+@dataclass(slots=True)
+class PPOConfig:
+    rollout_steps: int = 32
+    num_envs: int = 4
+    total_updates: int = 200
+    epochs: int = 4
+    minibatch_size: int = 512
+    gamma: float = 0.99
+    clip_coef: float = 0.2
+    ent_coef: float = 0.01
+    vf_coef: float = 0.5
+    lr: float = 3e-4
+    max_grad_norm: float = 0.5
+
+
+@dataclass(slots=True)
+class TrainConfig:
+    seed: int = 42
+    run_name: str = "orbit_wars_template_ppo"
+    device: str = "auto"
+    save_dir: str = "artifacts/rl_template"
+    checkpoint_every: int = 10
+    log_every: int = 1
+    opponent: str = "random"
+    self_play_update_interval: int = 10
+    self_play_deterministic: bool = False
+    alternate_player_sides: bool = True
+    env: EnvConfig = field(default_factory=EnvConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    ppo: PPOConfig = field(default_factory=PPOConfig)
+
+
+def default_train_config_path() -> Path:
+    return Path(__file__).resolve().parent / "configs" / "default.yaml"
+
+
+def load_train_config(path: str | Path) -> TrainConfig:
+    config_path = Path(path)
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML config must be a mapping: {config_path}")
+    return train_config_from_dict(data)
+
+
+def train_config_from_dict(data: dict[str, Any]) -> TrainConfig:
+    cfg = TrainConfig()
+    _update_dataclass(cfg, data, skip={"env", "model", "ppo"})
+    _update_dataclass(cfg.env, data.get("env", {}))
+    _update_dataclass(cfg.model, data.get("model", {}))
+    _update_dataclass(cfg.ppo, data.get("ppo", {}))
+    return cfg
+
+
+def _update_dataclass(instance: Any, values: dict[str, Any], skip: set[str] | None = None) -> None:
+    if not isinstance(values, dict):
+        return
+    skip = skip or set()
+    for key, value in values.items():
+        if key in skip or not hasattr(instance, key):
+            continue
+        default = getattr(instance, key)
+        setattr(instance, key, _coerce_value(value, default))
+
+
+def _coerce_value(value: Any, default: Any) -> Any:
+    if isinstance(default, bool):
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return bool(value)
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(value)
+    if isinstance(default, float):
+        return float(value)
+    return value
+
+
+--- cell 12 (code) ---
+%%writefile src/game_types.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(slots=True)
+class PlanetState:
+    id: int
+    owner: int
+    x: float
+    y: float
+    radius: float
+    ships: int
+    production: int
+
+
+@dataclass(slots=True)
+class FleetState:
+    id: int
+    owner: int
+    x: float
+    y: float
+    angle: float
+    from_planet_id: int
+    ships: int
+
+
+@dataclass(slots=True)
+class GameState:
+    step: int
+    player: int
+    planets: list[PlanetState]
+    fleets: list[FleetState]
+
+
+def parse_observation(observation: Any) -> GameState:
+    def obs_get(key: str, default: Any) -> Any:
+        if isinstance(observation, dict):
+            return observation.get(key, default)
+        return getattr(observation, key, default)
+
+    planets = [
+        PlanetState(
+            id=int(row[0]),
+            owner=int(row[1]),
+            x=float(row[2]),
+            y=float(row[3]),
+            radius=float(row[4]),
+            ships=int(row[5]),
+            production=int(row[6]),
+        )
+        for row in obs_get("planets", [])
+    ]
+    fleets = [
+        FleetState(
+            id=int(row[0]),
+            owner=int(row[1]),
+            x=float(row[2]),
+            y=float(row[3]),
+            angle=float(row[4]),
+            from_planet_id=int(row[5]),
+            ships=int(row[6]),
+        )
+        for row in obs_get("fleets", [])
+    ]
+    return GameState(
+        step=int(obs_get("step", 0)),
+        player=int(obs_get("player", 0)),
+        planets=planets,
+        fleets=fleets,
+    )
+
+--- cell 13 (code) ---
+%%writefile src/features.py
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+
+from .config import EnvConfig
+from .game_types import GameState, PlanetState, parse_observation
+
+BOARD_CENTER = (50.0, 50.0)
+ROTATION_RADIUS_LIMIT = 50.0
+SUN_RADIUS = 10.0
+PLANET_LAUNCH_RADIUS_OFFSET = 0.1
+
+
+@dataclass(slots=True)
+class DecisionContext:
+    env_index: int
+    source_id: int
+    candidate_ids: list[int]
+    candidate_mask: np.ndarray
+    ship_counts: list[int]
+    target_angles: list[float]
+
+
+@dataclass(slots=True)
+class TurnBatch:
+    self_features: np.ndarray
+    candidate_features: np.ndarray
+    global_features: np.ndarray
+    candidate_mask: np.ndarray
+    contexts: list[DecisionContext]
+    state: GameState
+
+
+def self_feature_dim() -> int:
+    return 11
+
+
+def candidate_feature_dim() -> int:
+    return 14
+
+
+def global_feature_dim() -> int:
+    return 8
+
+
+def encode_turn(
+    observation: Any,
+    env_cfg: EnvConfig,
+    *,
+    env_index: int = 0,
+) -> TurnBatch:
+    state = observation if isinstance(observation, GameState) else parse_observation(observation)
+    my_planets = sorted((planet for planet in state.planets if planet.owner == state.player), key=lambda planet: planet.id)
+    if not my_planets:
+        return TurnBatch(
+            self_features=np.zeros((0, self_feature_dim()), dtype=np.float32),
+            candidate_features=np.zeros((0, env_cfg.candidate_count, candidate_feature_dim()), dtype=np.float32),
+            global_features=np.zeros((0, global_feature_dim()), dtype=np.float32),
+            candidate_mask=np.zeros((0, env_cfg.candidate_count), dtype=bool),
+            contexts=[],
+            state=state,
+        )
+
+    global_feat = build_global_features(state, env_cfg)
+    self_rows: list[np.ndarray] = []
+    candidate_rows: list[np.ndarray] = []
+    candidate_masks: list[np.ndarray] = []
+    contexts: list[DecisionContext] = []
+
+    for src in my_planets:
+        candidates = build_candidates(src, state, env_cfg)
+        cand_feat, cand_mask, ship_counts, candidate_ids, target_angles = build_candidate_features(
+            src,
+            candidates,
+            state,
+            env_cfg,
+        )
+        self_rows.append(build_self_features(src, state, env_cfg))
+        candidate_rows.append(cand_feat)
+        candidate_masks.append(cand_mask)
+        contexts.append(
+            DecisionContext(
+                env_index=env_index,
+                source_id=src.id,
+                candidate_ids=candidate_ids,
+                candidate_mask=cand_mask,
+                ship_counts=ship_counts,
+                target_angles=target_angles,
+            )
+        )
+
+    return TurnBatch(
+        self_features=np.asarray(self_rows, dtype=np.float32),
+        candidate_features=np.asarray(candidate_rows, dtype=np.float32),
+        global_features=np.repeat(global_feat[None, :], len(self_rows), axis=0),
+        candidate_mask=np.asarray(candidate_masks, dtype=bool),
+        contexts=contexts,
+        state=state,
+    )
+
+
+def build_candidates(src: PlanetState, state: GameState, env_cfg: EnvConfig) -> list[PlanetState]:
+    others = [planet for planet in state.planets if planet.id != src.id]
+    enemy_quota = env_cfg.candidate_count // 3
+    neutral_quota = env_cfg.candidate_count // 3
+    friendly_quota = env_cfg.candidate_count - enemy_quota - neutral_quota
+
+    enemies = sorted(
+        (planet for planet in others if planet.owner not in {-1, state.player}),
+        key=lambda planet: (distance(src, planet), planet.id),
+    )[:enemy_quota]
+    neutrals = sorted(
+        (planet for planet in others if planet.owner == -1),
+        key=lambda planet: (distance(src, planet), planet.id),
+    )[:neutral_quota]
+    friendlies = sorted(
+        (planet for planet in others if planet.owner == state.player),
+        key=lambda planet: (distance(src, planet), planet.id),
+    )[:friendly_quota]
+
+    selected_ids = {planet.id for planet in enemies + neutrals + friendlies}
+    candidates = enemies + neutrals + friendlies
+    if len(candidates) >= env_cfg.candidate_count:
+        return candidates[: env_cfg.candidate_count]
+
+    fallback = sorted(
+        (planet for planet in others if planet.id not in selected_ids),
+        key=lambda planet: (distance(src, planet), planet.id),
+    )
+    candidates.extend(fallback[: env_cfg.candidate_count - len(candidates)])
+    return candidates
+
+
+def build_self_features(src: PlanetState, state: GameState, env_cfg: EnvConfig) -> np.ndarray:
+    my_planets = [planet for planet in state.planets if planet.owner == state.player]
+    enemy_planets = [planet for planet in state.planets if planet.owner not in {-1, state.player}]
+    return np.asarray(
+        [
+            1.0,
+            src.x / env_cfg.board_size,
+            src.y / env_cfg.board_size,
+            src.radius / 5.0,
+            min(src.ships, env_cfg.max_ships) / env_cfg.max_ships,
+            src.production / env_cfg.max_production,
+            1.0 if is_rotating_planet(src) else 0.0,
+            len(my_planets) / env_cfg.max_planets,
+            len(enemy_planets) / env_cfg.max_planets,
+            total_ships(my_planets) / (env_cfg.max_planets * env_cfg.max_ships),
+            total_ships(enemy_planets) / (env_cfg.max_planets * env_cfg.max_ships),
+        ],
+        dtype=np.float32,
+    )
+
+
+def build_candidate_features(
+    src: PlanetState,
+    candidates: list[PlanetState],
+    state: GameState,
+    env_cfg: EnvConfig,
+) -> tuple[np.ndarray, np.ndarray, list[int], list[int], list[float]]:
+    features = np.zeros((env_cfg.candidate_count, candidate_feature_dim()), dtype=np.float32)
+    candidate_mask = np.zeros((env_cfg.candidate_count,), dtype=bool)
+    ship_counts = [0] * env_cfg.candidate_count
+    candidate_ids = [-1] * env_cfg.candidate_count
+    target_angles = [0.0] * env_cfg.candidate_count
+    candidate_mask[0] = True
+
+    for idx, tgt in enumerate(candidates, start=1):
+        if idx >= env_cfg.candidate_count:
+            break
+        dx = tgt.x - src.x
+        dy = tgt.y - src.y
+        angle = math.atan2(dy, dx)
+        crosses_sun = shot_crosses_sun(src, angle, tgt)
+        ships_needed = fixed_ship_count(src, tgt)
+        features[idx] = np.asarray(
+            [
+                1.0,
+                1.0 if tgt.owner == -1 else 0.0,
+                1.0 if tgt.owner == state.player else 0.0,
+                1.0 if tgt.owner not in {-1, state.player} else 0.0,
+                tgt.x / env_cfg.board_size,
+                tgt.y / env_cfg.board_size,
+                dx / env_cfg.board_size,
+                dy / env_cfg.board_size,
+                distance(src, tgt) / env_cfg.board_size,
+                min(tgt.ships, env_cfg.max_ships) / env_cfg.max_ships,
+                tgt.production / env_cfg.max_production,
+                1.0 if is_rotating_planet(tgt) else 0.0,
+                1.0 if crosses_sun else 0.0,
+                min(src.ships, env_cfg.max_ships) / env_cfg.max_ships,
+            ],
+            dtype=np.float32,
+        )
+        ship_counts[idx] = ships_needed
+        candidate_mask[idx] = ships_needed > 0 and not crosses_sun and src.ships >= ships_needed
+        candidate_ids[idx] = tgt.id
+        target_angles[idx] = angle
+
+    return features, candidate_mask, ship_counts, candidate_ids, target_angles
+
+
+def build_global_features(state: GameState, env_cfg: EnvConfig) -> np.ndarray:
+    my_planets = [planet for planet in state.planets if planet.owner == state.player]
+    enemy_planets = [planet for planet in state.planets if planet.owner not in {-1, state.player}]
+    neutral_planets = [planet for planet in state.planets if planet.owner == -1]
+    my_fleets = [fleet for fleet in state.fleets if fleet.owner == state.player]
+    enemy_fleets = [fleet for fleet in state.fleets if fleet.owner != state.player]
+    return np.asarray(
+        [
+            state.step / env_cfg.episode_steps,
+            len(my_planets) / env_cfg.max_planets,
+            len(enemy_planets) / env_cfg.max_planets,
+            len(neutral_planets) / env_cfg.max_planets,
+            total_ships(my_planets) / (env_cfg.max_planets * env_cfg.max_ships),
+            total_ships(enemy_planets) / (env_cfg.max_planets * env_cfg.max_ships),
+            sum(fleet.ships for fleet in my_fleets) / (env_cfg.max_planets * env_cfg.max_ships),
+            sum(fleet.ships for fleet in enemy_fleets) / (env_cfg.max_planets * env_cfg.max_ships),
+        ],
+        dtype=np.float32,
+    )
+
+
+def fixed_ship_count(src: PlanetState, tgt: PlanetState) -> int:
+    return max(tgt.ships + 1, 20)
+
+
+def distance(a: PlanetState, b: PlanetState) -> float:
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def total_ships(planets: list[PlanetState]) -> float:
+    return float(sum(planet.ships for planet in planets))
+
+
+def is_rotating_planet(planet: PlanetState) -> bool:
+    dx = planet.x - BOARD_CENTER[0]
+    dy = planet.y - BOARD_CENTER[1]
+    orbital_radius = math.hypot(dx, dy)
+    return orbital_radius + planet.radius < ROTATION_RADIUS_LIMIT
+
+
+def shot_crosses_sun(src: PlanetState, angle: float, tgt: PlanetState) -> bool:
+    start_x = src.x + math.cos(angle) * (src.radius + PLANET_LAUNCH_RADIUS_OFFSET)
+    start_y = src.y + math.sin(angle) * (src.radius + PLANET_LAUNCH_RADIUS_OFFSET)
+    return point_to_segment_distance(BOARD_CENTER, (start_x, start_y), (tgt.x, tgt.y)) < SUN_RADIUS
+
+
+def point_to_segment_distance(point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]) -> float:
+    segment_len_sq = (start[0] - end[0]) ** 2 + (start[1] - end[1]) ** 2
+    if segment_len_sq == 0.0:
+        return math.hypot(point[0] - start[0], point[1] - start[1])
+    projection = (
+        ((point[0] - start[0]) * (end[0] - start[0]) + (point[1] - start[1]) * (end[1] - start[1]))
+        / segment_len_sq
+    )
+    projection = max(0.0, min(1.0, projection))
+    closest_x = start[0] + projection * (end[0] - start[0])
+    closest_y = start[1] + projection * (end[1] - start[1])
+    return math.hypot(point[0] - closest_x, point[1] - closest_y)
+
+
+--- cell 14 (code) ---
+%%writefile src/policy.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+
+
+@dataclass(slots=True)
+class PolicyOutput:
+    target_logits: torch.Tensor
+    value: torch.Tensor
+
+
+class PlanetPolicy(nn.Module):
+    def __init__(
+        self,
+        self_dim: int,
+        candidate_dim: int,
+        global_dim: int,
+        candidate_count: int,
+        hidden_size: int = 128,
+    ) -> None:
+        super().__init__()
+        self.candidate_count = candidate_count
+        self.self_encoder = nn.Sequential(
+            nn.Linear(self_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+        )
+        self.global_encoder = nn.Sequential(
+            nn.Linear(global_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+        )
+        self.candidate_encoder = nn.Sequential(
+            nn.Linear(candidate_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+        )
+        self.target_head = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(
+        self,
+        self_features: torch.Tensor,
+        candidate_features: torch.Tensor,
+        global_features: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> PolicyOutput:
+        self_hidden = self.self_encoder(self_features)
+        global_hidden = self.global_encoder(global_features)
+        candidate_hidden = self.candidate_encoder(candidate_features)
+        expanded_self = self_hidden.unsqueeze(1).expand(-1, self.candidate_count, -1)
+        expanded_global = global_hidden.unsqueeze(1).expand(-1, self.candidate_count, -1)
+        joint = torch.cat([expanded_self, expanded_global, candidate_hidden], dim=-1)
+        target_logits = self.target_head(joint).squeeze(-1)
+        target_logits = target_logits.masked_fill(~candidate_mask, torch.finfo(target_logits.dtype).min)
+        pooled_candidates = candidate_hidden.mean(dim=1)
+        value = self.value_head(torch.cat([self_hidden, global_hidden, pooled_candidates], dim=-1)).squeeze(-1)
+        return PolicyOutput(target_logits=target_logits, value=value)
+
+
+--- cell 15 (code) ---
+%%writefile src/ppo.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+from torch.distributions import Categorical
+
+from .policy import PolicyOutput
+
+
+@dataclass(slots=True)
+class SampledAction:
+    target_index: torch.Tensor
+    log_prob: torch.Tensor
+    entropy: torch.Tensor
+
+
+@dataclass(slots=True)
+class TransitionBatch:
+    self_features: torch.Tensor
+    candidate_features: torch.Tensor
+    global_features: torch.Tensor
+    candidate_mask: torch.Tensor
+    target_index: torch.Tensor
+    log_prob: torch.Tensor
+    returns: torch.Tensor
+    advantages: torch.Tensor
+
+
+def sample_actions(outputs: PolicyOutput, deterministic: bool) -> SampledAction:
+    target_logits = safe_target_logits(outputs.target_logits)
+    target_dist = Categorical(logits=target_logits)
+    target_index = target_logits.argmax(dim=-1) if deterministic else target_dist.sample()
+
+    log_prob, entropy = action_log_prob_and_entropy(outputs=outputs, target_index=target_index)
+    return SampledAction(target_index=target_index, log_prob=log_prob, entropy=entropy)
+
+
+def action_log_prob_and_entropy(
+    outputs: PolicyOutput,
+    target_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    target_logits = safe_target_logits(outputs.target_logits)
+    target_dist = Categorical(logits=target_logits)
+    target_log_prob = target_dist.log_prob(target_index)
+    target_entropy = target_dist.entropy()
+    return target_log_prob, target_entropy
+
+
+def safe_target_logits(target_logits: torch.Tensor) -> torch.Tensor:
+    invalid_rows = ~torch.isfinite(target_logits).any(dim=-1)
+    if not invalid_rows.any():
+        return target_logits
+    safe_logits = target_logits.clone()
+    safe_logits[invalid_rows, 0] = 0.0
+    return safe_logits
+
+
+def ppo_update(
+    policy: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: TransitionBatch,
+    *,
+    clip_coef: float,
+    ent_coef: float,
+    vf_coef: float,
+    max_grad_norm: float,
+    epochs: int,
+    minibatch_size: int,
+    device: torch.device,
+) -> dict[str, float]:
+    if batch.self_features.shape[0] == 0:
+        return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+    self_features = batch.self_features.to(device)
+    candidate_features = batch.candidate_features.to(device)
+    global_features = batch.global_features.to(device)
+    candidate_mask = batch.candidate_mask.to(device).bool()
+    old_log_prob = batch.log_prob.to(device)
+    target_index = batch.target_index.to(device)
+    returns = batch.returns.to(device)
+    advantages = batch.advantages.to(device)
+    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    size = self_features.shape[0]
+    minibatch_size = min(size, max(1, minibatch_size))
+    metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+    updates = 0
+    for _ in range(epochs):
+        order = torch.randperm(size, device=device)
+        for start in range(0, size, minibatch_size):
+            idx = order[start : start + minibatch_size]
+            outputs = policy(
+                self_features[idx],
+                candidate_features[idx],
+                global_features[idx],
+                candidate_mask[idx],
+            )
+            new_log_prob, entropy = action_log_prob_and_entropy(
+                outputs,
+                target_index[idx],
+            )
+            ratio = (new_log_prob - old_log_prob[idx]).exp()
+            policy_loss = torch.maximum(
+                -advantages[idx] * ratio,
+                -advantages[idx] * torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef),
+            ).mean()
+            value_loss = 0.5 * (returns[idx] - outputs.value).pow(2).mean()
+            entropy_mean = entropy.mean()
+            loss = policy_loss + vf_coef * value_loss - ent_coef * entropy_mean
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+            optimizer.step()
+            metrics["loss"] += float(loss.detach().cpu())
+            metrics["policy_loss"] += float(policy_loss.detach().cpu())
+            metrics["value_loss"] += float(value_loss.detach().cpu())
+            metrics["entropy"] += float(entropy_mean.detach().cpu())
+            updates += 1
+    return {key: value / max(updates, 1) for key, value in metrics.items()}
+
+
+--- cell 16 (code) ---
+%%writefile src/opponents.py
+
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+import torch
+
+from .config import TrainConfig
+from .features import encode_turn
+from .policy import PlanetPolicy
+from .ppo import sample_actions
+
+
+class OpponentPolicy(Protocol):
+    def act(self, observation: Any) -> list[list[float | int]]:
+        ...
+
+
+class KaggleRandomOpponent:
+    def __init__(self) -> None:
+        from kaggle_environments.envs.orbit_wars.orbit_wars import random_agent
+
+        self._agent = random_agent
+
+    def act(self, observation: Any) -> list[list[float | int]]:
+        payload = {
+            "player": obs_get(observation, "player", 0),
+            "planets": list(obs_get(observation, "planets", [])),
+        }
+        return list(self._agent(payload))
+
+
+class SelfPlayOpponent:
+    def __init__(self, cfg: TrainConfig, device: torch.device, deterministic: bool = True) -> None:
+        from .features import candidate_feature_dim, global_feature_dim, self_feature_dim
+
+        self.cfg = cfg
+        self.device = device
+        self.deterministic = deterministic
+        self.policy = PlanetPolicy(
+            self_dim=self_feature_dim(),
+            candidate_dim=candidate_feature_dim(),
+            global_dim=global_feature_dim(),
+            candidate_count=cfg.env.candidate_count,
+            hidden_size=cfg.model.hidden_size,
+        ).to(device)
+        self.policy.eval()
+
+    def sync_from(self, source_policy: PlanetPolicy) -> None:
+        self.policy.load_state_dict(source_policy.state_dict())
+        self.policy.eval()
+
+    def act(self, observation: Any) -> list[list[float | int]]:
+        batch = encode_turn(observation, self.cfg.env, env_index=0)
+        if batch.self_features.shape[0] == 0:
+            return []
+        with torch.inference_mode():
+            outputs = self.policy(
+                torch.from_numpy(batch.self_features).to(self.device),
+                torch.from_numpy(batch.candidate_features).to(self.device),
+                torch.from_numpy(batch.global_features).to(self.device),
+                torch.from_numpy(batch.candidate_mask).to(self.device).bool(),
+            )
+            sampled = sample_actions(outputs, deterministic=self.deterministic)
+        target_indices = sampled.target_index.detach().cpu().numpy()
+        moves: list[list[float | int]] = []
+        for row_idx, context in enumerate(batch.contexts):
+            target_idx = int(target_indices[row_idx])
+            if target_idx == 0:
+                continue
+            if target_idx >= len(context.candidate_ids):
+                continue
+            if not context.candidate_mask[target_idx]:
+                continue
+            ships = int(context.ship_counts[target_idx])
+            if ships <= 0:
+                continue
+            moves.append([context.source_id, float(context.target_angles[target_idx]), ships])
+        return moves
+
+
+def build_opponent(
+    name: str,
+    cfg: TrainConfig | None = None,
+    device: torch.device | None = None,
+) -> OpponentPolicy:
+    if name == "random":
+        return KaggleRandomOpponent()
+    if name == "self":
+        if cfg is None or device is None:
+            raise ValueError("cfg and device are required for self opponent")
+        return SelfPlayOpponent(cfg, device=device, deterministic=cfg.self_play_deterministic)
+    raise ValueError(f"Unknown opponent: {name}")
+
+
+def obs_get(observation: Any, key: str, default: Any) -> Any:
+    if isinstance(observation, dict):
+        return observation.get(key, default)
+    return getattr(observation, key, default)
+
+
+--- cell 17 (code) ---
+%%writefile src/env.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from .config import TrainConfig
+from .features import TurnBatch, encode_turn
+from .opponents import OpponentPolicy
+
+
+@dataclass(slots=True)
+class StepResult:
+    batch: TurnBatch
+    reward: float
+    done: bool
+    info: dict[str, Any]
+
+
+class OrbitWarsEnv:
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        opponent: OpponentPolicy,
+        make_fn: Any | None = None,
+        env_index: int = 0,
+    ) -> None:
+        self.cfg = cfg
+        self.opponent = opponent
+        self.make_fn = make_fn
+        self.env_index = env_index
+        self.env: Any | None = None
+        self.last_obs: Any | None = None
+        self.last_opp_obs: Any | None = None
+        self.episode_index = 0
+        self.learner_player = 0
+
+    def reset(self, seed: int | None = None) -> TurnBatch:
+        make_fn = self.make_fn or default_make_fn()
+        configuration: dict[str, Any] = {}
+        if seed is not None:
+            configuration["seed"] = int(seed)
+            configuration["randomSeed"] = int(seed)
+        if self.cfg.alternate_player_sides:
+            self.learner_player = (self.env_index + self.episode_index) % 2
+        else:
+            self.learner_player = 0
+        self.env = make_fn("orbit_wars", configuration=configuration, debug=False)
+        self.env.reset(num_agents=2)
+        states = self.env.step([[], []])
+        learner_state = states[self.learner_player]
+        opponent_state = states[1 - self.learner_player]
+        self.last_obs = extract_observation(learner_state)
+        self.last_opp_obs = extract_observation(opponent_state)
+        self.episode_index += 1
+        return encode_turn(self.last_obs, self.cfg.env, env_index=self.env_index)
+
+    def step(self, player_action: list[list[float | int]]) -> StepResult:
+        if self.env is None:
+            raise RuntimeError("Call reset() before step().")
+        opponent_action = self.opponent.act(self.last_opp_obs)
+        if self.learner_player == 0:
+            joint_action = [player_action, opponent_action]
+        else:
+            joint_action = [opponent_action, player_action]
+        states = self.env.step(joint_action)
+        player_state = states[self.learner_player]
+        opp_state = states[1 - self.learner_player]
+        self.last_obs = extract_observation(player_state)
+        self.last_opp_obs = extract_observation(opp_state)
+        done = extract_status(player_state) != "ACTIVE"
+        reward = terminal_reward(player_state, opp_state) if done else 0.0
+        batch = encode_turn(self.last_obs, self.cfg.env, env_index=self.env_index)
+        info = {
+            "learner_player": self.learner_player,
+            "player_status": extract_status(player_state),
+            "opponent_status": extract_status(opp_state),
+            "reward": reward,
+        }
+        return StepResult(batch=batch, reward=reward, done=done, info=info)
+
+
+def default_make_fn() -> Any:
+    from kaggle_environments import make
+
+    return make
+
+
+def extract_observation(state: Any) -> Any:
+    if isinstance(state, dict):
+        return state.get("observation")
+    return getattr(state, "observation")
+
+
+def extract_status(state: Any) -> str:
+    if isinstance(state, dict):
+        return str(state.get("status", "UNKNOWN"))
+    return str(getattr(state, "status", "UNKNOWN"))
+
+
+def extract_reward(state: Any) -> float:
+    if isinstance(state, dict):
+        value = state.get("reward", 0.0)
+    else:
+        value = getattr(state, "reward", 0.0)
+    return 0.0 if value is None else float(value)
+
+
+def terminal_reward(player_state: Any, opp_state: Any) -> float:
+    player_reward = extract_reward(player_state)
+    opponent_reward = extract_reward(opp_state)
+    if player_reward > 0.0 and opponent_reward > 0.0:
+        return 0.0
+    return player_reward
+
+
+--- cell 18 (code) ---
+%%writefile src/train.py
+
+from __future__ import annotations
+
+import argparse
+import random
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from .config import TrainConfig, default_train_config_path, load_train_config
+from .env import OrbitWarsEnv
+from .features import TurnBatch, candidate_feature_dim, global_feature_dim, self_feature_dim
+from .game_types import PlanetState
+from .opponents import SelfPlayOpponent, build_opponent
+from .policy import PlanetPolicy
+from .ppo import TransitionBatch, ppo_update, sample_actions
+
+
+@dataclass(slots=True)
+class StepGroup:
+    indices: list[int]
+    reward: float
+    done: bool
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=str(default_train_config_path()))
+    return parser.parse_args()
+
+
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def collect_rollout(
+    envs: list[OrbitWarsEnv],
+    batches: list[TurnBatch],
+    policy: PlanetPolicy,
+    cfg: TrainConfig,
+    device: torch.device,
+    next_seed: int,
+) -> tuple[TransitionBatch, list[TurnBatch], int, dict[str, float]]:
+    empty_candidate = (cfg.env.candidate_count, candidate_feature_dim())
+    self_rows: list[np.ndarray] = []
+    candidate_rows: list[np.ndarray] = []
+    global_rows: list[np.ndarray] = []
+    candidate_masks: list[np.ndarray] = []
+    target_indices: list[int] = []
+    log_probs: list[float] = []
+    values: list[float] = []
+    groups_per_env: list[list[StepGroup]] = [[] for _ in envs]
+    episode_rewards: list[float] = []
+    running_episode_rewards = [0.0 for _ in envs]
+
+    for _ in range(cfg.ppo.rollout_steps):
+        offsets = np.cumsum([0] + [batch.self_features.shape[0] for batch in batches[:-1]])
+        merged = merge_batches(batches)
+        row_values = np.zeros((merged.self_features.shape[0],), dtype=np.float32)
+        if merged.self_features.shape[0] > 0:
+            with torch.inference_mode():
+                outputs = policy(
+                    torch.from_numpy(merged.self_features).to(device),
+                    torch.from_numpy(merged.candidate_features).to(device),
+                    torch.from_numpy(merged.global_features).to(device),
+                    torch.from_numpy(merged.candidate_mask).to(device).bool(),
+                )
+                sampled = sample_actions(outputs, deterministic=False)
+                row_values = outputs.value.detach().cpu().numpy()
+                sampled_target_index = sampled.target_index.detach().cpu().numpy()
+                sampled_log_prob = sampled.log_prob.detach().cpu().numpy()
+        else:
+            sampled_target_index = np.zeros((0,), dtype=np.int64)
+            sampled_log_prob = np.zeros((0,), dtype=np.float32)
+
+        next_batches: list[TurnBatch] = []
+        for env_idx, env in enumerate(envs):
+            batch = batches[env_idx]
+            start = int(offsets[env_idx])
+            moves = []
+            group_indices: list[int] = []
+            for local_idx, context in enumerate(batch.contexts):
+                global_idx = start + local_idx
+                self_rows.append(batch.self_features[local_idx])
+                candidate_rows.append(batch.candidate_features[local_idx])
+                global_rows.append(batch.global_features[local_idx])
+                candidate_masks.append(batch.candidate_mask[local_idx])
+                values.append(float(row_values[global_idx]))
+                tgt_idx = int(sampled_target_index[global_idx]) if batch.self_features.shape[0] > 0 else 0
+                is_valid_send = (
+                    tgt_idx > 0
+                    and tgt_idx < len(context.candidate_ids)
+                    and context.candidate_mask[tgt_idx]
+                    and int(context.ship_counts[tgt_idx]) > 0
+                )
+                target_indices.append(tgt_idx)
+                log_probs.append(float(sampled_log_prob[global_idx]) if batch.self_features.shape[0] > 0 else 0.0)
+                group_indices.append(len(values) - 1)
+                if not is_valid_send:
+                    continue
+                ships = int(context.ship_counts[tgt_idx])
+                src_planet = find_planet(batch.state.planets, context.source_id)
+                if src_planet is None or src_planet.ships < ships:
+                    continue
+                moves.append([context.source_id, float(context.target_angles[tgt_idx]), ships])
+            result = env.step(moves)
+            running_episode_rewards[env_idx] += float(result.reward)
+            groups_per_env[env_idx].append(StepGroup(indices=group_indices, reward=float(result.reward), done=result.done))
+            if result.done:
+                episode_rewards.append(running_episode_rewards[env_idx])
+                running_episode_rewards[env_idx] = 0.0
+                next_seed += 1
+                next_batch = env.reset(seed=next_seed)
+            else:
+                next_batch = result.batch
+            next_batches.append(next_batch)
+        batches = next_batches
+
+    returns: list[float] = [0.0] * len(values)
+    advantages: list[float] = [0.0] * len(values)
+    next_state_values = bootstrap_values(policy, batches, device)
+    for env_idx, groups in enumerate(groups_per_env):
+        future_return = next_state_values[env_idx]
+        for group in reversed(groups):
+            future_return = group.reward + cfg.ppo.gamma * future_return * (1.0 - float(group.done))
+            for idx in group.indices:
+                returns[idx] = future_return
+                advantages[idx] = future_return - values[idx]
+    batch = TransitionBatch(
+        self_features=torch.from_numpy(np.asarray(self_rows, dtype=np.float32).reshape(-1, self_feature_dim())),
+        candidate_features=torch.from_numpy(
+            np.asarray(candidate_rows, dtype=np.float32).reshape(-1, empty_candidate[0], empty_candidate[1])
+        ),
+        global_features=torch.from_numpy(np.asarray(global_rows, dtype=np.float32).reshape(-1, global_feature_dim())),
+        candidate_mask=torch.from_numpy(np.asarray(candidate_masks, dtype=bool).reshape(-1, cfg.env.candidate_count)),
+        target_index=torch.tensor(target_indices, dtype=torch.long),
+        log_prob=torch.tensor(log_probs, dtype=torch.float32),
+        returns=torch.tensor(returns, dtype=torch.float32),
+        advantages=torch.tensor(advantages, dtype=torch.float32),
+    )
+    stats = {
+        "episode_reward_mean": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
+        "episodes_finished": float(len(episode_rewards)),
+        "samples": float(len(values)),
+    }
+    return batch, batches, next_seed, stats
+
+
+def bootstrap_values(policy: PlanetPolicy, batches: list[TurnBatch], device: torch.device) -> list[float]:
+    merged = merge_batches(batches)
+    if merged.self_features.shape[0] == 0:
+        return [0.0 for _ in batches]
+    offsets = np.cumsum([0] + [batch.self_features.shape[0] for batch in batches[:-1]])
+    with torch.inference_mode():
+        outputs = policy(
+            torch.from_numpy(merged.self_features).to(device),
+            torch.from_numpy(merged.candidate_features).to(device),
+            torch.from_numpy(merged.global_features).to(device),
+            torch.from_numpy(merged.candidate_mask).to(device).bool(),
+        )
+    values = outputs.value.detach().cpu().numpy()
+    per_env = []
+    for env_idx, batch in enumerate(batches):
+        start = int(offsets[env_idx])
+        count = batch.self_features.shape[0]
+        per_env.append(0.0 if count == 0 else float(values[start : start + count].mean()))
+    return per_env
+
+
+def merge_batches(batches: list[TurnBatch]) -> TurnBatch:
+    if not batches:
+        raise ValueError("batches must not be empty")
+    has_rows = any(batch.self_features.shape[0] > 0 for batch in batches)
+    self_rows = (
+        np.concatenate([batch.self_features for batch in batches], axis=0)
+        if has_rows
+        else np.zeros((0, self_feature_dim()), dtype=np.float32)
+    )
+    candidate_rows = (
+        np.concatenate([batch.candidate_features for batch in batches], axis=0)
+        if has_rows
+        else np.zeros((0, batches[0].candidate_features.shape[1], candidate_feature_dim()), dtype=np.float32)
+    )
+    global_rows = (
+        np.concatenate([batch.global_features for batch in batches], axis=0)
+        if has_rows
+        else np.zeros((0, global_feature_dim()), dtype=np.float32)
+    )
+    candidate_masks = (
+        np.concatenate([batch.candidate_mask for batch in batches], axis=0)
+        if has_rows
+        else np.zeros((0, batches[0].candidate_mask.shape[1]), dtype=bool)
+    )
+    return TurnBatch(
+        self_features=self_rows,
+        candidate_features=candidate_rows,
+        global_features=global_rows,
+        candidate_mask=candidate_masks,
+        contexts=[context for batch in batches for context in batch.contexts],
+        state=batches[0].state,
+    )
+
+
+def save_checkpoint(
+    save_dir: Path,
+    run_name: str,
+    update: int,
+    policy: PlanetPolicy,
+    optimizer: torch.optim.Optimizer,
+    cfg: TrainConfig,
+) -> None:
+    run_dir = save_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "update": update,
+            "policy": policy.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": cfg,
+        },
+        run_dir / "ckpt_last.pt",
+    )
+    torch.save(
+        {
+            "update": update,
+            "policy": policy.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": cfg,
+        },
+        run_dir / f"ckpt_{update:06d}.pt",
+    )
+
+
+def find_planet(planets: list[PlanetState], planet_id: int) -> PlanetState | None:
+    for planet in planets:
+        if planet.id == planet_id:
+            return planet
+    return None
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_train_config(args.config)
+    seed_everything(cfg.seed)
+    device = resolve_device(cfg.device)
+    opponent = build_opponent(cfg.opponent, cfg=cfg, device=device)
+    envs = [OrbitWarsEnv(cfg, opponent, env_index=idx) for idx in range(cfg.ppo.num_envs)]
+    next_seed = cfg.seed
+    batches = []
+    for env in envs:
+        batches.append(env.reset(seed=next_seed))
+        next_seed += 1
+    policy = PlanetPolicy(
+        self_dim=self_feature_dim(),
+        candidate_dim=candidate_feature_dim(),
+        global_dim=global_feature_dim(),
+        candidate_count=cfg.env.candidate_count,
+        hidden_size=cfg.model.hidden_size,
+    ).to(device)
+    if isinstance(opponent, SelfPlayOpponent):
+        opponent.sync_from(policy)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.ppo.lr)
+    save_dir = Path(cfg.save_dir)
+    for update in range(1, cfg.ppo.total_updates + 1):
+        batch, batches, next_seed, stats = collect_rollout(envs, batches, policy, cfg, device, next_seed)
+        metrics = ppo_update(
+            policy,
+            optimizer,
+            batch,
+            clip_coef=cfg.ppo.clip_coef,
+            ent_coef=cfg.ppo.ent_coef,
+            vf_coef=cfg.ppo.vf_coef,
+            max_grad_norm=cfg.ppo.max_grad_norm,
+            epochs=cfg.ppo.epochs,
+            minibatch_size=cfg.ppo.minibatch_size,
+            device=device,
+        )
+        if isinstance(opponent, SelfPlayOpponent) and update % cfg.self_play_update_interval == 0:
+            opponent.sync_from(policy)
+        if update % cfg.log_every == 0:
+            print(
+                f"update={update} episode_reward_mean={stats['episode_reward_mean']:.4f} "
+                f"episodes={int(stats['episodes_finished'])} samples={int(stats['samples'])} "
+                f"loss={metrics['loss']:.4f}"
+            )
+        if update % cfg.checkpoint_every == 0 or update == cfg.ppo.total_updates:
+            save_checkpoint(save_dir, cfg.run_name, update, policy, optimizer, cfg)
+
+
+if __name__ == "__main__":
+    main()
+
+
+--- cell 19 (markdown) ---
+# Training PPO
+
+--- cell 20 (code) ---
+%%capture
+!pip install --upgrade "kaggle-environments>=1.28.0"
+
+--- cell 21 (markdown) ---
+Note: For this public Notebook, total_updates is set to 100 to keep runtime short. For full training, increase it to 2000.
+
+--- cell 22 (code) ---
+!python -m src.train --config default_cfg.yaml
+
+--- cell 23 (markdown) ---
+# Evaluate
+
+--- cell 24 (markdown) ---
+We evaluate the trained models by playing them against the sniper agent.
+
+We measure win rate over 20 games for each of the following checkpoints:
+- No_Train (before training)
+- 500 updates (25% of total training)
+- 1000 updates (50% of total training)
+- 2000 updates (full training)
+
+--- cell 25 (markdown) ---
+Note: This experiment uses weights trained in a different environment.  
+To reproduce these results yourself, set ppo.total_updates to 2000 in your config file and run the training process.
+
+--- cell 26 (code) ---
+%%writefile eval_vs_sniper.py
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import math
+import random
+import sys
+import types
+from collections import namedtuple
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.config import TrainConfig, default_train_config_path, load_train_config
+from src.features import TurnBatch, candidate_feature_dim, encode_turn, global_feature_dim, self_feature_dim
+from src.policy import PlanetPolicy
+from src.ppo import sample_actions
+
+Planet = namedtuple("Planet", ["id", "owner", "x", "y", "radius", "ships", "production"])
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="")
+    parser.add_argument("--config", type=str, default=str(default_train_config_path()))
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--games", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--deterministic", action="store_true")
+    return parser.parse_args()
+
+
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def build_policy(cfg: TrainConfig, device: torch.device) -> PlanetPolicy:
+    return PlanetPolicy(
+        self_dim=self_feature_dim(),
+        candidate_dim=candidate_feature_dim(),
+        global_dim=global_feature_dim(),
+        candidate_count=cfg.env.candidate_count,
+        hidden_size=cfg.model.hidden_size,
+    ).to(device)
+
+def register_checkpoint_module_aliases() -> None:
+    sys.modules.setdefault("src", types.ModuleType("src"))
+    sys.modules.setdefault("src.rl_template", types.ModuleType("src.rl_template"))
+    module_candidates = {
+        "config": ["src.rl_template.config", "src.config", "config"],
+        "features": ["src.rl_template.features", "src.features", "features"],
+        "policy": ["src.rl_template.policy", "src.policy", "policy"],
+        "ppo": ["src.rl_template.ppo", "src.ppo", "ppo"],
+        "game_types": ["src.rl_template.game_types", "src.game_types", "game_types"],
+        "opponents": ["src.rl_template.opponents", "src.opponents", "opponents"],
+        "env": ["src.rl_template.env", "src.env", "env"],
+        "train": ["src.rl_template.train", "src.train", "train"],
+    }
+
+    for canonical_name, candidates in module_candidates.items():
+        module = None
+        for candidate in candidates:
+            try:
+                module = importlib.import_module(candidate)
+                break
+            except ModuleNotFoundError:
+                continue
+        if module is None:
+            continue
+        sys.modules[f"src.rl_template.{canonical_name}"] = module
+        sys.modules[f"src.{canonical_name}"] = module
+
+def load_checkpoint_if_available(policy: PlanetPolicy, checkpoint_path: str | None, device: torch.device) -> None:
+    register_checkpoint_module_aliases()
+    if checkpoint_path is None:
+        return
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get("policy", checkpoint)
+    policy.load_state_dict(state_dict)
+
+
+def build_moves(batch: TurnBatch, policy: PlanetPolicy, device: torch.device, deterministic: bool) -> list[list[float | int]]:
+    if batch.self_features.shape[0] == 0:
+        return []
+    with torch.inference_mode():
+        outputs = policy(
+            torch.from_numpy(batch.self_features).to(device),
+            torch.from_numpy(batch.candidate_features).to(device),
+            torch.from_numpy(batch.global_features).to(device),
+            torch.from_numpy(batch.candidate_mask).to(device).bool(),
+        )
+        sampled = sample_actions(outputs, deterministic=deterministic)
+    target_indices = sampled.target_index.detach().cpu().numpy()
+
+    moves: list[list[float | int]] = []
+    for row_idx, context in enumerate(batch.contexts):
+        target_idx = int(target_indices[row_idx])
+        if target_idx == 0:
+            continue
+        if target_idx >= len(context.candidate_ids):
+            continue
+        if not context.candidate_mask[target_idx]:
+            continue
+        ships = int(context.ship_counts[target_idx])
+        if ships <= 0:
+            continue
+        moves.append([context.source_id, float(context.target_angles[target_idx]), ships])
+    return moves
+
+
+def nearest_planet_sniper(obs: Any) -> list[list[float | int]]:
+    moves: list[list[float | int]] = []
+    player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
+    raw_planets = obs.get("planets", []) if isinstance(obs, dict) else obs.planets
+    planets = [Planet(*p) for p in raw_planets]
+    my_planets = [p for p in planets if p.owner == player]
+    targets = [p for p in planets if p.owner != player]
+    if not targets:
+        return moves
+    for mine in my_planets:
+        nearest = None
+        min_dist = float("inf")
+        for target in targets:
+            dist = math.hypot(mine.x - target.x, mine.y - target.y)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = target
+        if nearest is None:
+            continue
+        ships_needed = max(nearest.ships + 1, 20)
+        if mine.ships < ships_needed:
+            continue
+        angle = math.atan2(nearest.y - mine.y, nearest.x - mine.x)
+        moves.append([mine.id, angle, ships_needed])
+    return moves
+
+
+def extract_observation(state: Any) -> Any:
+    if isinstance(state, dict):
+        return state.get("observation")
+    return getattr(state, "observation")
+
+
+def extract_status(state: Any) -> str:
+    if isinstance(state, dict):
+        return str(state.get("status", "UNKNOWN"))
+    return str(getattr(state, "status", "UNKNOWN"))
+
+
+def extract_reward(state: Any) -> float:
+    if isinstance(state, dict):
+        value = state.get("reward", 0.0)
+    else:
+        value = getattr(state, "reward", 0.0)
+    return 0.0 if value is None else float(value)
+
+
+def play_one_game(
+    cfg: TrainConfig,
+    policy: PlanetPolicy,
+    device: torch.device,
+    *,
+    seed: int,
+    deterministic: bool,
+) -> tuple[float, int]:
+    from kaggle_environments import make
+
+    env = make(
+        "orbit_wars",
+        configuration={"seed": int(seed), "randomSeed": int(seed)},
+        debug=False,
+    )
+    env.reset(num_agents=2)
+    states = env.step([[], []])
+    player_obs = extract_observation(states[0])
+    opponent_obs = extract_observation(states[1])
+    done = extract_status(states[0]) != "ACTIVE"
+    step_count = 0
+
+    while not done:
+        batch = encode_turn(player_obs, cfg.env, env_index=0)
+        player_action = build_moves(batch, policy, device, deterministic)
+        opponent_action = nearest_planet_sniper(opponent_obs)
+        states = env.step([player_action, opponent_action])
+        player_obs = extract_observation(states[0])
+        opponent_obs = extract_observation(states[1])
+        done = extract_status(states[0]) != "ACTIVE"
+        step_count += 1
+
+    return extract_reward(states[0]), step_count
+
+
+def reward_to_label(reward: float) -> str:
+    if reward > 0:
+        return "win"
+    if reward < 0:
+        return "loss"
+    return "draw"
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_train_config(args.config)
+    device_name = args.device if args.device != "auto" else cfg.device
+    device = resolve_device(device_name)
+    seed_everything(args.seed)
+    policy = build_policy(cfg, device)
+    load_checkpoint_if_available(policy, args.checkpoint, device)
+    policy.eval()
+
+    wins = 0
+    draws = 0
+    losses = 0
+
+    for game_idx in range(args.games):
+        game_seed = args.seed + game_idx
+        reward, steps = play_one_game(
+            cfg,
+            policy,
+            device,
+            seed=game_seed,
+            deterministic=args.deterministic,
+        )
+        label = reward_to_label(reward)
+        if label == "win":
+            wins += 1
+        elif label == "loss":
+            losses += 1
+        else:
+            draws += 1
+        print(f"game={game_idx + 1} seed={game_seed} result={label} reward={reward:.1f} steps={steps}")
+
+    total_games = max(args.games, 1)
+    win_rate = wins / total_games
+    print(f"summary wins={wins} losses={losses} draws={draws} games={args.games}")
+    print(f"win_rate={win_rate:.4f}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+--- cell 27 (markdown) ---
+### No_Train
+
+--- cell 28 (code) ---
+!python eval_vs_sniper.py --config default_cfg.yaml --deterministic
+
+--- cell 29 (markdown) ---
+### 500 updates (25% of total training)
+
+--- cell 30 (code) ---
+!python eval_vs_sniper.py --config default_cfg.yaml --checkpoint /kaggle/input/datasets/kashiwaba/orbitwars-ppo-sample-weight/ckpt_000500.pt --deterministic
+
+--- cell 31 (markdown) ---
+### 1000 updates (50% of total training)
+
+--- cell 32 (code) ---
+!python eval_vs_sniper.py --config default_cfg.yaml --checkpoint /kaggle/input/datasets/kashiwaba/orbitwars-ppo-sample-weight/ckpt_001000.pt --deterministic
+
+--- cell 33 (markdown) ---
+### 2000 updates (full training)
+
+--- cell 34 (code) ---
+!python eval_vs_sniper.py --config default_cfg.yaml --checkpoint /kaggle/input/datasets/kashiwaba/orbitwars-ppo-sample-weight/ckpt_002000.pt --deterministic
+
+--- cell 35 (markdown) ---
+**Win Rate Summary**
+- No_Train (before training)          :  0%
+- 500 updates (25% of total training) : 30%
+- 1000 updates (50% of total training): 85%
+- 2000 updates (full training)        : 100%
+
+--- cell 36 (markdown) ---
+# Game Demo
+
+--- cell 37 (code) ---
+%%writefile play_vs_sniper.py
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import math
+import random
+import sys
+import types
+from collections import namedtuple
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.config import TrainConfig, default_train_config_path, load_train_config
+from src.features import TurnBatch, candidate_feature_dim, encode_turn, global_feature_dim, self_feature_dim
+from src.policy import PlanetPolicy
+from src.ppo import sample_actions
+
+Planet = namedtuple("Planet", ["id", "owner", "x", "y", "radius", "ships", "production"])
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run one rl_template match against the nearest-planet sniper agent and save the replay as HTML."
+    )
+    parser.add_argument("--config", type=str, default=str(default_train_config_path()))
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--output", type=str, default="artifacts/rl_template/replays/vs_sniper.html")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--deterministic", action="store_true")
+    return parser.parse_args()
+
+
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def build_policy(cfg: TrainConfig, device: torch.device) -> PlanetPolicy:
+    return PlanetPolicy(
+        self_dim=self_feature_dim(),
+        candidate_dim=candidate_feature_dim(),
+        global_dim=global_feature_dim(),
+        candidate_count=cfg.env.candidate_count,
+        hidden_size=cfg.model.hidden_size,
+    ).to(device)
+
+def register_checkpoint_module_aliases() -> None:
+    sys.modules.setdefault("src", types.ModuleType("src"))
+    sys.modules.setdefault("src.rl_template", types.ModuleType("src.rl_template"))
+    module_candidates = {
+        "config": ["src.rl_template.config", "src.config", "config"],
+        "features": ["src.rl_template.features", "src.features", "features"],
+        "policy": ["src.rl_template.policy", "src.policy", "policy"],
+        "ppo": ["src.rl_template.ppo", "src.ppo", "ppo"],
+        "game_types": ["src.rl_template.game_types", "src.game_types", "game_types"],
+        "opponents": ["src.rl_template.opponents", "src.opponents", "opponents"],
+        "env": ["src.rl_template.env", "src.env", "env"],
+        "train": ["src.rl_template.train", "src.train", "train"],
+    }
+
+    for canonical_name, candidates in module_candidates.items():
+        module = None
+        for candidate in candidates:
+            try:
+                module = importlib.import_module(candidate)
+                break
+            except ModuleNotFoundError:
+                continue
+        if module is None:
+            continue
+        sys.modules[f"src.rl_template.{canonical_name}"] = module
+        sys.modules[f"src.{canonical_name}"] = module
+
+def load_checkpoint_if_available(policy: PlanetPolicy, checkpoint_path: str | None, device: torch.device) -> None:
+    register_checkpoint_module_aliases()
+    if checkpoint_path is None:
+        return
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get("policy", checkpoint)
+    policy.load_state_dict(state_dict)
+
+
+def build_moves(batch: TurnBatch, policy: PlanetPolicy, device: torch.device, deterministic: bool) -> list[list[float | int]]:
+    if batch.self_features.shape[0] == 0:
+        return []
+    with torch.inference_mode():
+        outputs = policy(
+            torch.from_numpy(batch.self_features).to(device),
+            torch.from_numpy(batch.candidate_features).to(device),
+            torch.from_numpy(batch.global_features).to(device),
+            torch.from_numpy(batch.candidate_mask).to(device).bool(),
+        )
+        sampled = sample_actions(outputs, deterministic=deterministic)
+    target_indices = sampled.target_index.detach().cpu().numpy()
+
+    moves: list[list[float | int]] = []
+    for row_idx, context in enumerate(batch.contexts):
+        target_idx = int(target_indices[row_idx])
+        if target_idx == 0:
+            continue
+        if target_idx >= len(context.candidate_ids):
+            continue
+        if not context.candidate_mask[target_idx]:
+            continue
+        ships = int(context.ship_counts[target_idx])
+        if ships <= 0:
+            continue
+        moves.append([context.source_id, float(context.target_angles[target_idx]), ships])
+    return moves
+
+
+def nearest_planet_sniper(obs: Any) -> list[list[float | int]]:
+    moves: list[list[float | int]] = []
+    player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
+    raw_planets = obs.get("planets", []) if isinstance(obs, dict) else obs.planets
+    planets = [Planet(*p) for p in raw_planets]
+    my_planets = [p for p in planets if p.owner == player]
+    targets = [p for p in planets if p.owner != player]
+    if not targets:
+        return moves
+
+    for mine in my_planets:
+        nearest = None
+        min_dist = float("inf")
+        for target in targets:
+            dist = math.hypot(mine.x - target.x, mine.y - target.y)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = target
+        if nearest is None:
+            continue
+        ships_needed = max(nearest.ships + 1, 20)
+        if mine.ships < ships_needed:
+            continue
+        angle = math.atan2(nearest.y - mine.y, nearest.x - mine.x)
+        moves.append([mine.id, angle, ships_needed])
+    return moves
+
+
+def extract_observation(state: Any) -> Any:
+    if isinstance(state, dict):
+        return state.get("observation")
+    return getattr(state, "observation")
+
+
+def extract_status(state: Any) -> str:
+    if isinstance(state, dict):
+        return str(state.get("status", "UNKNOWN"))
+    return str(getattr(state, "status", "UNKNOWN"))
+
+
+def extract_reward(state: Any) -> float:
+    if isinstance(state, dict):
+        value = state.get("reward", 0.0)
+    else:
+        value = getattr(state, "reward", 0.0)
+    return 0.0 if value is None else float(value)
+
+
+def run_match(
+    cfg: TrainConfig,
+    policy: PlanetPolicy,
+    device: torch.device,
+    *,
+    seed: int,
+    deterministic: bool,
+) -> tuple[str, float, int]:
+    from kaggle_environments import make
+
+    env = make(
+        "orbit_wars",
+        configuration={"seed": int(seed), "randomSeed": int(seed)},
+        debug=False,
+    )
+    env.reset(num_agents=2)
+    states = env.step([[], []])
+    player_obs = extract_observation(states[0])
+    opponent_obs = extract_observation(states[1])
+    done = extract_status(states[0]) != "ACTIVE"
+    step_count = 0
+
+    while not done:
+        batch = encode_turn(player_obs, cfg.env, env_index=0)
+        player_action = build_moves(batch, policy, device, deterministic)
+        opponent_action = nearest_planet_sniper(opponent_obs)
+        states = env.step([player_action, opponent_action])
+        player_obs = extract_observation(states[0])
+        opponent_obs = extract_observation(states[1])
+        done = extract_status(states[0]) != "ACTIVE"
+        step_count += 1
+
+    html = env.render(mode="html")
+    return html, extract_reward(states[0]), step_count
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_train_config(args.config)
+    device_name = args.device if args.device != "auto" else cfg.device
+    device = resolve_device(device_name)
+    seed_everything(args.seed)
+    policy = build_policy(cfg, device)
+    load_checkpoint_if_available(policy, args.checkpoint, device)
+    policy.eval()
+
+    html, reward, step_count = run_match(
+        cfg,
+        policy,
+        device,
+        seed=args.seed,
+        deterministic=args.deterministic,
+    )
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html, encoding="utf-8")
+    print(f"saved_html={output_path}")
+    print(f"reward={reward:.1f}")
+    print(f"steps={step_count}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+--- cell 38 (code) ---
+!python play_vs_sniper.py --config default_cfg.yaml --checkpoint /kaggle/input/datasets/kashiwaba/orbitwars-ppo-sample-weight/ckpt_002000.pt --deterministic --output result.html
+
+--- cell 39 (code) ---
+from IPython.display import HTML, display
+
+with open("/kaggle/working/result.html", "r", encoding="utf-8") as f:
+    html = f.read()
+
+display(HTML(f"""
+<iframe
+    srcdoc='{html.replace("'", "&apos;")}'
+    width="100%"
+    height="900"
+    style="border:1px solid #ccc;"
+></iframe>
+"""))
+
+--- cell 40 (code) ---
+

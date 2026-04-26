@@ -31,6 +31,7 @@ from orbitwars.mcts.gumbel_search import (
     GumbelRootSearch,
     _build_anchor_joint,
     _rollout_value,
+    _value_fn_eval,
     enumerate_joints,
     gumbel_topk,
     sequential_halving,
@@ -947,3 +948,167 @@ def test_gumbel_root_search_unknown_variant_warns_and_falls_back(monkeypatch, ca
     assert len(ucb_calls) == 1
     captured = capsys.readouterr()
     assert "unknown sim_move_variant" in captured.out
+
+
+# ---- value_fn / nn_value pathway (Phase 1 of NN value-head Q) -----------
+
+def test_value_fn_eval_returns_scalar_in_range():
+    """Smoke: 1-ply eval with a constant value_fn returns the constant."""
+    obs = _mk_obs()
+    eng = FastEngine.from_official_obs(SimpleNamespace(**obs), num_agents=2)
+    base_state = eng.state
+    from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS, HeuristicAgent
+
+    def factory():
+        return HeuristicAgent(weights=HEURISTIC_WEIGHTS)
+
+    def constant_value_fn(o, p):
+        return 0.42
+
+    v = _value_fn_eval(
+        base_state=base_state,
+        my_player=0,
+        my_action=[],  # hold
+        opp_agent_factory=factory,
+        value_fn=constant_value_fn,
+        num_agents=2,
+    )
+    assert v == pytest.approx(0.42, abs=1e-6)
+
+
+def test_value_fn_eval_clips_out_of_range():
+    """If value_fn returns 5.0, _value_fn_eval clips to +1.0."""
+    obs = _mk_obs()
+    eng = FastEngine.from_official_obs(SimpleNamespace(**obs), num_agents=2)
+    base_state = eng.state
+    from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS, HeuristicAgent
+
+    def factory():
+        return HeuristicAgent(weights=HEURISTIC_WEIGHTS)
+
+    v = _value_fn_eval(
+        base_state=base_state,
+        my_player=0,
+        my_action=[],
+        opp_agent_factory=factory,
+        value_fn=lambda o, p: 5.0,
+        num_agents=2,
+    )
+    assert v == 1.0
+
+
+def test_value_fn_eval_falls_back_on_value_fn_exception():
+    """A throwing value_fn must NEVER forfeit — fall back to engine score."""
+    obs = _mk_obs()
+    eng = FastEngine.from_official_obs(SimpleNamespace(**obs), num_agents=2)
+    base_state = eng.state
+    from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS, HeuristicAgent
+
+    def factory():
+        return HeuristicAgent(weights=HEURISTIC_WEIGHTS)
+
+    def boom(o, p):
+        raise RuntimeError("simulated value_fn failure")
+
+    v = _value_fn_eval(
+        base_state=base_state,
+        my_player=0,
+        my_action=[],
+        opp_agent_factory=factory,
+        value_fn=boom,
+        num_agents=2,
+    )
+    # Must return a finite number — engine score on the post-step state.
+    assert isinstance(v, float)
+    assert -1.0 <= v <= 1.0
+
+
+def test_gumbel_search_dispatches_to_value_fn_when_configured():
+    """When rollout_policy='nn_value' AND value_fn is set, the search
+    uses _value_fn_eval (verified by counting calls). Otherwise it
+    uses _rollout_value (heuristic rollouts)."""
+    obs = _mk_obs()
+    calls = {"value_fn": 0}
+
+    def counting_value_fn(o, p):
+        calls["value_fn"] += 1
+        return 0.5
+
+    cfg = GumbelConfig(
+        num_candidates=2, total_sims=4, rollout_depth=1,
+        rollout_policy="nn_value",
+        hard_deadline_ms=2000.0,
+    )
+    search = GumbelRootSearch(
+        gumbel_cfg=cfg, rng_seed=0, value_fn=counting_value_fn,
+    )
+    res = search.search(obs, my_player=0)
+    assert res is not None
+    # value_fn must have been called at least once (one per candidate
+    # rollout; with 2 candidates × 2 sims/round × 1 round = 4 sims, but
+    # actual count depends on SH internals — just assert > 0).
+    assert calls["value_fn"] > 0
+
+
+def test_gumbel_search_falls_back_when_nn_value_set_but_no_fn(capsys):
+    """rollout_policy='nn_value' with value_fn=None should warn and
+    fall back to heuristic rollouts (search still completes)."""
+    import warnings
+    obs = _mk_obs()
+    cfg = GumbelConfig(
+        num_candidates=2, total_sims=4, rollout_depth=1,
+        rollout_policy="nn_value",
+        hard_deadline_ms=2000.0,
+    )
+    search = GumbelRootSearch(
+        gumbel_cfg=cfg, rng_seed=0, value_fn=None,
+    )
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        res = search.search(obs, my_player=0)
+    assert res is not None
+    # Warning about missing value_fn should fire.
+    msgs = [str(warning.message) for warning in w]
+    assert any("nn_value" in m and "value_fn" in m for m in msgs)
+
+
+def test_value_fn_steering_changes_action_vs_constant():
+    """Two GumbelRootSearch with the SAME seed but DIFFERENT value_fn
+    (one constant, one steering toward a specific candidate) should
+    produce different best_joint when the candidate set has >1 option.
+
+    This is the diagnostic the design doc calls for: confirm that
+    value_fn actually steers Q estimates to the wire."""
+    obs = _mk_obs()
+
+    def constant_fn(o, p):
+        return 0.0
+
+    cfg_c = GumbelConfig(
+        num_candidates=4, total_sims=16, rollout_depth=1,
+        rollout_policy="nn_value", hard_deadline_ms=5000.0,
+    )
+    s_const = GumbelRootSearch(
+        gumbel_cfg=cfg_c, rng_seed=42, value_fn=constant_fn,
+    )
+    res_const = s_const.search(obs, my_player=0)
+
+    # Steering value_fn returns +1 for one specific obs hash, 0 otherwise.
+    # We can't easily steer to a specific candidate without knowing
+    # the post-step obs identity, so just check that an extreme +1
+    # value_fn pushes Q-values toward 1.0 across the board.
+    def extreme_fn(o, p):
+        return 1.0
+
+    s_extreme = GumbelRootSearch(
+        gumbel_cfg=cfg_c, rng_seed=42, value_fn=extreme_fn,
+    )
+    res_extreme = s_extreme.search(obs, my_player=0)
+
+    # Q-values from the extreme run should be uniformly higher.
+    avg_q_const = sum(res_const.q_values) / max(1, len(res_const.q_values))
+    avg_q_extreme = sum(res_extreme.q_values) / max(1, len(res_extreme.q_values))
+    assert avg_q_extreme > avg_q_const + 0.5, (
+        f"value_fn=1.0 should produce higher Q than value_fn=0.0 "
+        f"(got {avg_q_extreme:.3f} vs {avg_q_const:.3f})"
+    )

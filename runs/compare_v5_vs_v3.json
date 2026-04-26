@@ -1,0 +1,217 @@
+{
+  "args": {
+    "weights_a": "runs/turbo_v5_w3pool.json",
+    "weights_b": "runs/turbo_v3_20260424.json",
+    "label_a": "turbo_v5",
+    "label_b": "turbo_v3",
+    "pool": "w3",
+    "games_per_opp": 10,
+    "step_timeout": 1.0,
+    "seed": 0,
+    "workers": 7,
+    "out": "runs/compare_v5_vs_v3.json"
+  },
+  "a": {
+    "label": "turbo_v5",
+    "win_rate": 0.96,
+    "hard_win_rate": 0.96,
+    "n_games": 200,
+    "wall_seconds": 179.60013630008325,
+    "weights": {
+      "w_production": 28.63663386650909,
+      "w_ships_cost": 0.0,
+      "w_distance_cost": 0.0,
+      "w_travel_cost": 2.231211570512909,
+      "mult_neutral": 1.913477813850269,
+      "mult_enemy": 5.794780208892341,
+      "mult_comet": 5.120691461063758,
+      "mult_reinforce_ally": 0.40607170008541543,
+      "ships_safety_margin": 3.0,
+      "min_launch_size": 26.64461832585852,
+      "max_launch_fraction": 0.9819786502233919,
+      "expand_cooldown_turns": 8.0,
+      "keep_reserve_ships": 0.4504354151452009,
+      "agg_early_game": 1.8293246324876349,
+      "early_game_cutoff_turn": 300.0,
+      "sun_avoidance_epsilon": 0.04322124464035456,
+      "comet_max_time_mismatch": 10.0,
+      "expand_bias": 1.744021101507501
+    }
+  },
+  "b": {
+    "label": "turbo_v3",
+    "win_rate": 0.92,
+    "hard_win_rate": 0.92,
+    "n_games": 200,
+    "wall_seconds": 210.45001879998017,
+    "weights": {
+      "w_production": 20.0,
+      "w_ships_cost": 0.0,
+      "w_distance_cost": 0.0,
+      "w_travel_cost": 1.444902944661085,
+      "mult_neutral": 2.002924634653468,
+      "mult_enemy": 5.0,
+      "mult_comet": 5.0,
+      "mult_reinforce_ally": 0.0,
+      "ships_safety_margin": 0.9854161130378981,
+      "min_launch_size": 30.0,
+      "max_launch_fraction": 0.9877046770973957,
+      "expand_cooldown_turns": 3.6464331186834906,
+      "keep_reserve_ships": 0.0,
+      "agg_early_game": 0.5,
+      "early_game_cutoff_turn": 104.60161165543384,
+      "sun_avoidance_epsilon": 0.005300802184648653,
+      "comet_max_time_mismatch": 5.0,
+      "expand_bias": 0.7148756834104646
+    }
+  },
+  "delta_win_rate": 0.039999999999999925,
+  "ci95": [
+    -0.006382065499501065,
+    0.08638206549950092
+  ],
+  "paired_win_rate_for_a": 0.52,
+  "paired_se": 0.03532704346531139,
+  "per_opp": {
+    "all_reinforce": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "comet_camper": {
+      "a_wr": 0.9,
+      "a_n": 10,
+      "b_wr": 0.8,
+      "b_n": 10,
+      "delta": 0.09999999999999998
+    },
+    "comet_monomaniac": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "defender": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "distance_blind": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 0.9,
+      "b_n": 10,
+      "delta": 0.09999999999999998
+    },
+    "economy": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "glass_cannon": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "harasser": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "heur_default": {
+      "a_wr": 0.9,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": -0.09999999999999998
+    },
+    "heur_v2": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 0.9,
+      "b_n": 10,
+      "delta": 0.09999999999999998
+    },
+    "heur_v3": {
+      "a_wr": 0.9,
+      "a_n": 10,
+      "b_wr": 0.7,
+      "b_n": 10,
+      "delta": 0.20000000000000007
+    },
+    "heur_v4": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 0.7,
+      "b_n": 10,
+      "delta": 0.30000000000000004
+    },
+    "late_game_swing": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 0.9,
+      "b_n": 10,
+      "delta": 0.09999999999999998
+    },
+    "opportunist": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "patient_builder": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "random": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "rusher": {
+      "a_wr": 0.7,
+      "a_n": 10,
+      "b_wr": 0.8,
+      "b_n": 10,
+      "delta": -0.10000000000000009
+    },
+    "starter": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    },
+    "sun_runner": {
+      "a_wr": 0.8,
+      "a_n": 10,
+      "b_wr": 0.7,
+      "b_n": 10,
+      "delta": 0.10000000000000009
+    },
+    "turtler": {
+      "a_wr": 1.0,
+      "a_n": 10,
+      "b_wr": 1.0,
+      "b_n": 10,
+      "delta": 0.0
+    }
+  }
+}

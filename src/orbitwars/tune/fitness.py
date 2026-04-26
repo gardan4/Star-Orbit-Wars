@@ -47,10 +47,16 @@ class OpponentSpec:
       * ``random`` — ``orbitwars.bots.base.RandomAgent(seed=param)``.
       * ``noop`` — ``orbitwars.bots.base.NoOpAgent()``.
       * ``archetype`` — ``orbitwars.opponent.archetypes.make_archetype(param)``.
+      * ``heuristic_weights`` — HeuristicAgent loaded with weights from a
+        JSON file path (param=str path) or a dict (param=dict). Use this
+        to add "previously-shipped strong bots" as opponents so TuRBO's
+        fitness landscape doesn't saturate at 1.000 against weak
+        archetypes — the new weight set must beat the current best
+        heuristic to score above 0.5 against it. (2026-04-26.)
     """
     name: str
     kind: str
-    param: Any = None  # archetype name (str) or random seed (int); None for builtin/noop
+    param: Any = None  # archetype name (str), random seed (int), JSON path or weights dict; None for builtin/noop
 
     def make_kaggle_agent(self) -> Any:
         """Reconstruct a fresh kaggle-compatible agent handle.
@@ -71,6 +77,34 @@ class OpponentSpec:
         if self.kind == "archetype":
             from orbitwars.opponent.archetypes import make_archetype
             return make_archetype(str(self.param)).as_kaggle_agent()
+        if self.kind == "heuristic_weights":
+            from orbitwars.bots.heuristic import HEURISTIC_WEIGHTS, HeuristicAgent
+            weights = dict(HEURISTIC_WEIGHTS)
+            if isinstance(self.param, dict):
+                weights.update({k: float(v) for k, v in self.param.items()})
+            elif isinstance(self.param, str):
+                # JSON file path — extract best trial's weights.
+                import json
+                from pathlib import Path
+                raw = json.loads(Path(self.param).read_text(encoding="utf-8"))
+                # Same "best_index + trials" extraction logic as bundle.py.
+                if (isinstance(raw, dict) and "best_index" in raw
+                        and isinstance(raw.get("trials"), list)):
+                    best_i = int(raw["best_index"])
+                    for tr in raw["trials"]:
+                        if (int(tr.get("trial", -1)) == best_i
+                                and isinstance(tr.get("weights"), dict)):
+                            raw = tr["weights"]
+                            break
+                # Or {"best_weights": {...}} / {"weights": {...}} top-level.
+                if isinstance(raw, dict):
+                    for key in ("best_weights", "best_point", "best", "weights"):
+                        if key in raw and isinstance(raw[key], dict):
+                            raw = raw[key]
+                            break
+                if isinstance(raw, dict):
+                    weights.update({k: float(v) for k, v in raw.items()})
+            return HeuristicAgent(weights=weights).as_kaggle_agent()
         raise ValueError(f"unknown opponent kind: {self.kind!r}")
 
 
@@ -305,4 +339,133 @@ def w2_pool() -> List[Opponent]:
     ]
     for name in ARCHETYPE_NAMES:
         pool.append((name, OpponentSpec(name=name, kind="archetype", param=name)))
+    return pool
+
+
+# Stress-test heuristic overrides. Each dict is sparse — keys not listed
+# fall back to HEURISTIC_WEIGHTS defaults (handled by the
+# kind="heuristic_weights" agent constructor). These are NOT meant to be
+# strong; they're extreme styles that probe specific gameplay axes so we
+# can detect blind spots in candidate weight sets. A new bot that ties
+# heur_v3 but loses to (say) sun_runner has a sun-routing bug —
+# information you cannot get from the pool's strong opponents alone.
+STRESS_TEST_HEURISTICS: Dict[str, Dict[str, float]] = {
+    # Crosses the sun aggressively. Tests sun-tangent routing logic.
+    "sun_runner": {
+        "sun_avoidance_epsilon": 0.0,
+        "w_travel_cost": 0.0,
+        "mult_enemy": 8.0,
+    },
+    # Ignores everything except comets. Tests comet timing & defense.
+    "comet_monomaniac": {
+        "mult_comet": 10.0,
+        "mult_neutral": 0.3,
+        "mult_enemy": 1.0,
+        "expand_bias": 0.0,
+        "comet_max_time_mismatch": 10.0,
+    },
+    # Launches everything, no reserves. Tests counter-attack timing.
+    "glass_cannon": {
+        "keep_reserve_ships": 0.0,
+        "ships_safety_margin": 0.0,
+        "max_launch_fraction": 1.0,
+        "min_launch_size": 10.0,
+    },
+    # Picks high-value targets regardless of distance. Tests long-route
+    # awareness — a candidate that fails to defend against deep raids.
+    "distance_blind": {
+        "w_distance_cost": 0.0,
+        "w_travel_cost": 0.0,
+    },
+    # Hyper-defensive; reinforces every ally. Tests "knowing when
+    # offense beats defense" and closing-out a turtle.
+    "all_reinforce": {
+        "mult_reinforce_ally": 5.0,
+        "mult_neutral": 0.3,
+        "mult_enemy": 0.5,
+        "keep_reserve_ships": 5.0,
+    },
+    # Long economy ramp. Tests beating a slow opponent without timing
+    # out — easy to draw against, hard to actually beat decisively.
+    "patient_builder": {
+        "agg_early_game": 0.2,
+        "early_game_cutoff_turn": 250.0,
+        "expand_cooldown_turns": 8.0,
+        "w_production": 20.0,
+        "expand_bias": 2.0,
+    },
+    # Turtle for the first 120 turns, then attack at full multiplier.
+    # Tests surviving a late-game burst from a previously-passive
+    # opponent.
+    "late_game_swing": {
+        "agg_early_game": 0.2,
+        "early_game_cutoff_turn": 120.0,
+        "mult_enemy": 10.0,
+        "expand_bias": 0.0,
+    },
+}
+
+
+def w3_pool() -> List[Opponent]:
+    """W3 pool: w2 + previously-shipped strong heuristics with diverse strategies.
+
+    W2 saturated: TuRBO-v3 trial-42 hit 1.000 win-rate, TuRBO-v4 trial-24
+    hit 0.978 — both essentially ceiling-bound on the archetype pool.
+    Without harder opponents, BO has no gradient to find genuinely
+    stronger weights, just different noise patterns at the saturation
+    boundary.
+
+    **Growable pool pattern (2026-04-26)**: as new strong heuristics get
+    confirmed (whether on the ladder or via beating an existing pool
+    member in paired-seed compare), append them to the file list below.
+    A candidate new bot has to beat a *diverse set* of strong opponents
+    to score, not just one — this protects against "exploits one specific
+    style very well but loses to other styles" overfitting. Same idea
+    AlphaStar's league training and PFSP use.
+
+    Currently included strong heuristics:
+      * heur_default: bare HEURISTIC_WEIGHTS (baseline play style).
+      * heur_v2: TuRBO-v2 weights (shipped in v8/v9, less aggressive).
+      * heur_v3: TuRBO-v3 weights (shipped in v22, very aggressive:
+        production=20 maxed, mult_enemy=5 maxed, mult_reinforce_ally=0).
+      * heur_v4: TuRBO-v4 weights (different optimum from v3: production=38,
+        mult_enemy=7.6, mult_reinforce_ally=0.18 re-enabled — DIFFERENT
+        play style despite paired-seed compare against v3 = +0.000 wr.)
+
+    Each one shifts the heuristic's behaviour along different axes
+    (aggression / production weight / reinforce policy / opening style),
+    so beating all of them simultaneously is a stronger "robustness"
+    signal than beating any one.
+
+    Note: requires the TuRBO output JSONs to exist (created by prior
+    TuRBO runs). Fail loudly if they're missing.
+    """
+    from pathlib import Path
+    base = Path(__file__).resolve().parents[3]  # repo root
+    weight_files = [
+        ("heur_v2", base / "runs" / "turbo_v2_20260424.json"),
+        ("heur_v3", base / "runs" / "turbo_v3_20260424.json"),
+        ("heur_v4", base / "runs" / "turbo_v4_20260426.json"),
+    ]
+    for _, p in weight_files:
+        if not p.exists():
+            raise FileNotFoundError(
+                f"w3_pool requires {p} (run the TuRBO version that produced it first)"
+            )
+    pool = list(w2_pool())
+    pool.append(("heur_default", OpponentSpec(
+        name="heur_default", kind="heuristic_weights", param={}
+    )))
+    for label, path in weight_files:
+        pool.append((label, OpponentSpec(
+            name=label, kind="heuristic_weights", param=str(path)
+        )))
+    # Stress-test extremes. See STRESS_TEST_HEURISTICS docstring.
+    # These should be EASY for a candidate to beat (they're deliberately
+    # bad in some axis). If a candidate ties heur_v3 but loses to one of
+    # these, the per-opponent breakdown points to a specific weakness.
+    for label, overrides in STRESS_TEST_HEURISTICS.items():
+        pool.append((label, OpponentSpec(
+            name=label, kind="heuristic_weights", param=overrides
+        )))
     return pool

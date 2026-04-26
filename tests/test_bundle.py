@@ -428,6 +428,57 @@ def test_bundle_macros_with_nn_and_weights_coexist(tmp_path):
     assert m._bundle_cfg.use_macros is True
 
 
+def _make_int8_quantized_checkpoint(path):
+    """Save a BC checkpoint with int8-quantized weights + per-tensor scales.
+
+    Mirrors the production quantization flow: each fp32 tensor is mapped
+    to int8 via per-tensor symmetric scaling. The bundle bootstrap
+    dequantizes back to fp32 at load time.
+    """
+    torch = pytest.importorskip("torch")
+    from orbitwars.nn.conv_policy import ConvPolicy, ConvPolicyCfg
+    from dataclasses import asdict
+    cfg = ConvPolicyCfg()
+    model = ConvPolicy(cfg)
+    state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    q_state = {}
+    scales = {}
+    for k, v in state.items():
+        if v.is_floating_point() and v.dim() > 0:
+            scale = float(v.abs().max() / 127.0)
+            if scale == 0:
+                scale = 1.0
+            q = (v / scale).round().clamp(-128, 127).to(torch.int8)
+            q_state[k] = q
+            scales[k] = scale
+        else:
+            q_state[k] = v
+    ckpt = {
+        "model_state": q_state, "cfg": asdict(cfg), "curve": {},
+        "_quantized": "int8_per_tensor_symmetric",
+        "_quant_scales": scales,
+    }
+    torch.save(ckpt, str(path))
+
+
+def test_bundle_int8_checkpoint_dequantizes_at_load(tmp_path):
+    """End-to-end: int8-quantized checkpoint should bundle, the
+    bootstrap should dequantize at load, and the resulting agent should
+    be callable with no precision-related errors."""
+    pytest.importorskip("torch")
+    ck = tmp_path / "int8.pt"
+    _make_int8_quantized_checkpoint(ck)
+    out = tmp_path / "v20_int8.py"
+    bundle_bot("mcts_bot", out, nn_checkpoint=ck)
+    src = out.read_text(encoding="utf-8")
+    # Bootstrap must fetch scales and apply them.
+    assert "_quant_scales" in src
+    assert "v.float() * float(scales[k])" in src
+    # End-to-end import + agent callable.
+    m = _import_bundle(out, "bundle_int8_test")
+    assert callable(m.agent)
+
+
 def test_bundle_nn_dataset_path_emits_runtime_load(tmp_path):
     """--nn-dataset-path should emit a runtime torch.load(path) — no
     base64 inlining — and add ZERO bytes to the bundle beyond the

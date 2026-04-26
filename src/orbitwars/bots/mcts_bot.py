@@ -60,6 +60,7 @@ class MCTSAgent(Agent):
         rng_seed: Optional[int] = None,
         use_opponent_model: bool = True,
         move_prior_fn: Optional[Any] = None,
+        value_fn: Optional[Any] = None,
     ):
         self.weights = dict(HEURISTIC_WEIGHTS) if weights is None else dict(weights)
         # BOKR-style angle refinement is available (set
@@ -86,6 +87,7 @@ class MCTSAgent(Agent):
             gumbel_cfg=self.gumbel_cfg,
             rng_seed=rng_seed,
             move_prior_fn=move_prior_fn,
+            value_fn=value_fn,
         )
         self._use_opponent_model = use_opponent_model
         # Posterior is created lazily on turn 0 so per-match state

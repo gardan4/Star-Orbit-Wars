@@ -34,7 +34,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "src"))
@@ -63,11 +63,18 @@ def _harvest_visits(
     obs: Any, player: int, agent: Any,
     out_x: List[np.ndarray], out_gy: List[int], out_gx: List[int],
     out_visits: List[np.ndarray],
+    out_player_ids: Optional[List[int]] = None,
 ) -> int:
     """Pull (state, visit-dist) demos from ``agent.last_search_result``.
 
     Returns the number of demos appended (one per owned planet that
     accumulated nonzero visits across non-HOLD candidates).
+
+    If ``out_player_ids`` is provided, also records the player_id for
+    each emitted demo. The caller (``_run_self_play``) uses this after
+    the game ends to stamp each demo with the corresponding player's
+    terminal reward — that's the (state, outcome) pair the value head
+    needs to learn V(s).
     """
     sr = getattr(agent, "last_search_result", None)
     if sr is None or not sr.visits or not sr.best_joint:
@@ -116,6 +123,8 @@ def _harvest_visits(
         out_gy.append(gy)
         out_gx.append(gx)
         out_visits.append(target)
+        if out_player_ids is not None:
+            out_player_ids.append(int(player))
         n_emitted += 1
     return n_emitted
 
@@ -146,11 +155,21 @@ def make_agent(seed: int, sims: int, deadline_ms: float, bc_ckpt: Path) -> MCTSA
 
 
 def _run_self_play(agents: List[MCTSAgent], harvest_each_turn: bool,
-                   out_x, out_gy, out_gx, out_visits) -> Tuple[int, list]:
+                   out_x, out_gy, out_gx, out_visits,
+                   out_terminal_values: Optional[List[float]] = None,
+                   ) -> Tuple[int, list, int]:
     """Custom self-play loop that lets us inspect each agent's state
     *between* turns (kaggle_environments' env.run is opaque).
 
-    Returns (steps, rewards).
+    Returns (steps, rewards, n_demos_this_game).
+
+    If ``out_terminal_values`` is provided, after the game ends each
+    demo collected during this game gets stamped with the corresponding
+    player's terminal reward (+1 win / -1 loss / 0 tie). Demos
+    collected from player 0's perspective get rewards[0]; demos from
+    player 1's perspective get rewards[1]. This is the value-head
+    training target for AlphaZero-style learning (V(s) = expected
+    outcome from this state).
     """
     env = make("orbit_wars", configuration={"actTimeout": 60}, debug=False)
     env.reset()
@@ -158,6 +177,10 @@ def _run_self_play(agents: List[MCTSAgent], harvest_each_turn: bool,
     from orbitwars.bots.base import Deadline
     n_demos_this_game = 0
     steps = 0
+    # Track per-demo player_id so we can stamp terminal values once
+    # the game finishes. This is a *local* list; it gets resolved into
+    # out_terminal_values at the end of the game.
+    demo_player_ids: List[int] = []
     while not all(s.status in ("DONE", "ERROR", "INVALID") for s in env.state):
         actions = []
         for player_id, agent in enumerate(agents):
@@ -175,12 +198,26 @@ def _run_self_play(agents: List[MCTSAgent], harvest_each_turn: bool,
                 n_demos_this_game += _harvest_visits(
                     obs, player_id, agent,
                     out_x, out_gy, out_gx, out_visits,
+                    out_player_ids=demo_player_ids,
                 )
         env.step(actions)
         steps += 1
         if steps > 600:  # safety: should never hit (game is 500-turn capped)
             break
     rewards = [s.reward for s in env.state]
+
+    # Stamp terminal values per demo. Convert env.state.reward (which
+    # can be None / partial) to a clean +1/-1/0 vector.
+    if out_terminal_values is not None:
+        clean_rewards = [
+            (1.0 if r == 1 else (-1.0 if r == -1 else 0.0))
+            for r in rewards
+        ]
+        for pid in demo_player_ids:
+            if 0 <= pid < len(clean_rewards):
+                out_terminal_values.append(clean_rewards[pid])
+            else:
+                out_terminal_values.append(0.0)
     return steps, rewards, n_demos_this_game
 
 
@@ -203,6 +240,7 @@ def main() -> int:
     out_gy: List[int] = []
     out_gx: List[int] = []
     out_visits: List[np.ndarray] = []
+    out_terminal_values: List[float] = []
 
     t_total = time.perf_counter()
     for g in range(args.games):
@@ -212,6 +250,7 @@ def main() -> int:
         steps, rewards, n_demos = _run_self_play(
             [a0, a1], harvest_each_turn=True,
             out_x=out_x, out_gy=out_gy, out_gx=out_gx, out_visits=out_visits,
+            out_terminal_values=out_terminal_values,
         )
         wall = time.perf_counter() - t0
         print(
@@ -230,13 +269,37 @@ def main() -> int:
         return 1
 
     print(f"\ncollected {len(out_x):,} demos in {time.perf_counter() - t_total:.0f}s")
-    np.savez_compressed(
-        out_path,
+    # Sanity: terminal values must be parallel-indexed with the demos
+    # (one stamp per emitted demo). If they're not equal-length, the
+    # game-end stamping logic missed a turn — fail loudly so we don't
+    # silently train on broken value targets.
+    if out_terminal_values and len(out_terminal_values) != len(out_x):
+        print(
+            f"ERROR: terminal_values len ({len(out_terminal_values)}) != "
+            f"demos len ({len(out_x)}). Refusing to write inconsistent "
+            f"targets.", file=sys.stderr,
+        )
+        return 1
+    save_kwargs = dict(
         x=np.stack(out_x).astype(np.float32),
         gy=np.array(out_gy, dtype=np.int64),
         gx=np.array(out_gx, dtype=np.int64),
         visit_dist=np.stack(out_visits).astype(np.float32),
     )
+    if out_terminal_values:
+        save_kwargs["terminal_value"] = np.array(
+            out_terminal_values, dtype=np.float32,
+        )
+        # Quick distribution summary so log shows the mix.
+        tvs = save_kwargs["terminal_value"]
+        n_win = int((tvs > 0.5).sum())
+        n_loss = int((tvs < -0.5).sum())
+        n_tie = int(((tvs >= -0.5) & (tvs <= 0.5)).sum())
+        print(
+            f"terminal_value mix: {n_win} wins / {n_loss} losses / "
+            f"{n_tie} ties (mean={tvs.mean():.3f})"
+        )
+    np.savez_compressed(out_path, **save_kwargs)
     print(f"wrote {out_path}  ({out_path.stat().st_size / 1024 / 1024:.1f} MB)")
     return 0
 

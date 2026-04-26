@@ -28,12 +28,13 @@ from orbitwars.tune.fitness import (
     starter_pool,
     w1_pool,
     w2_pool,
+    w3_pool,
 )
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pool", choices=["starter", "w1", "w2"], default="w2")
+    ap.add_argument("--pool", choices=["starter", "w1", "w2", "w3"], default="w2")
     ap.add_argument("--games-per-opp", type=int, default=5)
     ap.add_argument("--step-timeout", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
@@ -48,6 +49,8 @@ def main() -> int:
         opps = starter_pool()
     elif args.pool == "w1":
         opps = w1_pool()
+    elif args.pool == "w3":
+        opps = w3_pool()
     else:
         opps = w2_pool()
 
