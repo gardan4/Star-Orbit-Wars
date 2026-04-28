@@ -129,11 +129,14 @@ def _harvest_visits(
     return n_emitted
 
 
-def make_agent(seed: int, sims: int, deadline_ms: float, bc_ckpt: Path) -> MCTSAgent:
+def make_agent(
+    seed: int, sims: int, deadline_ms: float, bc_ckpt: Path,
+    rollout_policy: str = "fast",
+) -> MCTSAgent:
     cfg = GumbelConfig()
     cfg.sim_move_variant = "exp3"
     cfg.exp3_eta = 0.3
-    cfg.rollout_policy = "fast"
+    cfg.rollout_policy = rollout_policy
     cfg.anchor_improvement_margin = 0.0
     cfg.use_macros = True
     cfg.total_sims = sims
@@ -142,15 +145,24 @@ def make_agent(seed: int, sims: int, deadline_ms: float, bc_ckpt: Path) -> MCTSA
     cfg.rollout_depth = 15
 
     prior_fn = None
+    value_fn = None
     if bc_ckpt.exists():
         try:
             from orbitwars.nn.nn_prior import load_conv_policy, make_nn_prior_fn
             model, mcfg = load_conv_policy(bc_ckpt, device="cpu")
             prior_fn = make_nn_prior_fn(model, mcfg)
+            # When rollout_policy == "nn_value" we ALSO need to wire the
+            # value_fn so MCTS replaces leaf rollouts with NN-value lookups.
+            # This is the closed-loop iteration N+1 path: collect demos
+            # with the iter-N value head guiding search.
+            if rollout_policy == "nn_value":
+                from orbitwars.nn.nn_value import make_nn_value_fn
+                value_fn = make_nn_value_fn(model, mcfg)
         except Exception as e:
             print(f"  BC prior load failed: {e!r} — using uniform", flush=True)
     return MCTSAgent(
-        gumbel_cfg=cfg, rng_seed=seed, move_prior_fn=prior_fn,
+        gumbel_cfg=cfg, rng_seed=seed,
+        move_prior_fn=prior_fn, value_fn=value_fn,
     )
 
 
@@ -229,6 +241,17 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default="runs/mcts_demos.npz")
     ap.add_argument("--bc-checkpoint", type=str, default="runs/bc_warmstart_v2.pt")
+    ap.add_argument(
+        "--rollout-policy",
+        choices=["heuristic", "fast", "nn_value"],
+        default="fast",
+        help=(
+            "MCTS leaf evaluator. 'fast'=tiny rollout (default, cheap demos); "
+            "'heuristic'=HeuristicAgent rollouts; "
+            "'nn_value'=skip rollouts, query NN value head 1 ply ahead "
+            "(requires --bc-checkpoint with a trained value head)."
+        ),
+    )
     args = ap.parse_args()
 
     out_path = Path(args.out)
@@ -243,9 +266,19 @@ def main() -> int:
     out_terminal_values: List[float] = []
 
     t_total = time.perf_counter()
+    print(f"rollout_policy: {args.rollout_policy}"
+          + (" (NN value head used as leaf eval)"
+             if args.rollout_policy == "nn_value" else ""),
+          flush=True)
     for g in range(args.games):
-        a0 = make_agent(args.seed + g * 2,     args.sims, args.deadline_ms, bc_ckpt)
-        a1 = make_agent(args.seed + g * 2 + 1, args.sims, args.deadline_ms, bc_ckpt)
+        a0 = make_agent(
+            args.seed + g * 2,     args.sims, args.deadline_ms, bc_ckpt,
+            rollout_policy=args.rollout_policy,
+        )
+        a1 = make_agent(
+            args.seed + g * 2 + 1, args.sims, args.deadline_ms, bc_ckpt,
+            rollout_policy=args.rollout_policy,
+        )
         t0 = time.perf_counter()
         steps, rewards, n_demos = _run_self_play(
             [a0, a1], harvest_each_turn=True,

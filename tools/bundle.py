@@ -171,9 +171,15 @@ def bundle_bot(
             )
         modules = list(modules)
         # Insert just before bots.mcts_bot (which is the last entry).
+        # Order matters: features.obs_encode imports from nn.conv_policy,
+        # nn_prior + nn_value both import encode_grid from features.obs_encode.
+        # So conv_policy first, then features.obs_encode, then the prior/value
+        # bridges, then mcts_bot last.
         insert_at = modules.index("bots.mcts_bot")
         modules.insert(insert_at, "nn.conv_policy")
-        modules.insert(insert_at + 1, "nn.nn_prior")
+        modules.insert(insert_at + 1, "features.obs_encode")
+        modules.insert(insert_at + 2, "nn.nn_prior")
+        modules.insert(insert_at + 3, "nn.nn_value")
 
     if use_macros:
         if bot_name != "mcts_bot":
@@ -392,7 +398,7 @@ def bundle_bot(
             "# used when GumbelConfig.rollout_policy='nn_value'; building",
             "# the closure unconditionally costs ~0 bytes (just a closure)",
             "# and lets the same bundle support both rollout modes.",
-            "from orbitwars.nn.nn_value import make_nn_value_fn",
+            "# (make_nn_value_fn is inlined from nn.nn_value above.)",
             "_bundle_value_fn = make_nn_value_fn(_bundle_model, _bundle_cfg_nn)",
             "del _bundle_ckpt  # free RAM after model is built",
         ]

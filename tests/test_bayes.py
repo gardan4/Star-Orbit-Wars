@@ -26,7 +26,7 @@ from orbitwars.opponent.archetypes import (
     all_archetypes,
     make_archetype,
 )
-from orbitwars.opponent.bayes import ArchetypePosterior, _softmax
+from orbitwars.opponent.bayes import ArchetypePosterior, _softmax_np
 
 
 # --- Static checks -------------------------------------------------------
@@ -53,9 +53,9 @@ def test_reset_restores_uniform():
     assert p.turns_observed() == 0
 
 
-def test_softmax_stable_under_shift():
+def test_softmax_np_stable_under_shift():
     x = np.array([1000.0, 1001.0, 999.0])
-    d = _softmax(x)
+    d = _softmax_np(x)
     assert np.all(np.isfinite(d))
     assert abs(d.sum() - 1.0) < 1e-12
 

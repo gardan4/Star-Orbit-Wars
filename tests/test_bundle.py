@@ -272,9 +272,9 @@ def _make_fake_bc_checkpoint(path: Path, partial: bool = False) -> None:
 
 
 def test_bundle_nn_checkpoint_inlines_modules_and_factory(tmp_path):
-    """--nn-checkpoint should inline conv_policy + nn_prior modules,
-    base64-embed the checkpoint, and add `move_prior_fn=...` to the
-    agent factory."""
+    """--nn-checkpoint should inline conv_policy + nn_prior + nn_value +
+    obs_encode modules, base64-embed the checkpoint, and add
+    `move_prior_fn=...` + `value_fn=...` to the agent factory."""
     pytest.importorskip("torch")
     ck = tmp_path / "fake_bc.pt"
     _make_fake_bc_checkpoint(ck)
@@ -284,14 +284,37 @@ def test_bundle_nn_checkpoint_inlines_modules_and_factory(tmp_path):
     # Inlined modules (markers come from bundle.py header per-module).
     assert "# --- inlined: orbitwars/nn/conv_policy.py ---" in src
     assert "# --- inlined: orbitwars/nn/nn_prior.py ---" in src
+    # nn_value carries the leaf-eval bridge (make_nn_value_fn). It MUST be
+    # inlined when --nn-checkpoint is set; previously the bundler emitted
+    # a runtime `from orbitwars.nn.nn_value import ...` instead, which
+    # produced a Kaggle ModuleNotFoundError at boot. Regression: 2026-04-26.
+    assert "# --- inlined: orbitwars/nn/nn_value.py ---" in src
+    # obs_encode provides encode_grid which both nn_prior + nn_value call.
+    # Without it, the prior call site hits NameError when search runs.
+    assert "# --- inlined: orbitwars/features/obs_encode.py ---" in src
     # NN bootstrap + checkpoint base64.
     assert "# --- NN prior bootstrap" in src
     assert "(--nn-checkpoint" in src  # mode marker in the comment
     assert "_BUNDLE_BC_CKPT_B64 = (" in src
     assert "_bundle_move_prior_fn = make_nn_prior_fn(" in src
-    # Factory rewritten to thread move_prior_fn.
+    assert "_bundle_value_fn = make_nn_value_fn(" in src
+    # Factory rewritten to thread move_prior_fn + value_fn.
     assert "move_prior_fn=_bundle_move_prior_fn" in src
+    assert "value_fn=_bundle_value_fn" in src
     assert "MCTSAgent(rng_seed=0)" not in src  # base form replaced
+    # CRITICAL — bundle MUST NOT contain any unresolved `from orbitwars.*`
+    # imports. Such an import would explode at Kaggle boot with
+    # ModuleNotFoundError because Kaggle only ships the bundled main.py,
+    # not the orbitwars package. (This is the bug that made v30, v30b,
+    # v30c, v30d, v30e all error on Kaggle while v27 worked.)
+    import re as _re
+    leftover = _re.findall(
+        r"^(?:from|import)\s+orbitwars\.[^\s]+", src, _re.MULTILINE
+    )
+    assert leftover == [], (
+        f"bundle leaked orbitwars imports — Kaggle will fail to load "
+        f"with ModuleNotFoundError. Found: {leftover}"
+    )
 
 
 def test_bundle_nn_checkpoint_rejects_non_mcts_bot(tmp_path):
@@ -538,3 +561,51 @@ def test_bundle_nn_checkpoint_importable_and_agent_callable(tmp_path):
     # Verify the bootstrap actually built a model, not just emitted text.
     assert hasattr(m, "_bundle_model")
     assert hasattr(m, "_bundle_move_prior_fn")
+
+
+def test_bundle_no_top_level_function_name_collisions(tmp_path):
+    """Regression test for PHANTOM 6.0 (2026-04-28).
+
+    When two source modules both define a top-level function with the
+    same name (e.g. ``_softmax`` in ``mcts/actions.py`` and
+    ``opponent/bayes.py``), the inlined bundle has both definitions in
+    the same global scope and the LATER one shadows the earlier. If
+    their signatures differ, callers of the shadowed-out function get
+    a TypeError at runtime — caught by the silent ``except Exception``
+    in ``mcts_bot.act()``, returning ``heuristic_move``. Net effect:
+    MCTS search silently degenerates to anchor-only play, yet the
+    bundle imports cleanly and matches still complete.
+
+    This test scans every recipe's bundled .py for duplicate top-level
+    ``def`` names. A single duplication is a Phantom-class bug — fail
+    early so it's caught by CI rather than discovered after a ladder
+    submission scores at heuristic strength.
+    """
+    pytest.importorskip("torch")
+    ck = tmp_path / "fake_bc.pt"
+    _make_fake_bc_checkpoint(ck)
+    # Bundle the most complex configuration so every NN module is inlined.
+    out = tmp_path / "v_collision.py"
+    bundle_bot(
+        "mcts_bot", out,
+        nn_checkpoint=ck,
+        sim_move_variant="exp3",
+        rollout_policy="nn_value",
+        anchor_margin=0.0,
+        weights_override={"score_weight": 1.0},
+        use_macros=True,
+    )
+    src = out.read_text(encoding="utf-8")
+    import collections as _co
+    def_names = re.findall(r"^def\s+(\w+)", src, re.MULTILINE)
+    dups = {n: c for n, c in _co.Counter(def_names).items() if c > 1}
+    # ``build`` legitimately appears twice (heuristic + mcts_bot factory
+    # functions); both are unused inside the bundle and don't trigger
+    # runtime collisions in the agent path. Allowlist it.
+    KNOWN_HARMLESS = {"build"}
+    actionable = {n: c for n, c in dups.items() if n not in KNOWN_HARMLESS}
+    assert actionable == {}, (
+        f"bundle has top-level function name collisions — Phantom 6.0 "
+        f"regression: {actionable}. Rename one of each pair in source so "
+        f"the bundle inlines them with unique names."
+    )

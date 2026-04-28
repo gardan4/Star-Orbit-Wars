@@ -620,14 +620,23 @@ def test_mcts_agent_clears_opp_candidate_builder_on_posterior_collapse():
     assert agent._search.opp_candidate_builder is None
 
 
-def test_mcts_agent_decoupled_flag_armed_by_default():
-    """MCTSAgent enables ``use_decoupled_sim_move`` on its GumbelConfig so
-    the search's decoupled branch can fire once the builder is populated.
-    Without this, all posterior wiring would be a no-op."""
+def test_mcts_agent_decoupled_flag_DIAGNOSTIC_disabled_default():
+    """DIAGNOSTIC (2026-04-28): under Phantom 4.0 bug,
+    ``use_decoupled_sim_move=True`` was silently dropped from tight_cfg
+    on every act() call, so it had no runtime effect despite being
+    set in MCTSAgent.__init__. After the bugfix it actually fires —
+    and Kaggle errors. Diagnostic state: __init__ does NOT force
+    True; default is GumbelConfig's default False. Caller can set
+    True via gumbel_cfg arg explicitly. Restore True default once
+    the decoupled-path Kaggle bug is isolated."""
     agent = MCTSAgent(rng_seed=0)
-    assert agent.gumbel_cfg.use_decoupled_sim_move is True
-    # The search sees the same flag.
-    assert agent._search.gumbel_cfg.use_decoupled_sim_move is True
+    assert agent.gumbel_cfg.use_decoupled_sim_move is False
+    assert agent._search.gumbel_cfg.use_decoupled_sim_move is False
+    # Caller-explicit True still works.
+    explicit = MCTSAgent(
+        gumbel_cfg=GumbelConfig(use_decoupled_sim_move=True), rng_seed=0,
+    )
+    assert explicit.gumbel_cfg.use_decoupled_sim_move is True
 
 
 def test_mcts_agent_bokr_refinement_defaults_off():
@@ -732,3 +741,117 @@ def test_fallback_turn_counter_tracks_shadow_at_seat_1():
             f"Counter drift: mcts._fallback={mcts._fallback._turn_counter} "
             f"vs shadow={shadow._turn_counter}"
         )
+
+
+def test_phantom4_tight_cfg_preserves_all_configured_fields(monkeypatch):
+    """Regression test for PHANTOM 4.0 (2026-04-27).
+
+    Before the fix, ``mcts_bot.act()`` rebuilt a ``tight_cfg`` for each
+    search call to inject the safe-budget deadline, but the constructor
+    only copied 5 fields and silently reverted ``rollout_policy``,
+    ``sim_move_variant``, ``exp3_eta``, ``use_decoupled_sim_move``,
+    ``use_macros``, ``per_rollout_budget_ms``, ``num_opp_candidates``
+    to their GumbelConfig defaults. Every Kaggle ladder submission since
+    v9 had been running with default config instead of bundle-time
+    settings.
+
+    This test pins the fix by intercepting the search call and asserting
+    the cfg used for search has the configured (non-default) values.
+    """
+    from orbitwars.mcts.gumbel_search import GumbelRootSearch
+
+    cfg = GumbelConfig(
+        # Configure values that are DIFFERENT from the GumbelConfig defaults.
+        rollout_policy="nn_value",        # default: "heuristic"
+        sim_move_variant="exp3",           # default: "ucb"
+        exp3_eta=0.7,                       # default: 0.3
+        use_decoupled_sim_move=False,      # default: True (also overwritten in __init__ to True!)
+        use_macros=True,                    # default: False
+        num_opp_candidates=99,              # default: 5
+        per_rollout_budget_ms=42.0,         # default: None
+        num_candidates=4, total_sims=4, rollout_depth=1, hard_deadline_ms=2000.0,
+        anchor_improvement_margin=2.0,
+    )
+    agent = MCTSAgent(gumbel_cfg=cfg, rng_seed=0)
+    # Intercept the search call to capture the cfg actually used.
+    captured = {}
+    original_search = agent._search.search
+
+    def capture_search(*args, **kwargs):
+        captured["gumbel_cfg"] = agent._search.gumbel_cfg
+        # Snapshot the fields at the moment of search invocation.
+        c = agent._search.gumbel_cfg
+        captured["snapshot"] = {
+            "rollout_policy": c.rollout_policy,
+            "sim_move_variant": c.sim_move_variant,
+            "exp3_eta": c.exp3_eta,
+            "use_macros": c.use_macros,
+            "num_opp_candidates": c.num_opp_candidates,
+            "per_rollout_budget_ms": c.per_rollout_budget_ms,
+            "anchor_improvement_margin": c.anchor_improvement_margin,
+            "total_sims": c.total_sims,
+        }
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setattr(agent._search, "search", capture_search)
+    agent.act(_mk_obs(), Deadline())
+
+    # All configured fields should be preserved at search time.
+    snap = captured.get("snapshot", {})
+    assert snap.get("rollout_policy") == "nn_value", (
+        f"rollout_policy was reverted to default: got {snap.get('rollout_policy')!r}"
+    )
+    assert snap.get("sim_move_variant") == "exp3", (
+        f"sim_move_variant was reverted: got {snap.get('sim_move_variant')!r}"
+    )
+    assert snap.get("exp3_eta") == 0.7, (
+        f"exp3_eta was reverted: got {snap.get('exp3_eta')!r}"
+    )
+    assert snap.get("use_macros") is True, (
+        f"use_macros was reverted: got {snap.get('use_macros')!r}"
+    )
+    assert snap.get("num_opp_candidates") == 99, (
+        f"num_opp_candidates was reverted: got {snap.get('num_opp_candidates')!r}"
+    )
+    assert snap.get("per_rollout_budget_ms") == 42.0, (
+        f"per_rollout_budget_ms was reverted: got {snap.get('per_rollout_budget_ms')!r}"
+    )
+    # Anchor margin and total_sims were preserved by the original code,
+    # but pin them too as a sanity check.
+    assert snap.get("anchor_improvement_margin") == 2.0
+    assert snap.get("total_sims") == 4
+
+
+def test_phantom5_fresh_game_preserves_move_prior_fn_and_value_fn():
+    """Regression test for PHANTOM 5.0 (2026-04-28).
+
+    Before the fix, ``mcts_bot.act()`` detected ``fresh_game`` (turn 0)
+    and rebuilt ``self._search = GumbelRootSearch(...)`` WITHOUT
+    threading ``move_prior_fn`` or ``value_fn`` from the previous
+    instance. Both fields default to None on the dataclass, so the NN
+    prior + NN value head were silently DISABLED at the start of every
+    match. This is the second Phantom-class bug: an internal rebuild
+    quietly drops configured behavior.
+
+    Symptom in the wild: ``rollout_policy='nn_value'`` bundles fell back
+    to heuristic rollouts via the
+    ``rollout_policy='nn_value' but no value_fn supplied`` path. The
+    warning fires once per process so multi-game self-play didn't
+    surface it after game 1.
+    """
+    sentinel_prior = object()
+    sentinel_value = object()
+    # Stub the dataclass so we can assert without a real model.
+    agent = MCTSAgent(rng_seed=0)
+    agent._search.move_prior_fn = sentinel_prior  # type: ignore[assignment]
+    agent._search.value_fn = sentinel_value  # type: ignore[assignment]
+
+    # Drive one act() cycle. Turn 0 obs => fresh_game branch fires.
+    agent.act(_mk_obs(step=0), Deadline())
+
+    assert agent._search.move_prior_fn is sentinel_prior, (
+        "fresh_game rebuild dropped move_prior_fn — Phantom 5.0 regression"
+    )
+    assert agent._search.value_fn is sentinel_value, (
+        "fresh_game rebuild dropped value_fn — Phantom 5.0 regression"
+    )

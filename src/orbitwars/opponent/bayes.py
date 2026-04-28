@@ -86,7 +86,7 @@ from orbitwars.opponent.archetypes import (
 
 # ---- Helpers -----------------------------------------------------------
 
-def _softmax(x: np.ndarray) -> np.ndarray:
+def _softmax_np(x: np.ndarray) -> np.ndarray:
     x = x - np.max(x)
     e = np.exp(x)
     return e / np.sum(e)
@@ -254,12 +254,12 @@ class ArchetypePosterior:
         ``freeze_threshold=1.0`` opts out — the check becomes unreachable.
         """
         if self.freeze_threshold < 1.0:
-            if float(_softmax(self.log_alpha).max()) >= self.freeze_threshold:
+            if float(_softmax_np(self.log_alpha).max()) >= self.freeze_threshold:
                 self._frozen = True
 
     def distribution(self) -> np.ndarray:
         """Posterior over archetypes as a probability vector."""
-        return _softmax(self.log_alpha)
+        return _softmax_np(self.log_alpha)
 
     def most_likely(self) -> str:
         return self.names[int(np.argmax(self.log_alpha))]

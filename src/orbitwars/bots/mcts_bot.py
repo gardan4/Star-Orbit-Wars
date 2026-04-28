@@ -74,12 +74,14 @@ class MCTSAgent(Agent):
         # the v3 tail profile (max 882 ms, 0 over 900 ms).
         self.action_cfg = action_cfg or ActionConfig()
         self.gumbel_cfg = gumbel_cfg or GumbelConfig()
-        # Arm the decoupled sim-move branch by default. The branch is a
-        # no-op unless MCTSAgent also populates ``opp_candidate_builder``
-        # with >=2 wires (see _maybe_route_posterior_to_search), so this
-        # is backward-compat: behavior only changes once the posterior
-        # has concentrated enough to propose a multi-archetype mixture.
-        self.gumbel_cfg.use_decoupled_sim_move = True
+        # 2026-04-28 DIAGNOSTIC: under Phantom 4.0 bug, this line silently
+        # had no effect at search time (tight_cfg dropped the field). With
+        # the fix propagating it, decoupled actually fires on Kaggle and
+        # something there errors. Disabling unconditional True until we
+        # can isolate the decoupled-path Kaggle issue. (v22-v27 ran with
+        # decoupled effectively False at search time; was working fine.)
+        # NOTE: caller can still set use_decoupled_sim_move=True via
+        # the gumbel_cfg arg if desired.
         self._fallback = HeuristicAgent(weights=self.weights)
         self._search = GumbelRootSearch(
             weights=self.weights,
@@ -340,11 +342,27 @@ class MCTSAgent(Agent):
             # Fresh heuristic both for fallback and for the search's
             # internal rollouts.
             self._fallback = HeuristicAgent(weights=self.weights)
+            # PHANTOM 5.0 FIX (2026-04-28): the previous rebuild on
+            # fresh_game CONSTRUCTED a new GumbelRootSearch without
+            # threading ``move_prior_fn`` or ``value_fn`` from the old
+            # one. Both fields default to None on the dataclass, so the
+            # NN prior + NN value head were silently DISABLED at the
+            # start of every match — even when the agent was constructed
+            # with both. This is the second Phantom-class bug: an
+            # internal rebuild quietly drops configured behavior. The
+            # impact mirrored Phantom 4.0 — every nn_value bundle
+            # actually ran heuristic rollouts under the
+            # ``rollout_policy='nn_value' but no value_fn supplied''
+            # fallback, with no warning visible to the bundle author
+            # because warnings dedupe by source location and the same
+            # warn line fires once per process.
             self._search = GumbelRootSearch(
                 weights=self.weights,
                 action_cfg=self.action_cfg,
                 gumbel_cfg=self.gumbel_cfg,
                 rng_seed=None,  # fresh RNG; deterministic only if seeded at ctor.
+                move_prior_fn=self._search.move_prior_fn,
+                value_fn=self._search.value_fn,
             )
             # Per-match opponent posterior — archetypes are stateful
             # (HeuristicAgent holds _LaunchState), so we reset between games.
@@ -443,15 +461,37 @@ class MCTSAgent(Agent):
         if safe_budget <= 10.0:
             return heuristic_move
 
-        # Rebuild a one-shot config with the tightened deadline. All other
-        # fields (including anchor_improvement_margin!) must be preserved
-        # so the safety floor still protects us under the tight budget.
+        # Rebuild a one-shot config with the tightened deadline. ALL other
+        # fields must be preserved so the safety floor still protects us
+        # under the tight budget AND so that bundle-time config overrides
+        # (rollout_policy, sim_move_variant, exp3_eta, use_macros,
+        # use_decoupled_sim_move, etc.) actually reach the search.
+        #
+        # PHANTOM 4.0 FIX (2026-04-27): the previous version of this
+        # construction omitted rollout_policy, sim_move_variant, exp3_eta,
+        # use_decoupled_sim_move, num_opp_candidates, per_rollout_budget_ms,
+        # and use_macros — silently reverting them to defaults. Every
+        # `--rollout-policy nn_value` / `--sim-move-variant exp3` / etc.
+        # bundle since the introduction of these flags has been running
+        # with the GumbelConfig defaults instead. Confirmed via
+        # diagnostic: nn_value bundle never invoked _value_fn_eval; rollout
+        # cost matched HeuristicAgent rollouts, not NN value forward.
+        # This bug explains the universal "+51.8 Elo H2H phantom" — all
+        # bundles produced byte-identical wire actions because their
+        # config overrides were being dropped at search time.
         tight_cfg = GumbelConfig(
             num_candidates=self.gumbel_cfg.num_candidates,
             total_sims=self.gumbel_cfg.total_sims,
             rollout_depth=self.gumbel_cfg.rollout_depth,
             hard_deadline_ms=safe_budget,
             anchor_improvement_margin=self.gumbel_cfg.anchor_improvement_margin,
+            rollout_policy=self.gumbel_cfg.rollout_policy,
+            use_decoupled_sim_move=self.gumbel_cfg.use_decoupled_sim_move,
+            sim_move_variant=self.gumbel_cfg.sim_move_variant,
+            exp3_eta=self.gumbel_cfg.exp3_eta,
+            num_opp_candidates=self.gumbel_cfg.num_opp_candidates,
+            per_rollout_budget_ms=self.gumbel_cfg.per_rollout_budget_ms,
+            use_macros=self.gumbel_cfg.use_macros,
         )
 
         # Compute the caller-side outer hard stop: the latest wall-clock
