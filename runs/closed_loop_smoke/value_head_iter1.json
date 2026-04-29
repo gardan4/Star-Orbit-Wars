@@ -1,0 +1,30 @@
+{
+  "cfg": {
+    "grid_h": 50,
+    "grid_w": 50,
+    "n_channels": 12,
+    "backbone_channels": 32,
+    "n_blocks": 3,
+    "n_action_channels": 8,
+    "value_hidden": 128
+  },
+  "training_history": {
+    "train_mse": [
+      0.7136137076374018,
+      0.33628175131886356
+    ],
+    "val_mse": [
+      0.41962844133377075,
+      0.35790032148361206
+    ],
+    "wall_seconds": [
+      4.774302699952386,
+      9.376509599969722
+    ]
+  },
+  "n_demos": 3302,
+  "n_train": 2972,
+  "n_val": 330,
+  "source_bc_checkpoint": "runs\\bc_warmstart_small_cpu.pt",
+  "source_demos": "runs\\closed_loop_smoke\\demos_iter1.npz"
+}

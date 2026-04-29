@@ -1,0 +1,29 @@
+{
+  "initial_checkpoint": "runs\\bc_warmstart_small_cpu.pt",
+  "iterations": [
+    {
+      "iter": 1,
+      "demos": "runs\\closed_loop_smoke\\demos_iter1.npz",
+      "checkpoint_in": "runs\\bc_warmstart_small_cpu.pt",
+      "checkpoint_out": "runs\\closed_loop_smoke\\value_head_iter1.pt",
+      "training_history": {
+        "train_mse": [
+          0.7136137076374018,
+          0.33628175131886356
+        ],
+        "val_mse": [
+          0.41962844133377075,
+          0.35790032148361206
+        ],
+        "wall_seconds": [
+          4.774302699952386,
+          9.376509599969722
+        ]
+      },
+      "wall_seconds": 91.58644450001884
+    }
+  ],
+  "started_at": "2026-04-28T20:05:55",
+  "finished_at": "2026-04-28T20:07:27",
+  "total_wall_seconds": 91.59281289996579
+}
