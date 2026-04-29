@@ -224,3 +224,59 @@ def test_parse_obs_separates_owners():
     assert {p[0] for p in po.enemy_planets} == {0}
     assert {p[0] for p in po.neutral_planets} == {2}
     assert po.planet_by_id[1][5] == 15
+
+
+# --- Exact-plus-one neutral capture regression (2026-04-26) ---
+# Before this fix, the heuristic forced max(min_launch_size=20-30, proj+1)
+# even for tiny neutrals (e.g. 5-ship garrison). Result: every neutral
+# capture wasted 15-25 ships in the early game, killing the snowball.
+# Plus the post-cap launch gate `ships_to_send < min_launch_size: continue`
+# silently DROPPED neutral attacks entirely when min was bumped above
+# proj+safety. These tests pin the new behavior.
+
+def _mk_obs_with_small_neutral(neutral_ships: int = 5):
+    """Player 0 owns a 50-ship planet at (20,20). A neutral with
+    `neutral_ships` ships sits at (75,75). Step 5 (early game).
+    Geometry chosen so the (20,20)→(75,75) trajectory clears the sun
+    at (50,50) radius 10."""
+    return {
+        "player": 0,
+        "step": 5,
+        "angular_velocity": 0.03,
+        "planets": [
+            [0, 0, 20.0, 20.0, 1.5, 50, 3],     # mine, 50 ships
+            [1, -1, 75.0, 75.0, 1.5, neutral_ships, 2],  # neutral
+        ],
+        "initial_planets": [
+            [0, 0, 20.0, 20.0, 1.5, 10, 3],
+            [1, -1, 75.0, 75.0, 1.5, neutral_ships, 2],
+        ],
+        "fleets": [],
+        "next_fleet_id": 0,
+        "comet_planet_ids": [],
+        "comets": [],
+    }
+
+
+# NOTE (2026-04-29): tests for ``test_small_neutral_capture_does_not_oversize``,
+# ``test_medium_neutral_capture_sized_close_to_garrison`` were removed alongside
+# the _min_viable_attack_fleet tests. They depended on the
+# ``legacy_neutral_floor`` / ``legacy_enemy_floor`` weight knobs that were
+# part of the smart-sizing experiment and reverted with it (regressed -107
+# to -800 Elo per docs/STATUS.md). The knobs no longer exist in
+# HEURISTIC_WEIGHTS, so the tests' behavior assertions are no longer
+# meaningful. Re-add when smart-sizing is re-attempted.
+
+
+# NOTE: tests for _min_viable_attack_fleet were removed (2026-04-29) because
+# the helper itself was removed from heuristic.py during the smart-sizing
+# experiment rollback. Per docs/STATUS.md, the smart-sizing variants
+# regressed -107 to -800 Elo in A/B runs and the implementation was reverted.
+# The tests assumed an API that no longer exists; deleting them keeps the
+# suite green. If smart-sizing is re-attempted, port these intent specs
+# (isolated/contested/race-unwinnable) over to the new helper's signature.
+
+
+# NOTE (2026-04-29): test_neutral_capture_below_min_launch_size_is_NOT_dropped
+# also depended on legacy_neutral_floor/legacy_enemy_floor knobs that were
+# removed with the smart-sizing rollback. See the note above.

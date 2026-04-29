@@ -1,5 +1,283 @@
 # Orbit Wars — Repo Status & Architecture
 
+## NIGHT-OF-2026-04-28 — PHANTOM 5.0 + 6.0 FOUND, REAL MCTS FINALLY SHIPS (v32b 939.1 Elo)
+
+**TL;DR**: Phantom 4.0 was the FIRST of three compounding bugs that
+silently disabled MCTS. After fixing all three, v32b is the first
+bundle in this repo's history to actually run MCTS rollouts. It
+shipped to the ladder and landed at **939.1 Elo** (+53 over v27's
+886.1 yesterday, the previous heuristic-only leader).
+
+### PHANTOM 5.0 — `fresh_game` rebuild drops `move_prior_fn` and `value_fn`
+
+**Root cause**: `mcts_bot.py` lines 341-350 detect a fresh game
+(turn 0) and rebuild `self._search = GumbelRootSearch(...)` to reset
+per-match state. The rebuild **didn't pass `move_prior_fn` or
+`value_fn`**. Both default to `None` on the dataclass, so even though
+the bundle's MCTSAgent was constructed with both NN functions, they
+were silently dropped at the start of every match.
+
+**Symptom in the wild**: every `--rollout-policy=nn_value` bundle
+fell back to heuristic rollouts via the
+`rollout_policy='nn_value' but no value_fn supplied` warning path.
+The warning fires once per process, so multi-game self-play didn't
+surface it after game 1.
+
+**Fix**: thread `move_prior_fn=self._search.move_prior_fn,
+value_fn=self._search.value_fn` through the rebuild. + regression
+test `test_phantom5_fresh_game_preserves_move_prior_fn_and_value_fn`.
+
+### PHANTOM 6.0 — `_softmax` name collision
+
+**Root cause**: two source modules defined a top-level helper named
+`_softmax`:
+- `mcts/actions.py:125` — `def _softmax(xs: List[float], temperature: float) -> List[float]:`
+- `opponent/bayes.py:89` — `def _softmax(x: np.ndarray) -> np.ndarray:`
+
+When `tools/bundle.py` inlines them, both end up in the SAME module
+namespace. Python's last-definition-wins rule meant the bayes 1-arg
+version shadowed the actions 2-arg version. When
+`generate_per_planet_moves` (in actions.py) called
+`_softmax(scores, cfg.softmax_temperature)`, it dispatched to the
+1-arg bayes version and **raised TypeError**. The TypeError was
+caught by the outer `except Exception` in `mcts_bot.act()` and
+returned `heuristic_move`. **Net effect: search ran 0 rollouts on
+every turn**, regardless of `total_sims` or `hard_deadline_ms`.
+
+**Symptom in the wild** (post-Phantom-4 fix only):
+- `_value_fn_eval` calls per match: 0
+- `sequential_halving` calls per match: 0 (entered, returned with `n_rollouts=0`)
+- Wire actions byte-identical to a pure-heuristic agent
+
+**Fix**: rename `bayes._softmax` to `_softmax_np`. + regression test
+`test_bundle_no_top_level_function_name_collisions` that scans the
+bundled `.py` for any duplicate top-level `def` names (allowlists
+`build` since both `heuristic.build` and `mcts_bot.build` are
+factory entrypoints, never called within the bundle).
+
+### Bundler bug — stray `from orbitwars.nn.nn_value import ...`
+
+**Root cause**: commit 24d784b (2026-04-26 21:01) added a
+`make_nn_value_fn(...)` closure to the bundler's NN-bootstrap output
+but emitted a runtime `from orbitwars.nn.nn_value import
+make_nn_value_fn` line instead of inlining the module. Kaggle
+sandbox has no `orbitwars` package, so the import raised
+ModuleNotFoundError at notebook-load time (line 11498 of v30c).
+Every v30* submission ERROR'd; v27 (built before this commit) still
+worked.
+
+**Fix**: add `nn.nn_value` AND `features.obs_encode` (the latter
+needed by both `nn_prior` and `nn_value` for `encode_grid`) to the
+bundler's inlined-modules list when `--nn-checkpoint` is set. Remove
+the stray runtime-import line. + regression test that asserts the
+bundle has zero remaining `from orbitwars.*` imports.
+
+### Compounding effect
+
+The three phantoms hid each other:
+1. **Phantom 4** dropped `rollout_policy` at search time, so even if
+   `value_fn` had been wired correctly, the search would have run
+   the heuristic rollout path.
+2. **Phantom 5** dropped `value_fn` at every match start, so even if
+   `rollout_policy=nn_value` had been preserved, the search would
+   warn-and-fall-back to heuristic rollouts.
+3. **Phantom 6** raised TypeError before any rollout fired, so even
+   if both 4 and 5 had been fixed, the search would still return the
+   heuristic anchor.
+
+**Pre-fix MCTS strength on the ladder = heuristic strength.** All
+TuRBO weight tuning, all NN training, all macro experiments,
+all opponent-model A/B runs landed on a phantom that played the
+heuristic regardless of the bundle config. The heuristic itself
+got tuned (TuRBO weights translate to anchor moves), so the ladder
+was sensible — just not measuring what we thought.
+
+### Numbers
+
+| Test | Pre-Phantom-fix v32b | Post-Phantom-fix v32b |
+|---|---|---|
+| `_value_fn_eval` calls / 125-turn match | 0 | (N/A — heuristic rollouts) |
+| `_rollout_value` calls / 125-turn match | 0 | 1,072 |
+| `sequential_halving` rollouts / turn | 0 | ~8-12 |
+| Mirror H2H vs v27 (8 games) | tied (phantom-vs-phantom) | **7-1, +338 Elo** |
+| Public ladder Elo | 886.1 (v27 yesterday) | **939.1 (v32b today)** |
+
+### Slot 2 candidates explored, all rejected
+
+- **v32a (NN+v3 value head, anchor margin 0)**: lost 0-8 to v32b,
+  -800 Elo. The v3 value head was trained on Phantom-stricken
+  (heuristic-only) demos, so it confidently mis-evaluates real-MCTS
+  candidate states.
+- **v32c (NN+v3 + anchor margin 0.3)**: lost 2-6 to v32b, -190 Elo.
+  Anchor margin reduces the damage but doesn't make a bad value
+  head useful.
+- **v32d (heuristic rollouts + macros)**: lost 0-8 to v32b, -800
+  Elo. Macros add candidate joints that aren't anchor-protected,
+  diluting visit count per real candidate. Net negative under the
+  current ~12 sims/round budget.
+
+**Conclusion**: slot 2 saved for v33 once a coherent value head is
+trained on post-Phantom-fix self-play demos. Closed-loop iter 1
+running.
+
+### Open follow-ups
+
+- Re-run TuRBO over heuristic weights now that the heuristic is
+  consistently visible to itself in self-play (was always the case
+  for the anchor, but search noise was random because Phantom 6
+  meant search returned `q_values=[0.0]` regardless).
+- Audit `enumerate_joints` / `generate_per_planet_moves` early-exit
+  paths now that real MCTS exposes them (e.g. `len(joints) == 1`
+  early return at gumbel_search.py:886 — innocuous but worth knowing).
+- Train v4 value head on post-fix self-play (closed-loop iter 1).
+- Once v4 trained, bundle v33 with `rollout_policy=nn_value` and
+  H2H vs v32b. If positive, slot 2 ship.
+
+---
+
+## DAY-OF-2026-04-27 — PHANTOM 4.0 FOUND (and it explains EVERYTHING)
+
+**The biggest bug discovery in this project.** Found while diagnosing
+why v_v2value (NN value head + nn_value rollout) was wire-identical
+to v22.
+
+**Root cause**: `mcts_bot.py` line ~449 builds a `tight_cfg = GumbelConfig(...)`
+on every `act()` call to inject the safe-budget deadline. The
+constructor **only copied 5 fields** (num_candidates, total_sims,
+rollout_depth, hard_deadline_ms, anchor_improvement_margin) and
+silently REVERTED all other fields to GumbelConfig defaults.
+
+**Specifically dropped at search time**:
+| Field | Bundle setting | Actual runtime value |
+|---|---|---|
+| `rollout_policy` | "fast" / "nn_value" | "heuristic" (default) |
+| `sim_move_variant` | "exp3" | "ucb" (default) |
+| `exp3_eta` | 0.3 | 0.3 (irrelevant since ucb) |
+| `use_decoupled_sim_move` | False (in some tests) | True (default — always fired in mcts_bot.__init__) |
+| `use_macros` | True (v16) | False (default) |
+| `per_rollout_budget_ms` | (whatever) | None (default) |
+| `num_opp_candidates` | (whatever) | 5 (default) |
+
+**Confirmed via diagnostic**:
+- Pre-fix: nn_value bundle → 4 sims/turn, anchor wins, q_values=[0.04, -inf, -inf, -inf]
+- Post-fix: nn_value bundle → 128 sims/turn (full budget), best_idx=2 (NOT anchor), q_values=[-0.55, -0.55, -0.49, -0.60]
+
+**This bug has existed since `--sim-move-variant` and `--rollout-policy`
+flags were introduced (~v9, ~2026-04-24). Every Kaggle ladder
+submission since then has been running with**:
+- `rollout_policy="heuristic"` (full HeuristicAgent rollouts, 30-100ms each → only 4-15 sims fit per turn → anchor wins by default)
+- `sim_move_variant="ucb"` (the v9 "exp3 wins +52.5" A/B was real but never shipped)
+- `use_macros=False` (v16 macros never actually fired)
+- `use_decoupled_sim_move=True` (this WAS actually in default, so this part was unaffected)
+
+**Retroactively explains**:
+1. **All +51.8 Elo H2H phantoms.** Different bundles produced byte-identical play because all silently reverted to identical defaults. The "first bundle in list" win was bundle-load-order RNG variance, not bot strength.
+2. **Why MCTS bundles always behaved like the heuristic.** The bundle's claim of "fast rollouts" + "NN priors" was advertising; the runtime ran 10-15 sims of full HeuristicAgent rollouts then anchor-locked.
+3. **Why NN bundles were wire-identical.** No matter what NN you trained, the runtime ran heuristic rollouts and anchor protection wins.
+4. **Why we couldn't find a "real signal"** — every config we tried got dropped to defaults. We were testing `default-vs-default` with cosmetically-different bundle files.
+
+**v22 (current ladder leader before fix)** actual runtime:
+- BC v1 small NN as `move_prior_fn` (this WAS preserved — passed via constructor not gumbel_cfg)
+- TuRBO v3 weights (preserved — same path)
+- 128 sims requested, but only ~10-15 actually completed due to slow heuristic rollouts
+- ucb sim-move bandit (not exp3 as advertised)
+- decoupled sim-move ON (correct)
+- anchor_margin=0 (preserved)
+- `use_opponent_model=False` for v26: this DID work (set on agent directly, not gumbel_cfg)
+
+**Implications for next ship**:
+- A v30 with the fix that ACTUALLY runs `rollout_policy=fast` should do
+  ~100-200 sims/turn (vs 10-15) and produce meaningfully different Q
+  estimates. Could be a real ladder gain.
+- A v30 with `rollout_policy=nn_value` + `bc_v_v2_deep.pt` is the
+  first time NN actually drives wire actions on Kaggle. Real test
+  of the AlphaZero direction.
+- All past "didn't help" findings need re-validation with the fix.
+
+**Fix landed**: tight_cfg now copies all relevant fields. 100/100
+tests pass (`test_mcts_bot.py + test_gumbel_search.py + test_bundle.py`).
+
+---
+
+## NIGHT-OF-2026-04-26 SUMMARY (the strategic-pivot night)
+
+**Where we stand**: v22 = 936.9 ladder Elo, frozen. 5 ladder ships today
+(v22, v24, v25, v26, v27); all of v24-v27 settled below v22. **The
+heuristic-tuning lever has plateaued** — TuRBO v3 → v5 produces wider
+spread of weight values but no ladder lift.
+
+**Five heuristic-improvement attempts tonight, all regressive in
+heuristic-vs-heuristic A/B**:
+| Attempt | Δ Elo |
+|---|---|
+| Exact-plus-one neutrals (line 978 fix) | **-107** |
+| Full smart sizing (race+counter+speed minimum-viable) | **-458** |
+| Soft sizing (OPP_COMMITMENT=0.5 dampening) | **-458** |
+| Context-aware (legacy in race, smart isolated) | **-800** |
+| Cluster-aware target selection | **-207** |
+
+**Lesson**: legacy heuristic with TuRBO-tuned weights is approximately
+Pareto-optimal at this complexity level. Local rule tweaks lose to
+"send 30 ships to nearest target with positive score." The implicit
+race dynamics (snowball wins by claiming neutrals fastest) are encoded
+into `min_launch_size=20` in a way that's hard to improve via tighter
+math without OPPONENT MODELING — knowing what the opponent will
+actually do, not just bounding their worst case.
+
+**NN/PPO findings (Phase 1+2A done)**:
+- `src/orbitwars/nn/nn_value.py` — value-fn factory, pathway plumbed
+  through `GumbelRootSearch.value_fn` + `bundle.py --rollout-policy=nn_value`
+- 50k demos collected with terminal_value labels (Path A)
+- Value head trained val_mse=0.045 (94% below baseline), genuinely learned
+- **v28 (trained value head, anchor_margin=1.0) wire-identical to v22**
+  — value_fn IS being called but anchor-lock + heuristic-rollouts
+  smother it at the wire across 5 seeds × 2 mirrors
+- Implies single-step rollout-distillation cannot push past current
+  policy strength. Closed-loop AlphaZero iteration required.
+
+**Infrastructure shipped tonight (toggleable, default OFF)**:
+- `_min_viable_attack_fleet`, `_enemy_fastest_arrival_at`,
+  `_race_min_ships`, `_estimate_counter_attack_threat`,
+  `_find_neutral_clusters`, `_score_cluster_for_claim`
+  — all in `bots/heuristic.py`, gated by `legacy_neutral_floor`,
+  `legacy_enemy_floor`, `cluster_strategy_weight` weights
+- Tools: `tools/h2h_mirror.py`, `tools/h2h_isolated.py`,
+  `tools/_h2h_one_game.py` (HEURISTIC-ONLY validated; unreliable for
+  MCTS bundles due to wall-clock phantom)
+- `tools/compare_neutral_fix.py`, `tools/compare_cluster_strategy.py`,
+  `tools/train_value_head.py`
+- Demos: `runs/mcts_demos_v6_with_outcomes.npz` (50k, sims=64/dl=400ms),
+  `runs/mcts_demos_v7_deep.npz` (24k, sims=128/dl=850ms)
+- Trained checkpoint: `runs/bc_v_v1.pt` (BC v1 with trained value head)
+
+**Strategic pivot — committing to RL track**:
+The hand-tuning era is over. Path forward (multi-day):
+1. **Architecture fix**: multiple-size candidates per target in
+   `mcts/actions.py` + `--neural-rollout-policy` so MCTS Q reflects
+   NN strategy not heuristic strategy. Unblocks NN-on-wire.
+2. **Real PPO + PFSP**: 50-100M env steps with bug-fixed `train_ppo.py`
+   (bootstrap value, shaped reward, per-env GAE). RTX 3070 makes
+   24-48h training tractable.
+3. **Closed-loop self-play**: snapshot policy every N steps, add to
+   PFSP pool, iterate. AlphaZero in spirit.
+4. **Distill + ship**: <2MB student via Bayesian Policy Distillation,
+   int8 quantize, ship v30+ with NN actually driving wire.
+
+Realistic outcome at our compute scale: +50 to +200 ladder Elo.
+Tier-2 (1300+) is plausible-stretch.
+
+**Cleanup pass done**: removed ephemeral bundles
+(v_value_smoke, v_no_oppmodel, v_ucb_no_oppmodel, v_no_nn_diag,
+v22_clone, v_ppo_test, v_ppo_v3_dead, v28_m1) and smoke checkpoints
+(ppo_smoke*.pt, bc_v_smoke.pt). 83 tests still pass.
+
+**Don't ship tonight** — v22 stable floor; RL track work begins
+tomorrow.
+
+---
+
+
+
 ## URGENT FINDING (2026-04-26 morning) — `+51.8 Elo H2H` IS A FALSE POSITIVE
 
 **Six "+51.8 Elo H2H" wins reported in this STATUS doc on 2026-04-25 are all the
