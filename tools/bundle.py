@@ -147,6 +147,7 @@ def bundle_bot(
     nn_dataset_path: str | None = None,
     total_sims: int | None = None,
     hard_deadline_ms: float | None = None,
+    num_candidates: int | None = None,
 ) -> None:
     if bot_name not in BOT_RECIPES:
         raise SystemExit(f"Unknown bot '{bot_name}'. Known: {list(BOT_RECIPES)}")
@@ -298,6 +299,13 @@ def bundle_bot(
                 f"--total-sims only applies to bot=mcts_bot (got {bot_name!r})"
             )
         cfg_setters.append(f"_bundle_cfg.total_sims = {int(total_sims)!r}")
+
+    if num_candidates is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--num-candidates only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        cfg_setters.append(f"_bundle_cfg.num_candidates = {int(num_candidates)!r}")
 
     if hard_deadline_ms is not None:
         if bot_name != "mcts_bot":
@@ -621,6 +629,17 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--num-candidates",
+        type=int, default=None,
+        help=(
+            "Override GumbelConfig.num_candidates (default 4). Total root "
+            "joints = anchor + macros + Gumbel-sampled. Higher widens "
+            "search but cuts visits-per-candidate. Useful when MCTS "
+            "rarely overrides the anchor (low override rate => add "
+            "candidates so search has more chances to disagree)."
+        ),
+    )
+    ap.add_argument(
         "--nn-hold-neutral-prob",
         type=float,
         default=None,
@@ -687,6 +706,7 @@ def main() -> int:
         nn_dataset_path=args.nn_dataset_path,
         total_sims=args.total_sims,
         hard_deadline_ms=args.hard_deadline_ms,
+        num_candidates=args.num_candidates,
     )
     print(f"Bundled {args.bot} -> {out} ({out.stat().st_size} bytes)")
     if args.sim_move_variant:
