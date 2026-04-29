@@ -160,16 +160,28 @@ update.
 
 ### Slot 2 (2026-04-29) was held — no candidate beat v32b reliably.
 
-### Evening parameter sweeps (2026-04-29 ~13:00) — all net-zero or negative
+### Evening parameter sweeps (2026-04-29 ~13:00 onward) — all net-zero or negative
 
-After v33/v33b/v34 were rejected, swept three more configs against
-v32b (heuristic rollouts at 128 sims):
+After v33/v33b/v34 were rejected, swept five more configs against
+v32b (heuristic rollouts at 128 sims, num_candidates=4):
 
-| Variant | total_sims | rollout | sims-per-second | 8-game H2H delta |
-|---|---|---|---|---|
-| v35a | 800 | fast | 1ms/sim | -190 Elo (W-L = 2-6) |
-| v35b | 400 | fast | 1ms/sim | (not run) |
-| v35c | 192 | heuristic | 50ms/sim | tied 3-3-2 (delta 0.0) |
+| Variant | what changed vs v32b | 8-game H2H delta | 16-game confirmation |
+|---|---|---|---|
+| v35a | rollout=fast, total_sims=800 | **-190 Elo** | (not needed) |
+| v35c | total_sims=192 (vs 128) | tied (delta 0.0) | (not run) |
+| v35d | use_opponent_model=False | **-137 Elo** | (not run) |
+| v35e | num_candidates=12 (vs 4) | +43.7 Elo CI±175 | **-43.7 Elo** CI±124 |
+
+Diagnostic on v32b before the sweeps: MCTS overrides the heuristic
+anchor in only **9.2% of turns** (8 of 88 in a single self-play
+game), and runs ~12.5 rollouts per search. So 91% of v32b's play is
+pure heuristic — the search ceiling is bounded by that 9.2% delta.
+
+Lesson from v34 + v35e: 8-game H2H is too noisy for ladder
+decisions. Both showed ~+50-90 Elo on 8 games and flipped to
+~-44 on 16 games. The CI math: 8 games gives ±170, 16 gives ±124.
+Future H2H decisions should default to 16 games minimum, with
+24+ for "borderline ship/no-ship" cases.
 
 Fast rollouts at 800 sims lost decisively to heuristic at 128. The
 heuristic-rollout signal is ~7-10x more accurate per sim than fast,
