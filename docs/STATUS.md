@@ -172,6 +172,37 @@ v32b (heuristic rollouts at 128 sims, num_candidates=4):
 | v35d | use_opponent_model=False | **-137 Elo** | (not run) |
 | v35e | num_candidates=12 (vs 4) | +43.7 Elo CI±175 | **-43.7 Elo** CI±124 |
 | v35f | sim_move_variant=ucb (vs exp3) | (run as 16-game) | **0.0 Elo** CI±125 |
+| v36 | rollout=nn_value, v5 ckpt (40k demos), anchor=0.3 | (run as 16-game) | **-190 Elo** (4-12) CI±108 |
+
+### NN value head as leaf eval — definitive verdict
+
+Three value heads tested under increasingly favorable conditions:
+
+| Ckpt | demos | val_mse | H2H vs v32b |
+|---|---|---|---|
+| v3 | 12k phantom | 0.04 | -800 (v33) |
+| v4 | 12k post-fix | 0.20 | -190 (v33b w/ anchor=0.5) |
+| v5 | 40k post-fix | 0.39 | -190 (v36 w/ anchor=0.3) |
+
+Counterintuitively v5's val_mse is HIGHER than v4's because the
+40k demo set is more balanced (mean=0.42 vs 0.50) — predicting
+balanced outcomes is genuinely harder than predicting
+predictable ones. But more importantly: even with an objectively
+better and more data-rich value head, the H2H result is the same
+-190 Elo. **The NN-value-as-leaf approach is structurally worse
+than 15-ply heuristic rollouts** at this model size (32-channel,
+3-block conv, ~64k params). Adding more data won't fix it.
+
+Possible structural fixes (not tonight):
+- Larger model (>1M params) — Kaggle bundle size cap is ~1MB
+  base64-encoded torch state dict, currently ~350KB at 64k params.
+  Could push to 200k-500k.
+- Use NN as a MIXTURE-WITH-HEURISTIC value: v_final = α v_nn +
+  (1-α) v_heur_rollout. The NN provides a long-horizon prior, the
+  heuristic provides an accurate short-horizon view. Untested.
+- Use NN as POLICY only (better prior, then heuristic rollouts).
+  Tested via v34 → -44 Elo. Confirmed: prior alone doesn't help
+  meaningfully.
 
 The original W4 "exp3 vs ucb" A/B that showed exp3 +52.5 Elo was
 likely also a Phantom artifact — the post-fix 16-game test shows
