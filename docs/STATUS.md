@@ -160,12 +160,64 @@ update.
 
 ### Slot 2 (2026-04-29) was held — no candidate beat v32b reliably.
 
+### Evening parameter sweeps (2026-04-29 ~13:00) — all net-zero or negative
+
+After v33/v33b/v34 were rejected, swept three more configs against
+v32b (heuristic rollouts at 128 sims):
+
+| Variant | total_sims | rollout | sims-per-second | 8-game H2H delta |
+|---|---|---|---|---|
+| v35a | 800 | fast | 1ms/sim | -190 Elo (W-L = 2-6) |
+| v35b | 400 | fast | 1ms/sim | (not run) |
+| v35c | 192 | heuristic | 50ms/sim | tied 3-3-2 (delta 0.0) |
+
+Fast rollouts at 800 sims lost decisively to heuristic at 128. The
+heuristic-rollout signal is ~7-10x more accurate per sim than fast,
+and that quality dominates the quantity advantage at this depth.
+Heuristic at 192 sims tied 128 — sim count is saturated for this
+rollout quality (each heuristic rollout is ~50ms, so ~12-15 sims
+fit in the 850ms budget regardless of `total_sims` config).
+
+**v32b is at the local optimum** for the heuristic-rollout config
+space. Future Elo gains require either:
+1. A genuinely better leaf evaluator than heuristic-rollout-at-15-plies
+   (i.e. a stronger NN value head than v4 — needs more data + joint
+   training).
+2. A better heuristic itself (TuRBO re-tune, since real MCTS now
+   visits states the previous tuning didn't see).
+3. Action-space changes (more candidates per planet, BOKR angle
+   refinement, macro library) that expand what search can consider.
+
+### RL infrastructure in place for tomorrow
+
+- `tools/collect_mcts_demos.py` — `--visit-temperature` and
+  `--visit-smoothing` flags for AlphaZero-style target shaping.
+- `tools/train_value_head.py` — value-only training (in use).
+- `tools/train_policy_head.py` — policy-only distillation (in use).
+- `tools/train_az_head.py` — NEW. Joint policy+value with
+  configurable backbone unfreeze schedule. Standard AZ loss
+  `lambda_p * CE + lambda_v * MSE + lambda_l2 * weight_decay`.
+- `tools/closed_loop_train.py` — orchestrates demo-collect ->
+  value-head training -> next iter.
+
+### Tomorrow-shaped follow-ups
+
+- **Bigger demo set**: 30+ games at default config currently
+  collecting (~2.5h, runs/closed_loop_iter1_postfix/demos_iter1_big.npz).
+  More data + joint training may unlock the NN value head.
+- **TuRBO re-tune**: heuristic weights tuned in the phantom era
+  optimized the anchor only. Real MCTS now visits novel states
+  during rollouts; the same weights may be suboptimal there.
+- **Heuristic action-space audit**: `enumerate_joints` /
+  `generate_per_planet_moves` early-exit at len(joints) == 1
+  (gumbel_search.py:886). With 8 candidates per planet and 4
+  num_candidates default in v32b, joint diversity is bounded.
+  Bumping num_candidates to 16+ might give MCTS more states to
+  evaluate — at the cost of fewer sims per candidate.
+
 Open follow-ups (pre-existing):
-- Re-run TuRBO over heuristic weights now that real MCTS visits
-  meaningfully different heuristic states.
 - Audit `enumerate_joints` / `generate_per_planet_moves` early-exit
-  paths (e.g. `len(joints) == 1` early return at
-  gumbel_search.py:886 — innocuous but worth knowing).
+  paths.
 
 ---
 
