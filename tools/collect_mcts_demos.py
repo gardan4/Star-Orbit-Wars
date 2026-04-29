@@ -64,11 +64,30 @@ def _harvest_visits(
     out_x: List[np.ndarray], out_gy: List[int], out_gx: List[int],
     out_visits: List[np.ndarray],
     out_player_ids: Optional[List[int]] = None,
+    visit_temperature: float = 1.0,
+    visit_smoothing: float = 0.0,
 ) -> int:
     """Pull (state, visit-dist) demos from ``agent.last_search_result``.
 
     Returns the number of demos appended (one per owned planet that
     accumulated nonzero visits across non-HOLD candidates).
+
+    Args:
+        visit_temperature: AlphaZero-style policy temperature ``tau``.
+            Final target = ``visits ** (1/tau) / sum(visits ** (1/tau))``.
+            tau=1.0 = raw L1-normalized visits (default, current behavior).
+            tau>1.0 = smoother targets (more entropy, useful for policy
+            distillation when search converges to one-hot too aggressively).
+            tau<1.0 = sharper targets (closer to argmax — usually NOT what
+            you want for policy training, but matches AlphaZero late-game).
+        visit_smoothing: ``epsilon`` added to every channel BEFORE the
+            temperature transform. Lifts zero-visit channels off the floor
+            so their log-probability isn't ``-inf`` during cross-entropy.
+            Equivalent to a uniform prior of weight ``8 * epsilon``. With
+            epsilon=0.0 (default), zero-visit channels stay at 0 in the
+            target — the current behavior. epsilon=2.0 with one-hot
+            visits=[128, 0, 0, ...] gives a target ~[0.91, 0.014, ...]
+            that the policy head can actually learn from.
 
     If ``out_player_ids`` is provided, also records the player_id for
     each emitted demo. The caller (``_run_self_play``) uses this after
@@ -117,7 +136,18 @@ def _harvest_visits(
         s = float(hist.sum())
         if s <= 0:
             continue
-        target = hist / s
+        # AlphaZero-style target: visits ** (1/tau) / sum, with optional
+        # epsilon-smoothing applied BEFORE the temperature transform so
+        # zero-visit channels lift off the floor.
+        if visit_smoothing > 0.0:
+            hist = hist + float(visit_smoothing)
+        if visit_temperature != 1.0 and visit_temperature > 0.0:
+            inv_tau = 1.0 / float(visit_temperature)
+            hist_powered = np.power(np.maximum(hist, 0.0), inv_tau)
+            s_powered = float(hist_powered.sum())
+            target = hist_powered / s_powered if s_powered > 0 else hist / s
+        else:
+            target = hist / float(hist.sum())
         gy, gx = _planet_grid_cell(plnt)
         out_x.append(x_grid.astype(np.float32))
         out_gy.append(gy)
@@ -169,6 +199,8 @@ def make_agent(
 def _run_self_play(agents: List[MCTSAgent], harvest_each_turn: bool,
                    out_x, out_gy, out_gx, out_visits,
                    out_terminal_values: Optional[List[float]] = None,
+                   visit_temperature: float = 1.0,
+                   visit_smoothing: float = 0.0,
                    ) -> Tuple[int, list, int]:
     """Custom self-play loop that lets us inspect each agent's state
     *between* turns (kaggle_environments' env.run is opaque).
@@ -211,6 +243,8 @@ def _run_self_play(agents: List[MCTSAgent], harvest_each_turn: bool,
                     obs, player_id, agent,
                     out_x, out_gy, out_gx, out_visits,
                     out_player_ids=demo_player_ids,
+                    visit_temperature=visit_temperature,
+                    visit_smoothing=visit_smoothing,
                 )
         env.step(actions)
         steps += 1
@@ -252,6 +286,26 @@ def main() -> int:
             "(requires --bc-checkpoint with a trained value head)."
         ),
     )
+    ap.add_argument(
+        "--visit-temperature", type=float, default=1.0,
+        help=(
+            "AlphaZero-style visit-distribution temperature tau. "
+            "target = visits**(1/tau) / sum. "
+            "tau=1.0: raw L1-normalized visits (default). "
+            "tau>1.0: smoother targets — useful when SH converges to "
+            "near-one-hot visits and policy distillation has nothing to "
+            "learn beyond BC's argmax label."
+        ),
+    )
+    ap.add_argument(
+        "--visit-smoothing", type=float, default=0.0,
+        help=(
+            "Epsilon added to every channel BEFORE the temperature transform. "
+            "Lifts zero-visit channels off the floor so cross-entropy can "
+            "use them. Try 1.0-5.0 if visit_dist max-channel mean > 0.9 "
+            "(check via inspect_demos.py). 0.0 = current behavior."
+        ),
+    )
     args = ap.parse_args()
 
     out_path = Path(args.out)
@@ -270,6 +324,9 @@ def main() -> int:
           + (" (NN value head used as leaf eval)"
              if args.rollout_policy == "nn_value" else ""),
           flush=True)
+    print(f"visit_temperature: {args.visit_temperature}  "
+          f"visit_smoothing: {args.visit_smoothing}",
+          flush=True)
     for g in range(args.games):
         a0 = make_agent(
             args.seed + g * 2,     args.sims, args.deadline_ms, bc_ckpt,
@@ -284,6 +341,8 @@ def main() -> int:
             [a0, a1], harvest_each_turn=True,
             out_x=out_x, out_gy=out_gy, out_gx=out_gx, out_visits=out_visits,
             out_terminal_values=out_terminal_values,
+            visit_temperature=args.visit_temperature,
+            visit_smoothing=args.visit_smoothing,
         )
         wall = time.perf_counter() - t0
         print(
