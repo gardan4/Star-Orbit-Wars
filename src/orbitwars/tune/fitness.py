@@ -469,3 +469,37 @@ def w3_pool() -> List[Opponent]:
             name=label, kind="heuristic_weights", param=overrides
         )))
     return pool
+
+
+def w4_pool() -> List[Opponent]:
+    """W4 pool: w3 + heur_v5 (the currently-shipped weights).
+
+    W3 saturated at 0.97 in TuRBO-v5 (and 0.82 in TuRBO-v6 cold-start)
+    because v5 weights are NOT in the w3 pool — TuRBO had no signal
+    to find weights that beat the currently-deployed bot. W4 adds
+    heur_v5 (turbo_v5_w3pool.json's best trial) as an explicit
+    opponent so any new candidate must beat the current state of the
+    art to score above 0.5 against it.
+
+    The implicit assumption: heuristic-vs-heuristic strength
+    translates to MCTS-vs-MCTS strength because the v32b bundle uses
+    the heuristic as anchor + 91% of moves. So a new heuristic that
+    beats v5 in heuristic-only play should also beat v32b's bundle
+    when wrapped with the same MCTS configuration.
+
+    (2026-04-29: added after TuRBO-v6 hit 0.819 on w3 — the saturated
+    pool produced no useful gradient because the actual ladder bot's
+    weights weren't in it.)
+    """
+    from pathlib import Path
+    base = Path(__file__).resolve().parents[3]
+    pool = list(w3_pool())
+    v5_path = base / "runs" / "turbo_v5_w3pool.json"
+    if not v5_path.exists():
+        raise FileNotFoundError(
+            f"w4_pool requires {v5_path} (the current ladder bot's weights)"
+        )
+    pool.append(("heur_v5", OpponentSpec(
+        name="heur_v5", kind="heuristic_weights", param=str(v5_path)
+    )))
+    return pool
