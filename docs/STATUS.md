@@ -173,6 +173,13 @@ v32b (heuristic rollouts at 128 sims, num_candidates=4):
 | v35e | num_candidates=12 (vs 4) | +43.7 Elo CI±175 | **-43.7 Elo** CI±124 |
 | v35f | sim_move_variant=ucb (vs exp3) | (run as 16-game) | **0.0 Elo** CI±125 |
 | v36 | rollout=nn_value, v5 ckpt (40k demos), anchor=0.3 | (run as 16-game) | **-190 Elo** (4-12) CI±108 |
+| v37 | use_decoupled_sim_move=True | 16g #1: +44, 16g #2: -89 | **32g combined: ~tied** |
+
+v37 demonstrates the variance limit: the same bundle showed a
++44 Elo result over 16 games and a -89 Elo result over the next
+16 games. Combined 32-game record is essentially tied. **For
+ship/no-ship decisions in the near-50% regime, 16 games is too
+noisy; 32-64 games are needed.**
 
 ### NN value head as leaf eval — definitive verdict
 
