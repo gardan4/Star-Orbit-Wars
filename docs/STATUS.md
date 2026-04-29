@@ -120,18 +120,52 @@ was sensible — just not measuring what we thought.
 trained on post-Phantom-fix self-play demos. Closed-loop iter 1
 running.
 
-### Open follow-ups
+### Iter 1 closed-loop result (2026-04-29 morning)
 
-- Re-run TuRBO over heuristic weights now that the heuristic is
-  consistently visible to itself in self-play (was always the case
-  for the anchor, but search noise was random because Phantom 6
-  meant search returned `q_values=[0.0]` regardless).
+Collected 12,607 demos from 12 self-play games with v32b config
+(real MCTS, heuristic rollouts, total_sims=128, deadline 850ms).
+Trained v4 value head (val_mse=0.20) and v4 policy head (val_ce=1.46)
+via frozen-backbone iteration.
+
+**v33 (NN value head as leaf eval)** — `rollout_policy=nn_value`
+with v4 value head. 8-game H2H lost 0-8 (-800 Elo). Try v33b with
+`anchor_margin=0.5` to defensively gate overrides; lost 2-6 (-190).
+Conclusion: at current value-head quality, NN-as-leaf is dominated
+by 15-ply heuristic rollouts even with anchor protection.
+
+**v34 (visit-distilled prior + heuristic rollouts)** — kept
+heuristic rollouts but swapped in the policy-head trained on visit
+distributions. 8-game H2H showed +88 Elo (62.5% wr) but a 16-game
+confirmation flipped to -44 Elo (43.8%, CI ±12). The 8-game CI was
+±17 — too noisy to make slot decisions.
+
+**Diagnosis**: visit_dist concentration analysis shows **85% of
+demos have max-channel > 0.9** (essentially one-hot). MCTS+SH
+converges very aggressively at 128 sims × 8 channels per planet,
+so the visit distribution is already a hard label. Distilling onto
+that gives ~the same signal as BC's heuristic-pick imitation. The
+policy head's 264 trainable params couldn't extract a meaningful
+update.
+
+**Next-day plan**:
+1. Collect demos with `tau > 0` (visit-temperature smoothing) so
+   the policy target has more entropy. Look at AlphaZero's tau=1
+   for first 30 plies; we should at least try tau=0.5 across all
+   plies on this small grid.
+2. Scale to 50+ games (vs 12) so the policy head sees more
+   per-planet position diversity.
+3. Joint policy+value training (unfreeze the backbone after first
+   few epochs of head-only) to get a real policy improvement, not
+   a final-layer-only nudge.
+
+### Slot 2 (2026-04-29) was held — no candidate beat v32b reliably.
+
+Open follow-ups (pre-existing):
+- Re-run TuRBO over heuristic weights now that real MCTS visits
+  meaningfully different heuristic states.
 - Audit `enumerate_joints` / `generate_per_planet_moves` early-exit
-  paths now that real MCTS exposes them (e.g. `len(joints) == 1`
-  early return at gumbel_search.py:886 — innocuous but worth knowing).
-- Train v4 value head on post-fix self-play (closed-loop iter 1).
-- Once v4 trained, bundle v33 with `rollout_policy=nn_value` and
-  H2H vs v32b. If positive, slot 2 ship.
+  paths (e.g. `len(joints) == 1` early return at
+  gumbel_search.py:886 — innocuous but worth knowing).
 
 ---
 
