@@ -171,6 +171,11 @@ v32b (heuristic rollouts at 128 sims, num_candidates=4):
 | v35c | total_sims=192 (vs 128) | tied (delta 0.0) | (not run) |
 | v35d | use_opponent_model=False | **-137 Elo** | (not run) |
 | v35e | num_candidates=12 (vs 4) | +43.7 Elo CI±175 | **-43.7 Elo** CI±124 |
+| v35f | sim_move_variant=ucb (vs exp3) | (run as 16-game) | **0.0 Elo** CI±125 |
+
+The original W4 "exp3 vs ucb" A/B that showed exp3 +52.5 Elo was
+likely also a Phantom artifact — the post-fix 16-game test shows
+exp3 = ucb. They're functionally equivalent at this scale.
 
 Diagnostic on v32b before the sweeps: MCTS overrides the heuristic
 anchor in only **9.2% of turns** (8 of 88 in a single self-play
