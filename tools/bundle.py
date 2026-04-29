@@ -148,6 +148,7 @@ def bundle_bot(
     total_sims: int | None = None,
     hard_deadline_ms: float | None = None,
     num_candidates: int | None = None,
+    use_decoupled: bool | None = None,
 ) -> None:
     if bot_name not in BOT_RECIPES:
         raise SystemExit(f"Unknown bot '{bot_name}'. Known: {list(BOT_RECIPES)}")
@@ -306,6 +307,15 @@ def bundle_bot(
                 f"--num-candidates only applies to bot=mcts_bot (got {bot_name!r})"
             )
         cfg_setters.append(f"_bundle_cfg.num_candidates = {int(num_candidates)!r}")
+
+    if use_decoupled is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--use-decoupled only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        cfg_setters.append(
+            f"_bundle_cfg.use_decoupled_sim_move = {bool(use_decoupled)!r}"
+        )
 
     if hard_deadline_ms is not None:
         if bot_name != "mcts_bot":
@@ -640,6 +650,17 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--use-decoupled",
+        choices=["true", "false"], default=None,
+        help=(
+            "Override GumbelConfig.use_decoupled_sim_move. Default False "
+            "post-Phantom-fix; was forced True pre-fix (silently dropped "
+            "by tight_cfg). When True AND opp_candidate_builder is set "
+            "(Bayes posterior concentrates), root uses 2D UCB/Exp3 over "
+            "(my_joint, opp_wire) instead of sequential_halving."
+        ),
+    )
+    ap.add_argument(
         "--nn-hold-neutral-prob",
         type=float,
         default=None,
@@ -691,6 +712,9 @@ def main() -> int:
     use_macros_flag: bool | None = None
     if args.use_macros is not None:
         use_macros_flag = args.use_macros == "true"
+    use_decoupled: bool | None = None
+    if args.use_decoupled is not None:
+        use_decoupled = args.use_decoupled == "true"
     bundle_bot(
         args.bot, out,
         weights_override=weights_override,
@@ -707,6 +731,7 @@ def main() -> int:
         total_sims=args.total_sims,
         hard_deadline_ms=args.hard_deadline_ms,
         num_candidates=args.num_candidates,
+        use_decoupled=use_decoupled,
     )
     print(f"Bundled {args.bot} -> {out} ({out.stat().st_size} bytes)")
     if args.sim_move_variant:
