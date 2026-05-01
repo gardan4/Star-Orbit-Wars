@@ -1112,3 +1112,82 @@ def test_value_fn_steering_changes_action_vs_constant():
         f"value_fn=1.0 should produce higher Q than value_fn=0.0 "
         f"(got {avg_q_extreme:.3f} vs {avg_q_const:.3f})"
     )
+
+
+def test_value_mix_alpha_zero_ignores_nn_value():
+    """With value_mix_alpha=0.0 the search must collapse to pure
+    heuristic rollouts: a wildly off NN value_fn (returns +1.0 always)
+    must NOT pull Q estimates upward, because NN contributes 0% weight.
+    """
+    obs = _mk_obs()
+
+    def extreme_fn(o, p):
+        return 1.0
+
+    # Pure NN (alpha=1) under extreme_fn: Q approaches +1.
+    cfg_pure = GumbelConfig(
+        num_candidates=4, total_sims=16, rollout_depth=1,
+        rollout_policy="nn_value", hard_deadline_ms=5000.0,
+        value_mix_alpha=1.0,
+    )
+    s_pure = GumbelRootSearch(gumbel_cfg=cfg_pure, rng_seed=42, value_fn=extreme_fn)
+    res_pure = s_pure.search(obs, my_player=0)
+
+    # alpha=0 ignores NN; Q should NOT all collapse to +1 (it's whatever
+    # the depth-1 heuristic rollout produces, typically near 0 in
+    # mid-game starts).
+    cfg_mix0 = GumbelConfig(
+        num_candidates=4, total_sims=16, rollout_depth=1,
+        rollout_policy="nn_value", hard_deadline_ms=5000.0,
+        value_mix_alpha=0.0,
+    )
+    s_mix0 = GumbelRootSearch(gumbel_cfg=cfg_mix0, rng_seed=42, value_fn=extreme_fn)
+    res_mix0 = s_mix0.search(obs, my_player=0)
+
+    avg_q_pure = sum(res_pure.q_values) / max(1, len(res_pure.q_values))
+    avg_q_mix0 = sum(res_mix0.q_values) / max(1, len(res_mix0.q_values))
+    # Pure-NN with extreme_fn=+1 should be at or near +1.
+    assert avg_q_pure > 0.5
+    # Alpha=0 ignores the NN entirely; the heuristic rollout result
+    # must be strictly lower (rollout values typically in [-0.5, 0.5]
+    # at depth 1).
+    assert avg_q_mix0 < avg_q_pure - 0.2, (
+        f"value_mix_alpha=0.0 should ignore extreme NN value_fn; "
+        f"avg_q_mix0={avg_q_mix0:.3f} vs avg_q_pure={avg_q_pure:.3f}"
+    )
+
+
+def test_value_mix_alpha_intermediate_blends():
+    """With alpha=0.5 the leaf value lies between the pure-NN value
+    and the pure-heuristic-rollout value."""
+    obs = _mk_obs()
+
+    def extreme_fn(o, p):
+        return 1.0
+
+    base_kwargs = dict(
+        num_candidates=4, total_sims=16, rollout_depth=1,
+        rollout_policy="nn_value", hard_deadline_ms=5000.0,
+    )
+    cfg_pure = GumbelConfig(value_mix_alpha=1.0, **base_kwargs)
+    cfg_mix = GumbelConfig(value_mix_alpha=0.5, **base_kwargs)
+    cfg_zero = GumbelConfig(value_mix_alpha=0.0, **base_kwargs)
+
+    res_pure = GumbelRootSearch(
+        gumbel_cfg=cfg_pure, rng_seed=42, value_fn=extreme_fn,
+    ).search(obs, my_player=0)
+    res_mix = GumbelRootSearch(
+        gumbel_cfg=cfg_mix, rng_seed=42, value_fn=extreme_fn,
+    ).search(obs, my_player=0)
+    res_zero = GumbelRootSearch(
+        gumbel_cfg=cfg_zero, rng_seed=42, value_fn=extreme_fn,
+    ).search(obs, my_player=0)
+
+    avg_pure = sum(res_pure.q_values) / max(1, len(res_pure.q_values))
+    avg_mix = sum(res_mix.q_values) / max(1, len(res_mix.q_values))
+    avg_zero = sum(res_zero.q_values) / max(1, len(res_zero.q_values))
+    # alpha=0.5 must lie strictly between alpha=0 and alpha=1.
+    assert avg_zero < avg_mix < avg_pure, (
+        f"mix=0.5 should blend; got zero={avg_zero:.3f} "
+        f"mix={avg_mix:.3f} pure={avg_pure:.3f}"
+    )

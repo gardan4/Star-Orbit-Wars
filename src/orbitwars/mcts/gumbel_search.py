@@ -181,6 +181,26 @@ class GumbelConfig:
     # pruning — only the heuristic anchor stays protected. Default off
     # so the v12 baseline path is bit-identical.
     use_macros: bool = False
+    # Mixed leaf evaluator (variance reduction). When ``rollout_policy``
+    # is ``"nn_value"`` and ``value_mix_alpha`` is in (0, 1), the leaf
+    # value is the convex combination
+    #     V_leaf = α · V_NN  +  (1 − α) · V_heuristic_rollout
+    # where V_NN is the value-head's 1-ply-ahead estimate and
+    # V_heuristic_rollout is a depth-``rollout_depth`` heuristic-vs-
+    # heuristic rollout from the same post-action state. NN provides a
+    # long-horizon prior (correlates with eventual outcomes); the
+    # heuristic rollout provides a short-horizon accurate signal.
+    # Combining them is a control-variate-style variance reduction.
+    #
+    # ``α = 1.0`` (default) recovers the existing pure-NN-value path.
+    # ``α = 0.0`` is equivalent to plain heuristic rollouts.
+    # ``α = 0.5`` is a sensible starting point for the unblock; tune
+    # via H2H. Cost is ~2× the leaf-eval wall when α ∈ (0, 1) since both
+    # paths run on every leaf, so the rollout-budget projection halves.
+    # See docs/STATUS.md ("Possible structural fixes — Use NN as a
+    # MIXTURE-WITH-HEURISTIC value: untested.") for the original
+    # motivation.
+    value_mix_alpha: float = 1.0
 
 
 # ---------------------------- Gumbel top-k --------------------------------
@@ -717,6 +737,15 @@ class GumbelRootSearch:
     # ``orbitwars.nn.nn_value.make_nn_value_fn``. Signature:
     #   ``(obs, my_player) -> float in [-1, 1]``
     value_fn: Optional[Callable[[Any, int], float]] = None
+    # NN-greedy rollout policy factory. When set AND
+    # ``gumbel_cfg.rollout_policy == "nn"``, ``_opp_factory`` and
+    # ``_my_future_factory`` return fresh ``NNRolloutAgent`` instances
+    # so MCTS rollouts play NN-vs-NN instead of heuristic-vs-heuristic.
+    # Q estimates then reflect NN strategy, not heuristic strategy —
+    # the structural unlock for NN-on-wire (see
+    # docs/NN_DRIVEN_ROLLOUTS_SPEC.md). Signature:
+    #   ``() -> Agent``  (zero-arg factory; creates a stateless agent)
+    nn_rollout_factory: Optional[Callable[[], Any]] = None
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.rng_seed)
@@ -725,11 +754,20 @@ class GumbelRootSearch:
         # Priority 1: Bayesian posterior override (Path D). When the
         # posterior has concentrated on a specific archetype, MCTSAgent
         # sets this so rollouts play against that archetype's heuristic.
-        # Keep this path even under rollout_policy="fast" — exploitation
-        # signal beats raw rollout speed once the posterior has fired.
+        # Keep this path even under rollout_policy="fast"/"nn" —
+        # exploitation signal beats raw rollout speed once the posterior
+        # has fired.
         if self.opp_policy_override is not None:
             return self.opp_policy_override()
-        # Priority 2: fast rollout policy. Cheap nearest-target push —
+        # Priority 2: NN-greedy rollout policy. Argmax over NN logits
+        # per planet — Q estimates reflect NN strategy. See
+        # docs/NN_DRIVEN_ROLLOUTS_SPEC.md.
+        if (
+            self.gumbel_cfg.rollout_policy == "nn"
+            and self.nn_rollout_factory is not None
+        ):
+            return self.nn_rollout_factory()
+        # Priority 3: fast rollout policy. Cheap nearest-target push —
         # 30-50× faster than the full heuristic. See fast_rollout.py.
         if self.gumbel_cfg.rollout_policy == "fast":
             from orbitwars.bots.fast_rollout import FastRolloutAgent
@@ -742,8 +780,13 @@ class GumbelRootSearch:
 
     def _my_future_factory(self) -> Any:
         # Symmetric fast path: my-future rollout plies also swap in the
-        # cheap agent when rollout_policy="fast". Candidate turn-0
+        # cheap agent when rollout_policy="fast" / "nn". Candidate turn-0
         # action is unaffected (that's already built upstream).
+        if (
+            self.gumbel_cfg.rollout_policy == "nn"
+            and self.nn_rollout_factory is not None
+        ):
+            return self.nn_rollout_factory()
         if self.gumbel_cfg.rollout_policy == "fast":
             from orbitwars.bots.fast_rollout import FastRolloutAgent
             return FastRolloutAgent(
@@ -937,9 +980,18 @@ class GumbelRootSearch:
                 stacklevel=2,
             )
 
+        # Mixed-eval blend factor (only meaningful under nn_value).
+        mix_alpha = float(self.gumbel_cfg.value_mix_alpha)
+        # Clamp to a defensible range; bundle.py also validates upstream.
+        if mix_alpha < 0.0:
+            mix_alpha = 0.0
+        elif mix_alpha > 1.0:
+            mix_alpha = 1.0
+        use_mix = use_nn_value and mix_alpha < 1.0
+
         def rollout_fn(joint: JointAction) -> float:
             if use_nn_value:
-                return _value_fn_eval(
+                v_nn = _value_fn_eval(
                     base_state=base_state,
                     my_player=my_player,
                     my_action=joint.to_wire(),
@@ -949,6 +1001,23 @@ class GumbelRootSearch:
                     rng=self._rng,
                     hard_stop_at=rollout_deadline_sec,
                 )
+                if not use_mix:
+                    return v_nn
+                # Blend with a heuristic rollout for variance reduction.
+                v_heur = _rollout_value(
+                    base_state=base_state,
+                    my_player=my_player,
+                    my_action=joint.to_wire(),
+                    opp_agent_factory=self._opp_factory,
+                    my_future_factory=self._my_future_factory,
+                    depth=self.gumbel_cfg.rollout_depth,
+                    num_agents=num_agents,
+                    rng=self._rng,
+                    deadline_fn=_rollout_deadline_fired,
+                    hard_stop_at=rollout_deadline_sec,
+                    per_rollout_budget_ms=self.gumbel_cfg.per_rollout_budget_ms,
+                )
+                return mix_alpha * v_nn + (1.0 - mix_alpha) * v_heur
             return _rollout_value(
                 base_state=base_state,
                 my_player=my_player,

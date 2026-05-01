@@ -61,6 +61,7 @@ class MCTSAgent(Agent):
         use_opponent_model: bool = True,
         move_prior_fn: Optional[Any] = None,
         value_fn: Optional[Any] = None,
+        nn_rollout_factory: Optional[Any] = None,
     ):
         self.weights = dict(HEURISTIC_WEIGHTS) if weights is None else dict(weights)
         # BOKR-style angle refinement is available (set
@@ -90,6 +91,7 @@ class MCTSAgent(Agent):
             rng_seed=rng_seed,
             move_prior_fn=move_prior_fn,
             value_fn=value_fn,
+            nn_rollout_factory=nn_rollout_factory,
         )
         self._use_opponent_model = use_opponent_model
         # Posterior is created lazily on turn 0 so per-match state
@@ -363,6 +365,7 @@ class MCTSAgent(Agent):
                 rng_seed=None,  # fresh RNG; deterministic only if seeded at ctor.
                 move_prior_fn=self._search.move_prior_fn,
                 value_fn=self._search.value_fn,
+                nn_rollout_factory=self._search.nn_rollout_factory,
             )
             # Per-match opponent posterior — archetypes are stateful
             # (HeuristicAgent holds _LaunchState), so we reset between games.
@@ -492,6 +495,7 @@ class MCTSAgent(Agent):
             num_opp_candidates=self.gumbel_cfg.num_opp_candidates,
             per_rollout_budget_ms=self.gumbel_cfg.per_rollout_budget_ms,
             use_macros=self.gumbel_cfg.use_macros,
+            value_mix_alpha=self.gumbel_cfg.value_mix_alpha,
         )
 
         # Compute the caller-side outer hard stop: the latest wall-clock

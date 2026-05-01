@@ -40,14 +40,28 @@ TWO_PI = 2.0 * math.pi
 
 # ---- Fleet speed (exact match to engine) ----
 
+# Memoize the default-max_speed branch. The full game only ever uses the
+# default; memoizing avoids ~600k repeated log()+pow()+min() calls per
+# 30-rollout MCTS turn (saves ~5% wall on the heuristic act() hot path).
+_FLEET_SPEED_CACHE: dict = {}
+
+
 def fleet_speed(ships: int, max_speed: float = DEFAULT_MAX_SPEED) -> float:
     """Engine's fleet speed formula. ships >= 1."""
+    if max_speed == DEFAULT_MAX_SPEED:
+        cached = _FLEET_SPEED_CACHE.get(ships)
+        if cached is not None:
+            return cached
     if ships <= 0:
-        return 0.0
-    if ships == 1:
-        return 1.0
-    s = 1.0 + (max_speed - 1.0) * (math.log(ships) / math.log(1000.0)) ** 1.5
-    return min(s, max_speed)
+        v = 0.0
+    elif ships == 1:
+        v = 1.0
+    else:
+        s = 1.0 + (max_speed - 1.0) * (math.log(ships) / math.log(1000.0)) ** 1.5
+        v = s if s < max_speed else max_speed
+    if max_speed == DEFAULT_MAX_SPEED:
+        _FLEET_SPEED_CACHE[ships] = v
+    return v
 
 
 def ships_needed_for_speed(target_speed: float, max_speed: float = DEFAULT_MAX_SPEED) -> int:
