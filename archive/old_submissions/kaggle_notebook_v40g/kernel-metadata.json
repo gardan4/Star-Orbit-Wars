@@ -1,0 +1,18 @@
+{
+  "id": "gardan4/orbit-wars-mcts-v40g",
+  "title": "Orbit Wars MCTS v40g",
+  "code_file": "orbit-wars-mcts-v40g.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": [
+    "gardan4/orbit-wars-az-v39-bigger"
+  ],
+  "competition_sources": [
+    "orbit-wars"
+  ],
+  "kernel_sources": []
+}
