@@ -336,12 +336,23 @@ def main() -> int:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     from dataclasses import asdict
+    # NB: stringify Path values in training_args. Previously this saved
+    # raw WindowsPath objects which fail to unpickle on Kaggle's Linux
+    # container — the bundled submission's torch.load(...) crashes at
+    # ladder run time, marking the whole submission ERROR (silently —
+    # the kernel build phase succeeds, the failure happens later when
+    # Kaggle imports submission.py to play games). v40b through v40f
+    # all errored for this reason.
+    sanitized_args = {
+        k: (str(v) if isinstance(v, Path) else v)
+        for k, v in vars(args).items()
+    }
     torch.save({
         "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "cfg": asdict(cfg),
         "az_trained_jointly": True,
         "training_history": history,
-        "training_args": vars(args),
+        "training_args": sanitized_args,
         "source_bc_checkpoint": str(args.bc_checkpoint),
         "source_demos": str(args.demos),
     }, args.out)

@@ -149,6 +149,7 @@ def bundle_bot(
     hard_deadline_ms: float | None = None,
     num_candidates: int | None = None,
     use_decoupled: bool | None = None,
+    value_mix_alpha: float | None = None,
 ) -> None:
     if bot_name not in BOT_RECIPES:
         raise SystemExit(f"Unknown bot '{bot_name}'. Known: {list(BOT_RECIPES)}")
@@ -164,6 +165,34 @@ def bundle_bot(
             "Use either --nn-checkpoint (base64-inline) or "
             "--nn-dataset-path (read from Kaggle Dataset at runtime), not both."
         )
+
+    if nn_dataset_path is not None:
+        # Git Bash on Windows silently translates Linux-style abs paths
+        # (e.g. /kaggle/input/...) to Windows paths (C:/Program Files/Git/
+        # kaggle/input/...). The bundled .py runs on Kaggle's Linux
+        # container, so the translated path is wrong and torch.load
+        # raises FileNotFoundError, marking the ladder submission ERROR.
+        # See feedback memory entry 2026-04-30. Detect this and abort.
+        # Re-invoke with `MSYS_NO_PATHCONV=1` to disable the translation.
+        if (
+            len(nn_dataset_path) > 2
+            and nn_dataset_path[1] == ":"
+        ):
+            raise SystemExit(
+                f"--nn-dataset-path looks Windows-mangled: "
+                f"{nn_dataset_path!r}\n"
+                f"Git Bash auto-translated a Linux path. Re-run with "
+                f"MSYS_NO_PATHCONV=1 prefix:\n"
+                f"  MSYS_NO_PATHCONV=1 python -m tools.bundle ... "
+                f"--nn-dataset-path /kaggle/input/<dataset>/<file>.pt"
+            )
+        if not nn_dataset_path.startswith("/kaggle/input/"):
+            print(
+                f"WARN: --nn-dataset-path={nn_dataset_path!r} doesn't "
+                f"start with '/kaggle/input/' — verify this is the "
+                f"runtime path on the Kaggle container.",
+                flush=True,
+            )
 
     if nn_checkpoint is not None or nn_dataset_path is not None:
         if bot_name != "mcts_bot":
@@ -182,6 +211,12 @@ def bundle_bot(
         modules.insert(insert_at + 1, "features.obs_encode")
         modules.insert(insert_at + 2, "nn.nn_prior")
         modules.insert(insert_at + 3, "nn.nn_value")
+        # NNRolloutAgent — used when GumbelConfig.rollout_policy='nn'.
+        # Must come before bots.mcts_bot in case mcts_bot ever imports it
+        # at module top-level. Currently mcts_bot only imports
+        # NNRolloutAgent lazily (it's wired through nn_rollout_factory),
+        # but ordering it here is the safe default.
+        modules.insert(insert_at + 4, "bots.nn_rollout")
 
     if use_macros:
         if bot_name != "mcts_bot":
@@ -256,9 +291,9 @@ def bundle_bot(
             raise SystemExit(
                 f"--rollout-policy only applies to bot=mcts_bot (got {bot_name!r})"
             )
-        if rollout_policy not in ("heuristic", "fast", "nn_value"):
+        if rollout_policy not in ("heuristic", "fast", "nn_value", "nn"):
             raise SystemExit(
-                f"--rollout-policy must be 'heuristic'|'fast'|'nn_value' "
+                f"--rollout-policy must be 'heuristic'|'fast'|'nn_value'|'nn' "
                 f"(got {rollout_policy!r})"
             )
         if rollout_policy == "nn_value" and nn_checkpoint is None and nn_dataset_path is None:
@@ -266,6 +301,12 @@ def bundle_bot(
                 "--rollout-policy=nn_value requires --nn-checkpoint or "
                 "--nn-dataset-path so the value head can be loaded; "
                 "without one the search has no value_fn to call."
+            )
+        if rollout_policy == "nn" and nn_checkpoint is None and nn_dataset_path is None:
+            raise SystemExit(
+                "--rollout-policy=nn requires --nn-checkpoint or "
+                "--nn-dataset-path so the NN policy head can be loaded; "
+                "without one the rollout has no model to query."
             )
         cfg_setters.append(f"_bundle_cfg.rollout_policy = {rollout_policy!r}")
 
@@ -316,6 +357,18 @@ def bundle_bot(
         cfg_setters.append(
             f"_bundle_cfg.use_decoupled_sim_move = {bool(use_decoupled)!r}"
         )
+
+    if value_mix_alpha is not None:
+        if bot_name != "mcts_bot":
+            raise SystemExit(
+                f"--value-mix-alpha only applies to bot=mcts_bot (got {bot_name!r})"
+            )
+        a = float(value_mix_alpha)
+        if a < 0.0 or a > 1.0:
+            raise SystemExit(
+                f"--value-mix-alpha must be in [0, 1] (got {a})"
+            )
+        cfg_setters.append(f"_bundle_cfg.value_mix_alpha = {a!r}")
 
     if hard_deadline_ms is not None:
         if bot_name != "mcts_bot":
@@ -418,10 +471,17 @@ def bundle_bot(
             "# and lets the same bundle support both rollout modes.",
             "# (make_nn_value_fn is inlined from nn.nn_value above.)",
             "_bundle_value_fn = make_nn_value_fn(_bundle_model, _bundle_cfg_nn)",
+            "# Build NN-rollout factory. Used only when",
+            "# GumbelConfig.rollout_policy='nn'; constructing the closure",
+            "# unconditionally lets the same bundle support nn rollouts",
+            "# via a single config flip without re-bundling.",
+            "def _bundle_nn_rollout_factory():",
+            "    return NNRolloutAgent(_bundle_model, _bundle_cfg_nn)",
             "del _bundle_ckpt  # free RAM after model is built",
         ]
         factory_kwargs.append("move_prior_fn=_bundle_move_prior_fn")
         factory_kwargs.append("value_fn=_bundle_value_fn")
+        factory_kwargs.append("nn_rollout_factory=_bundle_nn_rollout_factory")
 
     if nn_bootstrap_lines:
         # Emit the NN bootstrap BEFORE the GumbelConfig / factory block so
@@ -534,11 +594,14 @@ def main() -> int:
     ap.add_argument(
         "--rollout-policy",
         default=None,
-        choices=["heuristic", "fast", "nn_value"],
+        choices=["heuristic", "fast", "nn_value", "nn"],
         help=(
             "Override GumbelConfig.rollout_policy at bundle time. "
             "nn_value: skip rollouts, query NN value head 1 ply ahead "
             "(requires --nn-checkpoint or --nn-dataset-path). "
+            "nn: NN-greedy MCTS rollouts on both sides — Q estimates "
+            "reflect NN strategy (the structural unlock for NN-on-wire). "
+            "Requires --nn-checkpoint or --nn-dataset-path. "
             "'fast' uses FastRolloutAgent inside rollouts (~13× more "
             "sims/turn) but is only useful if combined with a relaxed "
             "--anchor-margin — under the shipped margin=2.0 the wire "
@@ -671,6 +734,20 @@ def main() -> int:
             "--nn-checkpoint is set."
         ),
     )
+    ap.add_argument(
+        "--value-mix-alpha",
+        type=float,
+        default=None,
+        help=(
+            "Mixed-leaf-eval blend factor in [0, 1]. Only meaningful "
+            "with --rollout-policy=nn_value. V_leaf = α · V_NN + (1−α) · "
+            "V_heuristic_rollout. α=1.0 (default) recovers pure NN-as-leaf. "
+            "α=0.5 is the variance-reduction starting point. α=0.0 is "
+            "equivalent to plain heuristic rollouts. Cost is ~2× per leaf "
+            "when α ∈ (0, 1) since both paths run; halve the sim budget "
+            "projection when comparing to pure-NN configs."
+        ),
+    )
     args = ap.parse_args()
 
     weights_override: Dict[str, float] | None = None
@@ -732,6 +809,7 @@ def main() -> int:
         hard_deadline_ms=args.hard_deadline_ms,
         num_candidates=args.num_candidates,
         use_decoupled=use_decoupled,
+        value_mix_alpha=args.value_mix_alpha,
     )
     print(f"Bundled {args.bot} -> {out} ({out.stat().st_size} bytes)")
     if args.sim_move_variant:

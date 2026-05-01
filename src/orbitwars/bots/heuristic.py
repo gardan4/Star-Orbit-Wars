@@ -116,6 +116,14 @@ class ParsedObs:
     # falling through to the static-target branch.
     comet_path_by_pid: Dict[int, List[Tuple[float, float]]] = field(default_factory=dict)
     comet_path_index_by_pid: Dict[int, int] = field(default_factory=dict)
+    # Per-turn invariants. ``is_orbiting_planet`` and
+    # ``initial_orbit_params`` depend only on the (planet, initial_planet)
+    # pair and never change within a single act() call, but the heuristic
+    # + arrival-table builder collectively call them ~1M times per
+    # 30-rollout MCTS turn. Populating once in ``parse_obs`` eliminates
+    # the recomputation hot-path. Keyed by planet pid.
+    is_orbiting_by_pid: Dict[int, bool] = field(default_factory=dict)
+    orbit_params_by_pid: Dict[int, Tuple[float, float]] = field(default_factory=dict)
 
 
 _COMET_SPAWN_STEPS = (50, 150, 250, 350, 450)
@@ -214,6 +222,20 @@ def parse_obs(obs, step_override: Optional[int] = None) -> ParsedObs:
             p.enemy_planets.append(pl)
     for ip in p.initial_planets:
         p.initial_planet_by_id[ip[0]] = ip
+
+    # Cache per-turn orbit invariants for every planet so downstream
+    # callers (build_arrival_table, _travel_turns, _intercept_position)
+    # can skip recomputing.
+    for pl in p.planets:
+        pid = pl[0]
+        ip = p.initial_planet_by_id.get(pid, pl)
+        idx = float(ip[2]) - 50.0
+        idy = float(ip[3]) - 50.0
+        orb_r = math.hypot(idx, idy)
+        init_angle = math.atan2(idy, idx)
+        p.orbit_params_by_pid[pid] = (orb_r, init_angle)
+        # is_orbiting rule: orb_r + planet_radius < ROTATION_RADIUS_LIMIT (50)
+        p.is_orbiting_by_pid[pid] = (orb_r + float(pl[4])) < 50.0
 
     # Parse obs.comets. Engine schema:
     #   obs.comets: list of groups, each a dict with keys
@@ -334,9 +356,9 @@ def build_arrival_table(
             pid = pl[0]
             if pid == from_pid:
                 continue
-            is_orb = is_orbiting_planet(pl, po.initial_planet_by_id.get(pid, pl))
+            is_orb = po.is_orbiting_by_pid.get(pid, False)
             if is_orb:
-                ir, ia = initial_orbit_params(po.initial_planet_by_id[pid])
+                ir, ia = po.orbit_params_by_pid[pid]
                 # NOTE: current_step = po.step - 2 matches _travel_turns'
                 # engine-phase convention. A fleet observed at obs.step=S
                 # has its k-th subsequent collision checked against planet
@@ -416,8 +438,16 @@ def _travel_turns(source: Tuple[float, float], target_pl: List[Any],
             return (angle, t)
         # Fallthrough to static-aim if comet metadata is missing
         # (shouldn't happen with a well-formed obs).
-    if is_orbiting_planet(target_pl, initial_pl):
-        ir, ia = initial_orbit_params(initial_pl)
+    # Read orbit metadata from the per-turn cache when available.
+    orb_cache = getattr(po, "is_orbiting_by_pid", None) if po is not None else None
+    if orb_cache is not None and tpid in orb_cache:
+        is_orb = orb_cache[tpid]
+        ir_ia = po.orbit_params_by_pid.get(tpid) if is_orb else None
+    else:
+        is_orb = is_orbiting_planet(target_pl, initial_pl)
+        ir_ia = initial_orbit_params(initial_pl) if is_orb else None
+    if is_orb:
+        ir, ia = ir_ia  # type: ignore[misc]
         ot = OrbitingTarget(
             orbital_radius=ir, initial_angle=ia,
             angular_velocity=angular_velocity, current_step=step - 2,
@@ -461,8 +491,15 @@ def _intercept_position(
             k = max(1, int(math.ceil(travel_turns)))
             aim_idx = min(idx_now + k - 1, len(path) - 1)
             return (float(path[aim_idx][0]), float(path[aim_idx][1]))
-    if is_orbiting_planet(target_pl, initial_pl):
-        ir, ia = initial_orbit_params(initial_pl)
+    orb_cache = getattr(po, "is_orbiting_by_pid", None) if po is not None else None
+    if orb_cache is not None and tpid in orb_cache:
+        is_orb = orb_cache[tpid]
+        ir_ia = po.orbit_params_by_pid.get(tpid) if is_orb else None
+    else:
+        is_orb = is_orbiting_planet(target_pl, initial_pl)
+        ir_ia = initial_orbit_params(initial_pl) if is_orb else None
+    if is_orb:
+        ir, ia = ir_ia  # type: ignore[misc]
         ot = OrbitingTarget(
             orbital_radius=ir, initial_angle=ia,
             angular_velocity=angular_velocity, current_step=step - 2,

@@ -176,6 +176,7 @@ def make_agent(
 
     prior_fn = None
     value_fn = None
+    nn_rollout_factory = None
     if bc_ckpt.exists():
         try:
             from orbitwars.nn.nn_prior import load_conv_policy, make_nn_prior_fn
@@ -188,11 +189,21 @@ def make_agent(
             if rollout_policy == "nn_value":
                 from orbitwars.nn.nn_value import make_nn_value_fn
                 value_fn = make_nn_value_fn(model, mcfg)
+            # When rollout_policy == "nn" we wire an NNRolloutAgent
+            # factory so MCTS rollouts play NN-vs-NN. Q estimates then
+            # reflect NN strategy rather than heuristic strategy — this
+            # is the structural closed-loop AlphaZero path.
+            if rollout_policy == "nn":
+                from orbitwars.bots.nn_rollout import NNRolloutAgent
+                def _factory(_m=model, _c=mcfg):
+                    return NNRolloutAgent(_m, _c)
+                nn_rollout_factory = _factory
         except Exception as e:
             print(f"  BC prior load failed: {e!r} — using uniform", flush=True)
     return MCTSAgent(
         gumbel_cfg=cfg, rng_seed=seed,
         move_prior_fn=prior_fn, value_fn=value_fn,
+        nn_rollout_factory=nn_rollout_factory,
     )
 
 
@@ -277,7 +288,7 @@ def main() -> int:
     ap.add_argument("--bc-checkpoint", type=str, default="runs/bc_warmstart_v2.pt")
     ap.add_argument(
         "--rollout-policy",
-        choices=["heuristic", "fast", "nn_value"],
+        choices=["heuristic", "fast", "nn_value", "nn"],
         default="fast",
         help=(
             "MCTS leaf evaluator. 'fast'=tiny rollout (default, cheap demos); "
